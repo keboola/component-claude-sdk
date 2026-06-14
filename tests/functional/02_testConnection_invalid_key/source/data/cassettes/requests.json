@@ -1,0 +1,7 @@
+{
+  "_metadata": {"freeze_time": "2026-06-14T20:19:33", "keboola_vcr_version": "0.5.0", "recorded_at": "2026-06-14T18:19:34.266598+00:00"},
+  "interactions": [
+    {"request": {"body": "{\"model\": \"claude-haiku-4-5\", \"max_tokens\": 1, \"messages\": [{\"role\": \"user\", \"content\": \"ping\"}]}", "headers": {"Accept": ["*/*"], "Content-Length": ["97"], "content-type": ["application/json"]}, "method": "POST", "uri": "https://api.anthropic.com/v1/messages"}, "response": {"body": {"string": "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"},\"request_id\":\"req_011Cc3cZZKd72HLM91QDzk3U\"}"}, "headers": {"Content-Type": ["application/json"], "content-length": ["130"]}, "status": {"code": 401, "message": "Unauthorized"}}}
+  ],
+  "version": 1
+}

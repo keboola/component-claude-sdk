@@ -1,0 +1,7 @@
+{
+  "_metadata": {"freeze_time": "2026-06-14T21:08:24", "keboola_vcr_version": "0.5.0", "recorded_at": "2026-06-14T19:08:25.583712+00:00"},
+  "interactions": [
+    {"request": {"body": "{\"model\": \"claude-haiku-4-5\", \"max_tokens\": 1, \"messages\": [{\"role\": \"user\", \"content\": \"ping\"}]}", "headers": {"Accept": ["*/*"], "Content-Length": ["97"], "content-type": ["application/json"]}, "method": "POST", "uri": "https://api.anthropic.com/v1/messages"}, "response": {"body": {"string": "{\"model\":\"claude-haiku-4-5-20251001\",\"id\":\"msg_01LqzC9DayhWxGtnVR6dpj8E\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":\"max_tokens\",\"stop_sequence\":null,\"stop_details\":null,\"usage\":{\"input_tokens\":8,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":0},\"output_tokens\":1,\"service_tier\":\"standard\",\"inference_geo\":\"not_available\"}}"}, "headers": {"Content-Type": ["application/json"], "content-length": ["432"]}, "status": {"code": 200, "message": "OK"}}}
+  ],
+  "version": 1
+}

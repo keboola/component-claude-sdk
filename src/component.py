@@ -16,6 +16,7 @@ import sys
 
 from keboola.component.base import ComponentBase, sync_action
 from keboola.component.exceptions import UserException
+from keboola.vcr import DefaultSanitizer
 
 from claude_runner import ClaudeRunner, ClaudeRunResult
 from configuration import Configuration
@@ -25,6 +26,26 @@ from sdk_version_manager import SdkVersionManager
 from sync_actions import check_anthropic_connection
 from tasks import Task, TaskSource
 from transcript_writer import TranscriptWriter
+
+# VCR cassette sanitizers — picked up automatically by the datadirtest scaffolder
+# during recording (spec §7). The ONLY in-process HTTP we record is the
+# testConnection Anthropic Messages ping, whose key rides in the ``x-api-key``
+# header. DefaultSanitizer already strips every header except a small safe set
+# (content-type/length/accept), so ``x-api-key``/``authorization`` never reach
+# the cassette; we additionally list the key field names so any stray copy in a
+# URL or body is redacted too. NO secret value must ever land in a cassette.
+VCR_SANITIZERS = [
+    DefaultSanitizer(
+        additional_sensitive_fields=[
+            "x-api-key",
+            "anthropic_key",
+            "#anthropic_key",
+            "api_key",
+            "github_token",
+            "#github_token",
+        ],
+    ),
+]
 
 WORKSPACE_DIR = "/tmp/claude-workspace"  # noqa: S108 — /tmp is the only writable path in the read-only image
 

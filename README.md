@@ -131,6 +131,37 @@ Run the test suite and perform lint checks using this command:
 docker-compose run --rm test
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+Tests
+-----
+
+The suite has three layers. The Claude agent loop runs the `claude` CLI as a
+subprocess that makes its own outbound HTTPS, so in-process HTTP recording (VCR)
+cannot capture it — the agent-loop tests therefore mock the single
+`ClaudeRunner._query` SDK seam with a canned, typed message stream (no network,
+no subprocess):
+
+- **`tests/unit/`** — boundary unit tests for each module (config parsing,
+  output/transcript writers, plugin/SDK-version managers, the runner seam, the
+  orchestrator, and the `testConnection` logic).
+- **`tests/datadir/`** — datadir functional tests that drive the component
+  end-to-end through the Keboola `/data` contract (real `config.json`, input
+  tables, and output mapping / `.manifest` files), with the SDK boundary mocked.
+  Covers config-prompt and tasks-table modes, `task_id_filter`, agent→table
+  promotion, the always-on transcript tables, and the failure→exit-1 paths.
+- **`tests/functional/`** — VCR functional tests for the one in-process
+  Anthropic HTTP call, the `testConnection` sync action. Cassettes are recorded
+  once against the real API and replayed offline; `VCR_SANITIZERS` in
+  `src/component.py` scrub the key and auth headers so no secret value is stored.
+
+To (re)record the `testConnection` cassettes against the real API, put the key
+in a repo-root secrets file (gitignored, shaped `{"parameters":
+{"#anthropic_key": "..."}}`) and run:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+uv run python scripts/record_cassettes.py            # skip-if-exists
+uv run python scripts/record_cassettes.py --regenerate   # force re-record
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 Integration
 ===========
 

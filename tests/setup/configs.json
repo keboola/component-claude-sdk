@@ -1,0 +1,22 @@
+[
+  {
+    "name": "01_testConnection",
+    "description": "testConnection sync action with a valid #anthropic_key -> success. The real key is deep-merged from secrets.json at recording time and never written to the committed config.json; replay needs no key.",
+    "config": {
+      "action": "testConnection",
+      "parameters": {
+        "#anthropic_key": "DUMMY_KEY_REPLACED_FROM_SECRETS"
+      }
+    }
+  },
+  {
+    "name": "02_testConnection_invalid_key",
+    "description": "testConnection sync action with a deliberately invalid key -> Anthropic returns 401, the component raises UserException (exit 1). The dummy key is intentionally not in the real Anthropic key format so it is obviously not a real secret.",
+    "config": {
+      "action": "testConnection",
+      "parameters": {
+        "#anthropic_key": "INVALID-TEST-KEY-EXPECT-401"
+      }
+    }
+  }
+]
