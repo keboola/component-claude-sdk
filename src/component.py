@@ -1,99 +1,117 @@
-"""
-Template Component main class.
+"""keboola.app-claude-sdk — Claude Agent SDK runner.
 
+A highly configurable Claude Agent SDK runner inside Keboola. ``run()`` is a thin
+orchestrator (spec §6.1) delegating to private methods; the SDK boundary lives in
+``ClaudeRunner`` and the runtime SDK overlay (``SdkVersionManager``) runs first so
+any overlay is on ``sys.path`` before a single ``claude_agent_sdk`` symbol is used.
 """
 
-import csv
+from __future__ import annotations
+
+import asyncio
 import logging
-from datetime import datetime
+import os
 
-from keboola.component.base import ComponentBase
+from keboola.component.base import ComponentBase, sync_action
 from keboola.component.exceptions import UserException
 
+from claude_runner import ClaudeRunner
 from configuration import Configuration
+from output_writer import OutputWriter
+from plugin_manager import PluginManager
+from sdk_version_manager import SdkVersionManager
+from sync_actions import check_anthropic_connection
+from tasks import Task, TaskSource
+from transcript_writer import TranscriptWriter
+
+WORKSPACE_DIR = "/tmp/claude-workspace"  # noqa: S108 — /tmp is the only writable path in the read-only image
 
 
 class Component(ComponentBase):
-    """
-    Extends base class for general Python components. Initializes the CommonInterface
-    and performs configuration validation.
-
-    For easier debugging the data folder is picked up by default from `../data` path,
-    relative to working directory.
-
-    If `debug` parameter is present in the `config.json`, the default logger is set to verbose DEBUG mode.
-    """
+    """Orchestrates a configured Claude agent run over Keboola data."""
 
     def __init__(self):
         super().__init__()
+        self._sdk_manager = SdkVersionManager()
+        self._plugin_manager = PluginManager()
+        self._output_writer = OutputWriter(self)
+        self._runner = ClaudeRunner(workspace_dir=WORKSPACE_DIR)
 
     def run(self):
-        """
-        Main execution code
-        """
+        """Orchestrate the run: ensure SDK, prepare env, run tasks, finalize."""
+        config = Configuration(**self.configuration.parameters)
+        logging.info("Starting Claude SDK run: %s", config.log_safe_summary())
 
-        # ####### EXAMPLE TO REMOVE
-        # check for missing configuration parameters
-        params = Configuration(**self.configuration.parameters)
+        sdk_version, plugin_result, env = self._ensure_sdk_and_env(config)
+        transcript = self._build_transcript(config, sdk_version, plugin_result.resolved)
 
-        # Access parameters in configuration
-        if params.print_hello:
-            logging.info("Hello World")
+        tasks = TaskSource(config).load(self.get_input_tables_definitions())
+        results = [self._run_one_task(task, config, plugin_result.sdk_plugins, env, transcript) for task in tasks]
 
-        # get input table definitions
-        input_tables = self.get_input_tables_definitions()
-        for table in input_tables:
-            logging.info("Received input table: %s with path: %s", table.name, table.full_path)
+        self._finalize(config, transcript, results)
 
-        if len(input_tables) == 0:
-            raise UserException("No input tables found")
+    def _ensure_sdk_and_env(self, config: Configuration):
+        """Step 1a + 2: resolve the SDK version, prepare plugins and the env."""
+        sdk_version = self._sdk_manager.ensure(config.sdk_version, config.sdk_version_on_failure.value)
+        env = self._build_env(config)
+        plugin_result = self._plugin_manager.prepare(config.plugins, env, github_token=config.github_token)
+        os.makedirs(WORKSPACE_DIR, exist_ok=True)
+        self._output_writer.ensure_dir()
+        return sdk_version, plugin_result, env
 
-        # get last state data/in/state.json from previous run
-        previous_state = self.get_state_file()
-        logging.info(previous_state.get("some_parameter"))
+    @staticmethod
+    def _build_env(config: Configuration) -> dict[str, str]:
+        """Build the subprocess env (secrets injected; never logged)."""
+        env: dict[str, str] = {
+            "ANTHROPIC_API_KEY": config.anthropic_key,
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+        }
+        if config.github_token:
+            env["GITHUB_TOKEN"] = config.github_token
+            env["GH_TOKEN"] = config.github_token
+        return env
 
-        # Create output table (Table definition - just metadata)
-        table = self.create_out_table_definition("output.csv", incremental=True, primary_key=["timestamp"])
+    def _build_transcript(self, config: Configuration, sdk_version: str, plugins_resolved: dict[str, str]):
+        secrets = [s for s in (config.anthropic_key, config.github_token) if s]
+        return TranscriptWriter(
+            component=self,
+            files_out_path=self.files_out_path,
+            sdk_version_resolved=sdk_version,
+            plugins_resolved=plugins_resolved,
+            secret_values=secrets,
+        )
 
-        # get file path of the table (data/out/tables/Features.csv)
-        out_table_path = table.full_path
-        logging.info(out_table_path)
+    def _run_one_task(self, task: Task, config: Configuration, plugin_paths, env, transcript: TranscriptWriter):
+        """Run one task inside its own event loop, teeing messages to the transcript."""
+        logging.info("Running task '%s'.", task.task_id)
+        options = self._runner.build_options(task, config, plugin_paths, env)
+        transcript.begin_task(task.task_id)
+        result = asyncio.run(self._runner.run_task(task, options, on_message=transcript.on_message))
+        result.extra_args["model"] = task.model or config.model.value
+        transcript.end_task(result)
+        return result
 
-        # Add timestamp column and save into out_table_path
-        input_table = input_tables[0]
-        with (
-            open(input_table.full_path) as inp_file,
-            open(table.full_path, mode="w", encoding="utf-8", newline="") as out_file,
-        ):
-            reader = csv.DictReader(inp_file)
+    def _finalize(self, config: Configuration, transcript: TranscriptWriter, results):
+        """Promote agent outputs, flush transcripts (always), decide exit code."""
+        self._output_writer.promote(default_incremental=config.output.default_incremental)
+        transcript.flush()
 
-            columns = list(reader.fieldnames)
-            # append timestamp
-            columns.append("timestamp")
+        failed = [r for r in results if not r.success]
+        if failed:
+            details = "; ".join(f"{r.task_id}: {r.error_message or r.subtype}" for r in failed)
+            raise UserException(f"{len(failed)} of {len(results)} task(s) failed: {details}")
+        logging.info("All %d task(s) completed successfully.", len(results))
 
-            # write result with column added
-            writer = csv.DictWriter(out_file, fieldnames=columns)
-            writer.writeheader()
-            for in_row in reader:
-                in_row["timestamp"] = datetime.now().isoformat()
-                writer.writerow(in_row)
-
-        # Save table manifest (output.csv.manifest) from the Table definition
-        self.write_manifest(table)
-
-        # Write new state - will be available next run
-        self.write_state_file({"some_state_parameter": "value"})
-
-        # ####### EXAMPLE TO REMOVE END
+    @sync_action("testConnection")
+    def test_connection(self):
+        """Validate #anthropic_key with a single cheap in-process API call."""
+        config = Configuration(**self.configuration.parameters)
+        return check_anthropic_connection(config.anthropic_key)
 
 
-"""
-        Main entrypoint
-"""
 if __name__ == "__main__":
     try:
         comp = Component()
-        # this triggers the run method by default and is controlled by the configuration.action parameter
         comp.execute_action()
     except UserException as exc:
         logging.exception(exc)

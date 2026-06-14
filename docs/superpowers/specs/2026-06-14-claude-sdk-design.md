@@ -261,8 +261,6 @@ re-pull fails mid-run).
 
 ### 2.9 Platform env & token forwarding
 
-### 2.9 Platform env & token forwarding
-
 - `KBC_DATADIR` (=`/data/`), `KBC_COMPONENTID`, `KBC_CONFIGID`, `KBC_BRANCHID` (absent on default
   branch) used as normal; all handled by the python-component library.
 - **Keboola MCP server** (optional convenience server) needs `KBC_STORAGE_TOKEN` + `KBC_STORAGE_API_URL`.
