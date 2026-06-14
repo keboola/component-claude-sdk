@@ -62,6 +62,11 @@ def test_task_id_filter_string_normalised_to_list():
     assert cfg.selected_task_ids() == ["sync-orders"]
 
 
+def test_task_id_filter_comma_separated_string_split():
+    cfg = Configuration(**_base(task_id_filter="sync-orders, summarize ,"))
+    assert cfg.selected_task_ids() == ["sync-orders", "summarize"]
+
+
 def test_task_id_filter_empty_string_is_none():
     cfg = Configuration(**_base(task_id_filter="   "))
     assert cfg.selected_task_ids() is None

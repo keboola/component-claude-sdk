@@ -214,12 +214,17 @@ class Configuration(BaseModel):
     @field_validator("task_id_filter", mode="before")
     @classmethod
     def _normalise_task_filter(cls, v):
-        """Normalise to ``None`` (all rows) or a non-empty list of task_ids."""
+        """Normalise to ``None`` (all rows) or a non-empty list of task_ids.
+
+        The UI surfaces this as a free-text field, so a single string may carry
+        a comma-separated list (``"a, b"``); split it. A native list is taken
+        as-is. Matching is exact string equality per spec §2.3.1.
+        """
         if v is None:
             return None
         if isinstance(v, str):
-            v = v.strip()
-            return [v] if v else None
+            cleaned = [part.strip() for part in v.split(",") if part.strip()]
+            return cleaned or None
         if isinstance(v, list):
             cleaned = [str(item).strip() for item in v if str(item).strip()]
             return cleaned or None
