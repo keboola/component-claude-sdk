@@ -135,3 +135,23 @@ def test_token_scrubbed_from_logs(monkeypatch, caplog):
         PluginManager().prepare([entry], {}, github_token="GH_SECRET_VALUE")
     assert "GH_SECRET_VALUE" not in str(exc.value)
     assert "***" in str(exc.value)
+
+
+def test_full_secret_set_scrubbed_not_just_github_token(monkeypatch):
+    """The CLI env also carries ANTHROPIC_API_KEY / MCP secrets; the scrub must
+    redact the FULL secret set, not only the github_token."""
+
+    def run_leaking_anthropic_key(cmd, capture_output, text, env):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="boom leaked ANTHROPIC_VALUE and MCP_VALUE")
+
+    monkeypatch.setattr(subprocess, "run", run_leaking_anthropic_key)
+    monkeypatch.setattr("os.makedirs", lambda *a, **k: None)
+    entry = PluginEntry(source="acme/repo", plugins=["x"], version="latest")
+    with pytest.raises(UserException) as exc:
+        PluginManager().prepare(
+            [entry], {}, github_token="GH_VALUE", secret_values=["ANTHROPIC_VALUE", "MCP_VALUE", "GH_VALUE"]
+        )
+    msg = str(exc.value)
+    assert "ANTHROPIC_VALUE" not in msg
+    assert "MCP_VALUE" not in msg
+    assert "***" in msg

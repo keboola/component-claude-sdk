@@ -172,3 +172,88 @@ def test_workspace_input_files_off_does_not_stage(tmp_path, monkeypatch):
 
     comp.run()
     assert not os.path.exists(os.path.join(workspace, "doc.txt"))
+
+
+def test_transcript_flushed_when_promote_raises(tmp_path, monkeypatch):
+    """If promote() raises (e.g. incremental-without-PK) the write_always
+    claude_sessions/claude_runs tables MUST still be written (flush in finally)."""
+    import pytest
+    from keboola.component.exceptions import UserException
+
+    data_dir = _make_datadir(
+        tmp_path,
+        {"#anthropic_key": "KEY_NAME_ONLY", "task": {"prompt": "x"}},
+    )
+    monkeypatch.setenv("KBC_DATADIR", data_dir)
+    comp = Component()
+    _patch_sdk(monkeypatch, comp, _canned_stream())
+    # force promote() to raise
+    monkeypatch.setattr(comp._output_writer, "promote", lambda **kw: (_ for _ in ()).throw(UserException("boom")))
+
+    with pytest.raises(UserException) as exc:
+        comp.run()
+    assert "boom" in str(exc.value)
+    # durable transcript written despite the promote failure
+    assert os.path.isfile(os.path.join(data_dir, "out", "tables", "claude_sessions.csv"))
+    assert os.path.isfile(os.path.join(data_dir, "out", "tables", "claude_runs.csv"))
+
+
+def test_transcript_flushed_when_run_task_raises(tmp_path, monkeypatch):
+    """If the SDK query loop raises, the buffered transcript rows from before the
+    raise must still be flushed (finally), and it surfaces as exit-1 UserException."""
+    import pytest
+    from keboola.component.exceptions import UserException
+
+    data_dir = _make_datadir(
+        tmp_path,
+        {"#anthropic_key": "KEY_NAME_ONLY", "task": {"prompt": "x"}},
+    )
+    monkeypatch.setenv("KBC_DATADIR", data_dir)
+    comp = Component()
+
+    from claude_agent_sdk import ProcessError, SystemMessage
+
+    def raising_stream(prompt, options):
+        async def gen():
+            # one message is teed (buffered) before the loop raises
+            yield SystemMessage(subtype="init", data={"session_id": "s"})
+            raise ProcessError("CLI exited with 401 invalid api key", exit_code=1)
+
+        return gen()
+
+    monkeypatch.setattr(comp._runner, "_query", raising_stream)
+
+    with pytest.raises(UserException) as exc:
+        comp.run()
+    # auth-classified message (exit 1, not opaque exit 2)
+    assert "#anthropic_key" in str(exc.value)
+    # the buffered session row was still flushed
+    assert os.path.isfile(os.path.join(data_dir, "out", "tables", "claude_sessions.csv"))
+
+
+def test_run_task_launch_failure_is_user_exception(tmp_path, monkeypatch):
+    """A CLI-not-found / connection failure surfaces as a clear exit-1 message."""
+    import pytest
+    from keboola.component.exceptions import UserException
+
+    data_dir = _make_datadir(
+        tmp_path,
+        {"#anthropic_key": "KEY_NAME_ONLY", "task": {"prompt": "x"}},
+    )
+    monkeypatch.setenv("KBC_DATADIR", data_dir)
+    comp = Component()
+
+    from claude_agent_sdk import CLINotFoundError
+
+    def raising_stream(prompt, options):
+        async def gen():
+            raise CLINotFoundError("claude binary not found")
+            yield  # pragma: no cover
+
+        return gen()
+
+    monkeypatch.setattr(comp._runner, "_query", raising_stream)
+
+    with pytest.raises(UserException) as exc:
+        comp.run()
+    assert "CLI/MCP failed to launch" in str(exc.value)

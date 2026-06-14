@@ -25,6 +25,7 @@ import logging
 import os
 import shutil
 
+from keboola.component.base import ComponentBase
 from keboola.component.dao import BaseType, ColumnDefinition
 from keboola.component.exceptions import UserException
 
@@ -35,7 +36,7 @@ META_SUFFIX = ".meta.json"
 class OutputWriter:
     """Reconciles the agent's filesystem outputs into manifested tables."""
 
-    def __init__(self, component, agent_output_dir: str = AGENT_OUTPUT_DIR) -> None:
+    def __init__(self, component: ComponentBase, agent_output_dir: str = AGENT_OUTPUT_DIR) -> None:
         self._component = component
         self._agent_output_dir = agent_output_dir
 

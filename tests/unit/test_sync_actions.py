@@ -19,8 +19,13 @@ class FakeHttpClient:
         self.calls = []
 
     def post_raw(self, endpoint_path=None, headers=None, json=None, **kwargs):
-        self.calls.append({"endpoint": endpoint_path, "headers": headers, "json": json})
+        self.calls.append({"endpoint": endpoint_path, "headers": headers, "json": json, "kwargs": kwargs})
         return self._response
+
+
+class RaisingHttpClient:
+    def post_raw(self, *args, **kwargs):
+        raise ConnectionError("connection refused")
 
 
 def test_success_returns_validation_result():
@@ -50,3 +55,15 @@ def test_other_error_raises():
 def test_empty_key_raises():
     with pytest.raises(UserException):
         check_anthropic_connection("", http_client=FakeHttpClient(FakeResponse(200)))
+
+
+def test_connection_error_becomes_user_exception():
+    with pytest.raises(UserException) as exc:
+        check_anthropic_connection("KEY", http_client=RaisingHttpClient())
+    assert "Could not reach the Anthropic API" in str(exc.value)
+
+
+def test_request_passes_explicit_timeout():
+    client = FakeHttpClient(FakeResponse(200, "{}"))
+    check_anthropic_connection("KEY", http_client=client)
+    assert client.calls[0]["kwargs"].get("timeout") is not None

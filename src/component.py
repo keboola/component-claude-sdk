@@ -12,14 +12,15 @@ import asyncio
 import logging
 import os
 import shutil
+import sys
 
 from keboola.component.base import ComponentBase, sync_action
 from keboola.component.exceptions import UserException
 
-from claude_runner import ClaudeRunner
+from claude_runner import ClaudeRunner, ClaudeRunResult
 from configuration import Configuration
 from output_writer import OutputWriter
-from plugin_manager import PluginManager
+from plugin_manager import PluginManager, PluginResult
 from sdk_version_manager import SdkVersionManager
 from sync_actions import check_anthropic_connection
 from tasks import Task, TaskSource
@@ -38,29 +39,52 @@ class Component(ComponentBase):
         self._output_writer = OutputWriter(self)
         self._runner = ClaudeRunner(workspace_dir=WORKSPACE_DIR)
 
-    def run(self):
-        """Orchestrate the run: ensure SDK, prepare env, run tasks, finalize."""
+    def run(self) -> None:
+        """Orchestrate the run: ensure SDK, prepare env, run tasks, finalize.
+
+        The ``write_always`` transcript tables MUST be flushed even when a task
+        loop or output promotion raises, so the per-task work and ``promote()``
+        run inside a ``try`` whose ``finally`` always flushes the transcript
+        before any exception propagates (output-state durability guarantee).
+        """
         config = Configuration(**self.configuration.parameters)
         logging.info("Starting Claude SDK run: %s", config.log_safe_summary())
 
         sdk_version, plugin_result, env = self._ensure_sdk_and_env(config)
         transcript = self._build_transcript(config, sdk_version, plugin_result.resolved)
-
         tasks = TaskSource(config).load(self.get_input_tables_definitions())
-        results = [self._run_one_task(task, config, plugin_result.sdk_plugins, env, transcript) for task in tasks]
 
-        self._finalize(config, transcript, results)
+        results: list[ClaudeRunResult] = []
+        try:
+            for task in tasks:
+                results.append(self._run_one_task(task, config, plugin_result.sdk_plugins, env, transcript))
+            self._output_writer.promote(default_incremental=config.output.default_incremental)
+        finally:
+            transcript.flush()
 
-    def _ensure_sdk_and_env(self, config: Configuration):
+        self._report_outcome(results)
+
+    def _ensure_sdk_and_env(self, config: Configuration) -> tuple[str, PluginResult, dict[str, str]]:
         """Step 1a + 2: resolve the SDK version, prepare plugins and the env."""
         sdk_version = self._sdk_manager.ensure(config.sdk_version, config.sdk_version_on_failure.value)
         env = self._build_env(config)
-        plugin_result = self._plugin_manager.prepare(config.plugins, env, github_token=config.github_token)
+        plugin_result = self._plugin_manager.prepare(
+            config.plugins, env, github_token=config.github_token, secret_values=self._secret_values(config)
+        )
         os.makedirs(WORKSPACE_DIR, exist_ok=True)
         self._output_writer.ensure_dir()
         if config.workspace_input_files:
             self._stage_input_files()
         return sdk_version, plugin_result, env
+
+    @staticmethod
+    def _secret_values(config: Configuration) -> list[str]:
+        """All secret strings to scrub from any captured output (defense-in-depth)."""
+        secrets = [config.anthropic_key, config.github_token]
+        for server in config.mcp_servers:
+            secrets.extend(getattr(server, "env", {}).values())
+            secrets.extend(getattr(server, "headers", {}).values())
+        return [s for s in secrets if s]
 
     def _stage_input_files(self) -> None:
         """Copy /data/in/files/ into the agent workspace so the agent can read them.
@@ -93,17 +117,25 @@ class Component(ComponentBase):
             env["GH_TOKEN"] = config.github_token
         return env
 
-    def _build_transcript(self, config: Configuration, sdk_version: str, plugins_resolved: dict[str, str]):
-        secrets = [s for s in (config.anthropic_key, config.github_token) if s]
+    def _build_transcript(
+        self, config: Configuration, sdk_version: str, plugins_resolved: dict[str, str]
+    ) -> TranscriptWriter:
         return TranscriptWriter(
             component=self,
             files_out_path=self.files_out_path,
             sdk_version_resolved=sdk_version,
             plugins_resolved=plugins_resolved,
-            secret_values=secrets,
+            secret_values=self._secret_values(config),
         )
 
-    def _run_one_task(self, task: Task, config: Configuration, plugin_paths, env, transcript: TranscriptWriter):
+    def _run_one_task(
+        self,
+        task: Task,
+        config: Configuration,
+        plugin_paths: list[dict[str, str]],
+        env: dict[str, str],
+        transcript: TranscriptWriter,
+    ) -> ClaudeRunResult:
         """Run one task inside its own event loop, teeing messages to the transcript."""
         logging.info("Running task '%s'.", task.task_id)
         options = self._runner.build_options(task, config, plugin_paths, env)
@@ -113,11 +145,9 @@ class Component(ComponentBase):
         transcript.end_task(result)
         return result
 
-    def _finalize(self, config: Configuration, transcript: TranscriptWriter, results):
-        """Promote agent outputs, flush transcripts (always), decide exit code."""
-        self._output_writer.promote(default_incremental=config.output.default_incremental)
-        transcript.flush()
-
+    @staticmethod
+    def _report_outcome(results: list[ClaudeRunResult]) -> None:
+        """Decide the exit: any failed task -> UserException (exit 1)."""
         failed = [r for r in results if not r.success]
         if failed:
             details = "; ".join(f"{r.task_id}: {r.error_message or r.subtype}" for r in failed)
@@ -137,7 +167,7 @@ if __name__ == "__main__":
         comp.execute_action()
     except UserException as exc:
         logging.exception(exc)
-        exit(1)
+        sys.exit(1)
     except Exception as exc:
         logging.exception(exc)
-        exit(2)
+        sys.exit(2)

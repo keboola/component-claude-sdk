@@ -30,6 +30,7 @@ import logging
 import os
 from typing import Any
 
+from keboola.component.base import ComponentBase
 from keboola.component.dao import BaseType, ColumnDefinition
 
 from claude_runner import ClaudeRunResult
@@ -94,7 +95,7 @@ class TranscriptWriter:
 
     def __init__(
         self,
-        component,
+        component: ComponentBase,
         files_out_path: str,
         sdk_version_resolved: str,
         plugins_resolved: dict[str, str],
@@ -206,7 +207,7 @@ class TranscriptWriter:
 
     # --- helpers --------------------------------------------------------------
 
-    def _message_to_row(self, message: Any) -> dict[str, str]:
+    def _message_to_row(self, message: Any) -> dict[str, Any]:
         """Project one SDK message onto the claude_sessions columns."""
         msg_type = type(message).__name__
         row = {

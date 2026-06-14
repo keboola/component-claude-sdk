@@ -18,6 +18,8 @@ ANTHROPIC_API_URL = "https://api.anthropic.com"
 ANTHROPIC_VERSION = "2023-06-01"
 # Cheapest model for the validation ping; 1 token keeps cost negligible.
 TEST_MODEL = "claude-haiku-4-5"
+# Bound the connection test so a hung endpoint fails fast rather than blocking the UI.
+REQUEST_TIMEOUT_S = 15
 
 
 def check_anthropic_connection(anthropic_key: str, http_client: HttpClient | None = None) -> ValidationResult:
@@ -41,7 +43,13 @@ def check_anthropic_connection(anthropic_key: str, http_client: HttpClient | Non
         "messages": [{"role": "user", "content": "ping"}],
     }
 
-    response = client.post_raw("/v1/messages", headers=headers, json=payload)
+    try:
+        response = client.post_raw("/v1/messages", headers=headers, json=payload, timeout=REQUEST_TIMEOUT_S)
+    except Exception as exc:
+        # A connection error / exhausted RetryError must surface as a clean exit 1,
+        # not an opaque exit 2.
+        raise UserException(f"Could not reach the Anthropic API: {exc}") from exc
+
     if response.status_code == 200:
         logging.info("Anthropic connection test succeeded.")
         return ValidationResult("Connection to the Anthropic API succeeded.")

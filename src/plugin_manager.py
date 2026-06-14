@@ -40,14 +40,26 @@ class PluginManager:
     def __init__(self, claude_home: str = CLAUDE_HOME) -> None:
         self._claude_home = claude_home
         self._cache_dir = f"{claude_home}/plugins/cache"
+        self._secret_values: list[str] = []
 
-    def prepare(self, plugins: list[PluginEntry], env: dict[str, str], github_token: str = "") -> PluginResult:
+    def prepare(
+        self,
+        plugins: list[PluginEntry],
+        env: dict[str, str],
+        github_token: str = "",
+        secret_values: list[str] | None = None,
+    ) -> PluginResult:
         """Install every configured plugin and return SDK local-plugin configs.
 
         ``env`` is mutated in place with the plugin/home env vars so the caller's
-        subprocess (and the SDK) share the writable home. Secret scrubbing for
-        logs is keyed on ``github_token`` when present.
+        subprocess (and the SDK) share the writable home. ``secret_values`` is the
+        FULL set of secret strings (Anthropic key, GitHub token, MCP secrets) to
+        scrub from any captured CLI output — defense-in-depth, symmetric scrub.
+        ``github_token`` is also used for the private-source auth requirement.
         """
+        # Scrub the full secret set (caller-provided) plus the github_token.
+        self._secret_values = [s for s in {*(secret_values or []), github_token} if s]
+
         env["CLAUDE_CONFIG_DIR"] = self._claude_home
         env["CLAUDE_CODE_PLUGIN_CACHE_DIR"] = self._cache_dir
         env["CLAUDE_CODE_PLUGIN_KEEP_MARKETPLACE_ON_FAILURE"] = "1"
@@ -68,18 +80,18 @@ class PluginManager:
         marketplace = self._marketplace_name(source)
 
         if entry.version == "latest":
-            self._run(["plugin", "marketplace", "add", source], env, github_token, source)
-            self._run(["plugin", "marketplace", "update", marketplace], env, github_token, source)
+            self._run(["plugin", "marketplace", "add", source], env, source)
+            self._run(["plugin", "marketplace", "update", marketplace], env, source)
         else:
             pinned_source = self._pin_source(source, entry.version)
-            self._run(["plugin", "marketplace", "add", pinned_source], env, github_token, source)
+            self._run(["plugin", "marketplace", "add", pinned_source], env, source)
 
         plugin_names = entry.plugins or ["*"]
         for name in plugin_names:
-            self._install_plugin(name, marketplace, env, github_token, source)
+            self._install_plugin(name, marketplace, env, source)
             result.resolved[f"{marketplace}/{name}"] = entry.version
 
-        for path in self._cache_paths(marketplace, env, github_token, source):
+        for path in self._cache_paths(marketplace, env, source):
             result.sdk_plugins.append({"type": "local", "path": path})
 
     @staticmethod
@@ -115,19 +127,13 @@ class PluginManager:
             return f"{source}#{ref}"
         return f"{source}@{ref}"
 
-    def _install_plugin(
-        self, name: str, marketplace: str, env: dict[str, str], github_token: str, source: str
-    ) -> None:
+    def _install_plugin(self, name: str, marketplace: str, env: dict[str, str], source: str) -> None:
         target = marketplace if name == "*" else f"{name}@{marketplace}"
-        self._run(["plugin", "install", target], env, github_token, source)
+        self._run(["plugin", "install", target], env, source)
 
-    def _cache_paths(
-        self, marketplace: str, env: dict[str, str], github_token: str, source: str
-    ) -> list[str]:
+    def _cache_paths(self, marketplace: str, env: dict[str, str], source: str) -> list[str]:
         """Resolve the local cache paths of the installed marketplace plugins."""
-        proc = self._run(
-            ["plugin", "marketplace", "list", "--json"], env, github_token, source, check=False
-        )
+        proc = self._run(["plugin", "marketplace", "list", "--json"], env, source, check=False)
         paths: list[str] = []
         try:
             data = json.loads(proc.stdout or "[]")
@@ -148,7 +154,6 @@ class PluginManager:
         self,
         args: list[str],
         env: dict[str, str],
-        github_token: str,
         source: str,
         check: bool = True,
     ) -> subprocess.CompletedProcess:
@@ -156,21 +161,20 @@ class PluginManager:
         cmd = ["claude", *args]
         proc = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, **env})
         logging.info("claude %s -> exit %s", " ".join(args), proc.returncode)
-        scrubbed_out = self._scrub(proc.stdout, github_token)
+        scrubbed_out = self._scrub(proc.stdout)
         if scrubbed_out.strip():
             logging.debug("claude %s stdout: %s", args[0], scrubbed_out)
         if check and proc.returncode != 0:
-            scrubbed_err = self._scrub(proc.stderr or proc.stdout, github_token)
+            scrubbed_err = self._scrub(proc.stderr or proc.stdout)
             raise UserException(
                 f"Plugin command 'claude {' '.join(args)}' failed for source '{source}': {scrubbed_err.strip()}"
             )
         return proc
 
-    @staticmethod
-    def _scrub(text: str | None, github_token: str) -> str:
-        """Remove the GitHub token value from any text destined for the log."""
+    def _scrub(self, text: str | None) -> str:
+        """Redact every known secret value from text destined for a log/message."""
         if not text:
             return ""
-        if github_token:
-            text = text.replace(github_token, "***")
+        for secret in self._secret_values:
+            text = text.replace(secret, "***")
         return text

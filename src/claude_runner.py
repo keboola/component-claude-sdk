@@ -13,10 +13,15 @@ import logging
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from keboola.component.exceptions import UserException
 
 from configuration import Configuration, McpRemoteServer, McpStdioServer
 from tasks import Task
+
+if TYPE_CHECKING:  # import only for type-checkers; runtime import stays lazy/overlay-safe
+    from claude_agent_sdk import ClaudeAgentOptions
 
 # Budget-cap result subtypes the SDK emits (spec §4 / §12: it is a subtype value).
 BUDGET_CAP_SUBTYPES = frozenset({"error_max_budget", "error_max_budget_usd"})
@@ -58,7 +63,7 @@ class ClaudeRunner:
         config: Configuration,
         plugin_paths: list[dict[str, str]],
         env: dict[str, str],
-    ):
+    ) -> ClaudeAgentOptions:
         """Map merged (config + task) settings to a ClaudeAgentOptions.
 
         Lazy SDK import keeps the runtime overlay safe.
@@ -100,7 +105,7 @@ class ClaudeRunner:
 
         return ClaudeAgentOptions(**kwargs)
 
-    def _write_settings_file(self, settings_json: dict | str | None, env: dict[str, str]) -> str | None:
+    def _write_settings_file(self, settings_json: dict[str, Any] | str | None, env: dict[str, str]) -> str | None:
         """Persist the ``settings_json`` passthrough to a file and return its path.
 
         ``ClaudeAgentOptions.settings`` is a file PATH, so we materialise the
@@ -143,17 +148,38 @@ class ClaudeRunner:
     async def run_task(
         self,
         task: Task,
-        options,
+        options: Any,
         on_message: Callable[[Any], Awaitable[None] | None],
     ) -> ClaudeRunResult:
-        """Run one task, teeing every message to ``on_message``; capture result."""
+        """Run one task, teeing every message to ``on_message``; capture result.
+
+        A raise from the SDK query loop is translated into a ``UserException``
+        (exit 1) with an actionable message, rather than escaping as an opaque
+        exit 2. The lazy SDK import keeps the runtime overlay safe.
+        """
+        from claude_agent_sdk import CLIConnectionError, CLINotFoundError, ProcessError
+
         result_message = None
-        async for message in self._query(task.prompt, options):
-            maybe = on_message(message)
-            if maybe is not None:
-                await maybe
-            if type(message).__name__ == "ResultMessage":
-                result_message = message
+        try:
+            async for message in self._query(task.prompt, options):
+                maybe = on_message(message)
+                if maybe is not None:
+                    await maybe
+                if type(message).__name__ == "ResultMessage":
+                    result_message = message
+        except (CLINotFoundError, CLIConnectionError) as exc:
+            raise UserException(
+                f"The agent CLI/MCP failed to launch for task '{task.task_id}': {exc}"
+            ) from exc
+        except ProcessError as exc:
+            detail = str(exc)
+            if self._looks_like_auth_error(detail):
+                raise UserException(
+                    f"Anthropic authentication failed for task '{task.task_id}' — check #anthropic_key."
+                ) from exc
+            raise UserException(
+                f"The agent process failed for task '{task.task_id}': {detail}"
+            ) from exc
 
         if result_message is None:
             logging.warning("Task '%s' produced no ResultMessage.", task.task_id)
@@ -163,6 +189,11 @@ class ClaudeRunner:
                 error_message="No result message returned by the agent (run did not complete).",
             )
         return self._to_result(task, result_message)
+
+    @staticmethod
+    def _looks_like_auth_error(detail: str) -> bool:
+        lowered = detail.lower()
+        return any(s in lowered for s in ("401", "authentication", "unauthorized", "invalid api key", "api key"))
 
     @staticmethod
     def _to_result(task: Task, message: Any) -> ClaudeRunResult:
@@ -192,7 +223,7 @@ class ClaudeRunner:
             error_message=error_message,
         )
 
-    def _query(self, prompt: str, options) -> AsyncIterator[Any]:
+    def _query(self, prompt: str, options: ClaudeAgentOptions) -> AsyncIterator[Any]:
         """The SDK seam — lazily imports and calls ``query``.
 
         Tests monkeypatch this to yield a canned, typed message stream so the

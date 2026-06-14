@@ -77,7 +77,7 @@ class SdkVersionManager:
             raise UserException(
                 f"Failed to install requested SDK version '{sdk_version}': {detail}. "
                 f"Set sdk_version_on_failure='fallback_pinned' to continue on the baked version instead."
-            )
+            ) from exc
         logging.warning(
             "Could not install SDK version '%s' (%s); falling back to the baked version.",
             sdk_version,

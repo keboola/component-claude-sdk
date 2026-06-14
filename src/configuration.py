@@ -194,7 +194,7 @@ class Configuration(BaseModel):
             super().__init__(**data)
         except ValidationError as e:
             error_messages = [f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}" for err in e.errors()]
-            raise UserException(f"Configuration validation error: {', '.join(error_messages)}")
+            raise UserException(f"Configuration validation error: {', '.join(error_messages)}") from e
 
     @field_validator("permission_mode", mode="before")
     @classmethod

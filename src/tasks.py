@@ -141,8 +141,8 @@ class TaskSource:
             return None
         try:
             return int(value)
-        except ValueError:
-            raise UserException(f"Invalid integer for '{column}' on task_id '{task_id}': {value!r}.")
+        except ValueError as exc:
+            raise UserException(f"Invalid integer for '{column}' on task_id '{task_id}': {value!r}.") from exc
 
     @staticmethod
     def _parse_float(value: str | None, column: str, task_id: str) -> float | None:
@@ -151,8 +151,8 @@ class TaskSource:
             return None
         try:
             return float(value)
-        except ValueError:
-            raise UserException(f"Invalid number for '{column}' on task_id '{task_id}': {value!r}.")
+        except ValueError as exc:
+            raise UserException(f"Invalid number for '{column}' on task_id '{task_id}': {value!r}.") from exc
 
     def _apply_task_id_filter(self, tasks: list[Task]) -> list[Task]:
         """Keep only the rows whose task_id matches the filter (spec §2.3.1)."""
