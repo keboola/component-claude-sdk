@@ -206,9 +206,11 @@ complementary sinks, both `write_always`:**
 
 We also always write a **`claude_runs.csv`** summary table (one row per task) from the final
 `ResultMessage`: `task_id, session_id, success, subtype, is_error, num_turns, duration_ms,
-total_cost_usd, model, api_error_status, result_text`. `write_always: true`, `incremental: true`,
-PK `["task_id","session_id"]`, native `schema` with real numeric types. This is the usage/cost report
-(§9) and the at-a-glance run outcome.
+total_cost_usd, model, sdk_version_resolved, plugins_resolved, api_error_status, result_text`.
+`sdk_version_resolved` is the SDK version actually used (§2.10) and `plugins_resolved` the resolved
+plugin refs (§2.8) — so a `latest` run for either is traceable. `write_always: true`,
+`incremental: true`, PK `["task_id","session_id"]`, native `schema` with real numeric types. This is
+the usage/cost report (§9) and the at-a-glance run outcome.
 
 **Why both file + table:** the table is for querying/monitoring/cost-tracking in SQL; the file is the
 full-fidelity debug artifact (some tool payloads are large/awkward for a table cell). The brief
@@ -224,16 +226,40 @@ hard ceiling of **$10** (the build decision) — the component clamps the effect
 ≤ $10. There is **no top-level wall-clock timeout** in the SDK, so runs are bounded by `max_turns` +
 `max_budget_usd` together (both always set; see §9).
 
-### 2.8 Runtime plugin add/update → writable `CLAUDE_CONFIG_DIR` + CLI
+### 2.8 Runtime plugins — public + private, pin or latest (decision 9, refined)
 
-(decision 7 mechanism; full detail in §6.4 and research Q4.) Plugins **cannot** be baked into the
-read-only image, so at job start we point `CLAUDE_CONFIG_DIR` (and `CLAUDE_CODE_PLUGIN_CACHE_DIR`) at a
-writable `/tmp/claude-home`, then per configured marketplace run the **non-interactive** CLI:
-`claude plugin marketplace add <source>` → (for updates) `claude plugin marketplace update` →
-`claude plugin install <plugin>@<marketplace>`, then load the resulting cache dirs into the SDK via
-`plugins=[{"type":"local","path": <cache-path>}]` (the Python SDK only supports `type:"local"`).
-Private sources authenticate via `GITHUB_TOKEN`/`GH_TOKEN` (and `GITLAB_TOKEN`/`BITBUCKET_TOKEN` if a
-user supplies those) injected into the subprocess `env`.
+Plugins **cannot** be baked into the read-only image, so they are added/installed at job start into a
+writable `/tmp/claude-home` (via `CLAUDE_CONFIG_DIR` / `CLAUDE_CODE_PLUGIN_CACHE_DIR`) and loaded into
+the SDK by local path (the Python SDK only supports `{"type":"local","path": …}`). The config models
+plugins as a **structured list** that handles **both public and private sources** and lets **each entry
+choose a pinned ref or `latest`:**
+
+**`plugins`** (a list; each entry):
+
+| Field | Meaning |
+|---|---|
+| `source` | The marketplace source. Either a **known-public shorthand** (e.g. `superpowers`, resolved to its canonical public GitHub `owner/repo` from a small built-in registry of vetted public marketplaces) **or** an explicit source: `owner/repo` (GitHub), a git URL, or a remote `marketplace.json` URL. **Private** sources (e.g. the CF Kit's private repo) use the same `owner/repo`/URL form and authenticate via `#github_token` (§2.4) — no separate field needed. |
+| `private` | bool, default inferred (`false` for shorthands, else the user can mark `true`); if `true`, requires `#github_token` to be set or it's a `UserException`. |
+| `plugins` | the plugin name(s) to install from that marketplace (list[str]; or `["*"]` / omitted = install all the marketplace offers). |
+| `version` | **`latest`** (default) **or a pinned ref** — a git tag, commit SHA, or branch. Per entry. |
+
+**Runtime flow per entry** (concrete in §6.4): `claude plugin marketplace add <resolved-source>` →
+if `version=latest`: `claude plugin marketplace update` (re-pull newest) ; if `version=<ref>`: add the
+marketplace at that ref (the source already carries `@ref`/`#ref` so the cached version is pinned) →
+`claude plugin install <plugin>@<marketplace>` → collect the resulting cache path(s) → pass as
+`plugins=[{"type":"local","path": <cache-path>}]`. **Examples:** a public `{source: "superpowers",
+version: "latest"}` and a private `{source: "keboola/cf-claude-code-kit", private: true, plugins:
+["component-developer"], version: "v1.4.0"}` (authed by `#github_token`) can both appear in one config.
+
+**Pin/latest semantics are unified with the SDK update model (§2.10):** `version: <ref>` =
+reproducible pinned install (no `marketplace update`); `version: latest` = re-pull newest on every run
+(not reproducible — the resolved ref is recorded in the run log). Private sources authenticate via
+`GITHUB_TOKEN`/`GH_TOKEN` (and `GITLAB_TOKEN`/`BITBUCKET_TOKEN` if supplied) injected into the
+subprocess `env`. A fetch/install failure for a user-supplied source is a clear `UserException` (the
+`CLAUDE_CODE_PLUGIN_KEEP_MARKETPLACE_ON_FAILURE=1` env keeps a usable stale cache when a `latest`
+re-pull fails mid-run).
+
+### 2.9 Platform env & token forwarding
 
 ### 2.9 Platform env & token forwarding
 
@@ -244,6 +270,46 @@ user supplies those) injected into the subprocess `env`.
   granted, the Keboola-MCP convenience is unavailable but the component still works with the
   user-supplied Anthropic key and any **non-Keboola** MCP servers. We do **not** make `forward_token`
   a hard dependency of the build.
+
+### 2.10 Runtime SDK / CLI version (decision 1a — optional runtime upgrade)
+
+The image **bakes `claude-agent-sdk==0.2.101`** (+ its bundled CLI) and rebuilds rarely. To let a user
+move to a newer SDK/CLI **without an image rebuild**, an optional config field **`sdk_version`** controls
+the SDK used at runtime:
+
+| `sdk_version` value | Behaviour |
+|---|---|
+| `pinned` (**default**) | Use the image's baked `0.2.101`. **No network**, deterministic, fastest. The recommended/normal path. |
+| a concrete version (e.g. `0.2.105`) | At job start, `pip install --upgrade --target /tmp/sdk-overlay "claude-agent-sdk==0.2.105"` and prepend `/tmp/sdk-overlay` to `sys.path` **before** `import claude_agent_sdk` is used for the run. |
+| `latest` | Same, with `"claude-agent-sdk"` (no version) so pip resolves the newest. |
+
+**Mechanism (concrete).** `/tmp` is writable, the image is read-only, so we install into an **overlay
+dir** `/tmp/sdk-overlay` and put it first on `sys.path` (equivalently set `PYTHONPATH`) so the runtime
+version shadows the baked one. **Because the SDK bundles the CLI pinned to the package version, upgrading
+the package upgrades the CLI too** — one `pip install` moves both. The upgrade runs **once, before the
+agent loop** (in `__init__`/early `run()`), so the rest of the run imports the resolved version. The
+import of `claude_agent_sdk` in `ClaudeRunner`/`PluginManager` is deferred until after the overlay is on
+the path.
+
+**Risk caveats (explicit):**
+- **Offline / registry failure.** If `sdk_version != pinned` and the `pip install` fails (no egress,
+  registry down, bad version), behaviour is governed by `sdk_version_on_failure` (default **`fail`** →
+  `UserException` with the pip error, so the user knows their requested version didn't load; alternative
+  **`fallback_pinned`** → log a warning and continue on the baked `0.2.101`). Default is `fail` so a
+  user who asked for a specific version is never silently downgraded.
+- **SDK ↔ bundled-CLI skew.** A runtime-upgraded package brings its own matching bundled CLI, so the
+  Python layer and CLI stay in lockstep (no skew **within** the upgraded package). The only skew risk is
+  our code vs a much newer SDK API — mitigated by the single `ClaudeRunner` seam and by recommending
+  `pinned` for production; `latest` is opt-in and at the user's risk (documented).
+- **Egress.** Requires outbound HTTPS to the Python package registry at job start — same egress class as
+  plugin/MCP fetches. In a locked-down stack with no egress, only `pinned` works (documented).
+- **Determinism.** `pinned` is reproducible; `latest` is not (the resolved version can change run to
+  run) — surfaced in the field description, and the **resolved SDK version is recorded** in the
+  `claude_runs` table for traceability.
+
+This unifies with the plugin pin/latest model (§2.8 / §6.4): both let the user choose a fixed version
+for reproducibility or `latest` for freshness, both fetch into a writable `/tmp` location at job start,
+both fail clearly on a fetch error by default.
 
 ## 3. Authentication & connection
 
@@ -299,21 +365,21 @@ below maps to a concrete `ClaudeAgentOptions` field or subprocess `env` var.
 |---|---|---|
 | `#anthropic_key` | secret, **required** | `env["ANTHROPIC_API_KEY"]` |
 | `#github_token` | secret, optional | `env["GITHUB_TOKEN"]` + `env["GH_TOKEN"]` |
+| `sdk_version` | str, default **`pinned`** (`pinned` / a version like `0.2.105` / `latest`) | runtime SDK+CLI used (§2.10): `pinned`=baked 0.2.101, else `pip install --target /tmp/sdk-overlay` before import |
+| `sdk_version_on_failure` | enum, default **`fail`** (`fail` / `fallback_pinned`) | behaviour when a non-`pinned` install fails (§2.10) |
 | `model` | enum, default `claude-opus-4-8` (opus-4-8 / sonnet-4-6 / haiku-4-5) | `ClaudeAgentOptions.model` |
 | `fallback_model` | enum, optional | `ClaudeAgentOptions.fallback_model` |
 | `max_turns` | int, default **20** | `ClaudeAgentOptions.max_turns` (set **explicitly** — SDK default `None` = unbounded) |
-| `max_budget_usd` | float, default **5.0**; cf-dev smoke ceiling **10.0** | `ClaudeAgentOptions.max_budget_usd` (hard cap; per-task override clamped ≤ this) |
+| `max_budget_usd` | float, default **10.0**; cf-dev smoke ceiling **10.0** | `ClaudeAgentOptions.max_budget_usd` (hard cap; per-task override clamped ≤ this) |
 | `effort` | enum optional (low/medium/high/xhigh/max) | `ClaudeAgentOptions.effort` |
-| `permission_mode` | enum, default **`dontAsk`** (dontAsk / acceptEdits / plan / bypassPermissions) | `ClaudeAgentOptions.permission_mode` |
+| `permission_mode` | enum, default **`dontAsk`**; viable values only: `dontAsk` / `bypassPermissions` / `auto` (see §6.5 — prompting modes are hidden) | `ClaudeAgentOptions.permission_mode` (always set explicitly; user-selectable) |
 | `allowed_tools` | list[str], default `[]` | `ClaudeAgentOptions.allowed_tools` |
 | `disallowed_tools` | list[str], default `[]` | `ClaudeAgentOptions.disallowed_tools` |
 | `system_prompt` | str, optional | `ClaudeAgentOptions.system_prompt` (config-level default; per-task override from table) |
 | `settings_json` | object/string, optional (passthrough) | written to a file under the writable home and passed via `ClaudeAgentOptions.settings` (path) + `setting_sources` |
 | `setting_sources` | list enum, default `[]` (no ambient user/project settings) | `ClaudeAgentOptions.setting_sources` |
 | `mcp_servers` | list of typed server objects (stdio/http/sse) + per-server `#secrets` | `ClaudeAgentOptions.mcp_servers` (dict) |
-| `plugins.marketplaces` | list of `{source, scope?}` | `claude plugin marketplace add/update` |
-| `plugins.install` | list of `{plugin, marketplace}` | `claude plugin install` then `plugins=[{type:local,path}]` |
-| `plugins.update_on_run` | bool, default **true** | run `claude plugin marketplace update` before install |
+| `plugins` | list of entries `{source, private?, plugins[], version}` — public shorthand or `owner/repo`/git-url; `version` = `latest` (default) or a pinned tag/SHA/branch; private via `#github_token` (§2.8) | per entry: `claude plugin marketplace add` (+`marketplace update` if `latest`) + `claude plugin install`, then `plugins=[{type:local,path}]` |
 | `github_enabled` | bool, default **false** | enables `Bash` + `gh`/`git` working dir + injects token; convenience toggle that allow-lists `Bash(gh *)`,`Bash(git *)` |
 | `workspace_input_files` | bool, default **false** | if true, stage `/data/in/files/` into the agent `cwd` so the agent can read uploaded files; via `cwd` + `add_dirs` |
 | `output.default_incremental` | bool, default **false** | default `incremental` for agent-produced tables |
@@ -327,7 +393,11 @@ below maps to a concrete `ClaudeAgentOptions` field or subprocess `env` var.
 - `github_enabled` true → reveal a note that `#github_token` is required and `Bash` is enabled.
 - `mcp_servers[i].type` switches between stdio fields (`command`,`args`,`env`,`#secrets`) and
   http/sse fields (`url`,`headers`,`#secrets`) via `options.dependencies`.
-- `plugins.*` is a collapsible advanced group.
+- `plugins` is a collapsible advanced array; each entry has `source` (text — public shorthand or
+  `owner/repo`/URL), `private` (bool; when true a note reminds `#github_token` is required), `plugins`
+  (string list), and `version` (text — `latest` or a pinned tag/SHA/branch). `sdk_version` /
+  `sdk_version_on_failure` sit in an advanced group with a description warning that non-`pinned` needs
+  egress and `latest` is non-reproducible (§2.10).
 - `task_id_filter` is a free-text / array field (a `task_id` or list of `task_id`s) presented near the
   tasks-table mapping, with a description that it only applies when a `tasks` table is mapped and that
   leaving it empty runs all rows (§2.3.1). No async/enum dropdown in v1 (the `task_id` set lives in the
@@ -354,18 +424,23 @@ instantiate from just that field for the sync action without requiring `task`/`p
 ```
 src/
   component.py            # Component(ComponentBase): __init__ wires clients; run() orchestrates
-  configuration.py        # Pydantic models (Configuration + nested: McpServerConfig, PluginsConfig, TaskConfig, OutputConfig)
-  claude_runner.py        # ClaudeRunner: owns ClaudeAgentOptions build + query() loop + result capture (the SDK boundary)
-  plugin_manager.py       # PluginManager: writable CLAUDE_CONFIG_DIR + `claude plugin` CLI add/update/install
+  configuration.py        # Pydantic models (Configuration + nested: McpServerConfig, PluginEntry list, TaskConfig, OutputConfig; sdk_version/permission_mode validators)
+  sdk_version_manager.py  # SdkVersionManager: optional runtime pip-overlay of claude-agent-sdk (§2.10); runs FIRST, before any SDK import
+  claude_runner.py        # ClaudeRunner: owns ClaudeAgentOptions build + query() loop + result capture (the SDK boundary; imports claude_agent_sdk lazily)
+  plugin_manager.py       # PluginManager: writable CLAUDE_CONFIG_DIR + `claude plugin` CLI add/update/install (pin|latest per entry — §6.4)
   transcript_writer.py    # TranscriptWriter: streams JSONL file + builds claude_sessions / claude_runs tables (write_always)
   output_writer.py        # OutputWriter: agent-produced table CSV+manifest helpers (native schema, has_header, PK/incremental)
-  tasks.py                # TaskSource: reads config-prompt OR the `tasks` input table into a list[Task]
+  tasks.py                # TaskSource: reads config-prompt OR the `tasks` input table into a list[Task]; applies task_id_filter
   sync_actions.py         # testConnection (cheap in-process Anthropic HTTP check)
 ```
 
 ### 6.1 `run()` orchestration (the shape)
 
 1. Parse `config.json` → `Configuration` (Pydantic), raising `UserException` on validation error.
+1a. `SdkVersionManager.ensure(config.sdk_version, config.sdk_version_on_failure)` (§2.10): if not
+   `pinned`, pip-install into `/tmp/sdk-overlay`, prepend to `sys.path`; record the **resolved SDK
+   version** for `claude_runs`. **Runs before any `claude_agent_sdk` symbol is used** (ClaudeRunner /
+   PluginManager import it lazily).
 2. Build the writable home + `PluginManager.prepare()` (env dirs, marketplace add/update/install) →
    returns local plugin paths.
 3. `TaskSource.load()` → `list[Task]` (config-prompt single task, or rows of the `tasks` table after
@@ -402,38 +477,73 @@ workspace. **This is the single function the tests mock** (§7).
 
 ### 6.4 `PluginManager` mechanics (concrete)
 
-`prepare()`:
+`prepare(plugins: list[PluginEntry], env) -> list[SdkPluginConfig]`:
 1. `mkdir -p /tmp/claude-home` ; set `env CLAUDE_CONFIG_DIR=/tmp/claude-home`,
    `CLAUDE_CODE_PLUGIN_CACHE_DIR=/tmp/claude-home/plugins/cache`,
    `CLAUDE_CODE_PLUGIN_KEEP_MARKETPLACE_ON_FAILURE=1`.
-2. For each `plugins.marketplaces[i]`: `claude plugin marketplace add <source> [--scope …]`
-   (non-interactive). If `update_on_run`: `claude plugin marketplace update`.
-3. For each `plugins.install[i]`: `claude plugin install <plugin>@<marketplace>`.
-4. Resolve installed cache paths (`claude plugin marketplace list --json`) and return them as
-   `[{"type":"local","path": <cache-path>}]` for `ClaudeAgentOptions.plugins`.
-   Private sources authenticate purely via the env tokens already injected.
+2. **Resolve `source`** (§2.8): a known-public shorthand (e.g. `superpowers`) → its canonical public
+   `owner/repo` via a small built-in registry of vetted public marketplaces; otherwise use the explicit
+   `owner/repo`/git-url/marketplace.json verbatim. If `private` and no `#github_token` → `UserException`.
+3. **Per entry, version-aware add:**
+   - `version: <ref>` (pinned tag/SHA/branch) → `claude plugin marketplace add <source>@<ref>` (or the
+     `#ref` form for a git URL) so the cached marketplace is **pinned**; do **not** run
+     `marketplace update` (pinning is reproducible).
+   - `version: latest` → `claude plugin marketplace add <source>` then `claude plugin marketplace
+     update` to re-pull the newest commit/tag.
+4. **Install:** for each requested plugin name (or all if `["*"]`/omitted):
+   `claude plugin install <plugin>@<marketplace>`.
+5. Resolve installed cache paths (`claude plugin marketplace list --json`) and return them as
+   `[{"type":"local","path": <cache-path>}]` for `ClaudeAgentOptions.plugins`. **Record the resolved
+   version/ref** per plugin for the run log (so a `latest` run is traceable).
+   Private sources authenticate purely via the env tokens already injected (`GITHUB_TOKEN`/`GH_TOKEN`,
+   etc.). No-op cleanly (returns `[]`) when `plugins` is empty.
 All `claude plugin` invocations are `subprocess.run` with captured output logged (never echoing
-secrets), non-zero exit → `UserException`. **Validated end-to-end at Phase 7** (the non-interactive
-behaviour + `<encoded-cwd>` path are doc-level claims per the research carry-forward).
+secrets), non-zero exit → `UserException` naming the failing source. **Validated end-to-end at Phase 7
+S4** (the non-interactive behaviour, the `@ref` pin form, and the `<encoded-cwd>` path are doc-level
+claims per the research carry-forward).
 
-### 6.5 Permission / sandbox model
+### 6.5 Permission / sandbox model — `permission_mode` is user-configurable
 
-Default `permission_mode="dontAsk"` (deny anything not explicitly allow-listed, never prompt —
-safest headless mode; the reference used the riskier `bypassPermissions`). The **Keboola container is
-the sandbox** (process isolation, read-only image, controlled egress); the SDK provides no OS-level
-sandbox. We expose `permission_mode` + `allowed_tools`/`disallowed_tools` and a constrained `/tmp`
-`cwd`. We never default to `bypassPermissions`. Tool names: built-ins `Read/Write/Edit/Bash/Glob/
-Grep/WebFetch/WebSearch` (scoped patterns like `Bash(git *)` supported); MCP `mcp__<server>__<tool>`.
+`permission_mode` is a **user-configurable** config field over the SDK `PermissionMode` enum (verified
+literal: `default | acceptEdits | plan | bypassPermissions | dontAsk | auto`), set **explicitly** on
+every run (the SDK default `None` behaves like interactive `default` and would hang headless — §12).
+The **default is `dontAsk`** (the safest non-prompting mode: deny anything not explicitly allow-listed,
+never prompt), but the user may choose another mode.
+
+**Headless viability — only non-prompting modes are offered.** A Keboola job is non-interactive: any
+mode that pauses for an approval prompt will **hang the container until the job times out**. So:
+
+| Mode | Headless? | Surface in UI? |
+|---|---|---|
+| `dontAsk` | ✅ non-prompting (deny un-allow-listed, no prompt) | ✅ **default** |
+| `bypassPermissions` | ✅ non-prompting (auto-approve all; hooks + deny rules still apply) | ✅ (powerful — documented as "agent can run anything allowed; use deliberately") |
+| `auto` | ✅ non-prompting (classifier-gated auto-decision, no human prompt) | ✅ |
+| `acceptEdits` | ⚠️ prompts for non-edit tools → can hang | ❌ hidden |
+| `default` | ❌ prompts on unmatched tools → hangs | ❌ hidden |
+| `plan` | ❌ prompts on edits → hangs | ❌ hidden |
+
+We therefore surface **only `dontAsk`, `bypassPermissions`, `auto`** in the UI enum (the three viable
+non-prompting modes) and document the rationale; the Pydantic model validates against that allowed set
+and rejects a prompting mode with a clear `UserException` (so a hand-edited config can't silently hang).
+The **Keboola container is the sandbox** (process isolation, read-only image, controlled egress); the
+SDK provides no OS-level sandbox. We pair the mode with `allowed_tools`/`disallowed_tools` and a
+constrained `/tmp` `cwd`. Tool names: built-ins `Read/Write/Edit/Bash/Glob/Grep/WebFetch/WebSearch`
+(scoped patterns like `Bash(git *)` supported); MCP `mcp__<server>__<tool>`.
 
 ### 6.6 Key dependencies
 
-- **`claude-agent-sdk==0.2.101`** — pinned, verified on PyPI (uploaded 2026-06-13, `requires-python
-  >=3.10`, compatible with the scaffold's 3.14). **Bundles a native Claude Code CLI binary per
-  platform** (confirmed: the release ships platform-specific wheels incl.
+- **`claude-agent-sdk==0.2.101`** — pinned in the image, verified on PyPI (uploaded 2026-06-13,
+  `requires-python >=3.10`, compatible with the scaffold's 3.14). **Bundles a native Claude Code CLI
+  binary per platform** (confirmed: the release ships platform-specific wheels incl.
   `manylinux_2_17_x86_64`, plus the package description states the CLI is auto-bundled, no Node
-  needed). → **Dockerfile is Python-only (uv), NO Node.** (See §11 infra + the §12 fallback.)
+  needed). → **Dockerfile is Python-only (uv), NO Node.** (See §11 infra + the §12 fallback.) The
+  runtime `sdk_version` field (§2.10) can shadow this baked version with a `/tmp/sdk-overlay` install;
+  the `import claude_agent_sdk` used for the run is therefore **deferred** until after the overlay (if
+  any) is on `sys.path` — `SdkVersionManager` (§6 module list) owns this and is the first thing `run()`
+  does.
 - `keboola-component>=1.10.0` (datadir, manifests, exceptions), `pydantic>=2.11.7`.
-- `uvx` (from uv, already in the image) to launch stdio MCP servers and is the `claude plugin` runtime.
+- `uvx` (from uv, already in the image) to launch stdio MCP servers and is the `claude plugin` runtime;
+  `pip` (present in the slim image) performs the optional runtime SDK overlay install.
 
 ## 7. Testing (decision 8 — the unusual part)
 
@@ -487,8 +597,14 @@ with the **image tag overridden** to the `initial-implementation` build, each ca
    per-task rows in `claude_runs`.
 3. **S3 — MCP server.** Add one generic MCP server (e.g. a public read-only HTTP MCP) with a
    `#secret`, allow-list its tools, assert the agent calls a tool (visible in `claude_sessions`).
-4. **S4 — plugin add/update at runtime.** Add a public marketplace + install a plugin, assert it loads
-   (validates the §6.4 mechanism end-to-end — the research carry-forward to confirm here).
+4. **S4 — plugin add/update at runtime (public pin + latest; private if token available).** Add a
+   public marketplace shorthand at a **pinned** `version` and a second at `latest`, install a plugin
+   from each, assert both load and the resolved refs land in `claude_runs.plugins_resolved`; if a
+   `#github_token` is provided, add one **private** source too. Validates the §6.4 mechanism
+   end-to-end — the research carry-forward to confirm here.
+   - **S4b — runtime SDK overlay (§2.10).** A scenario with `sdk_version` set to a concrete newer
+     version, asserting `claude_runs.sdk_version_resolved` reflects it (and that `sdk_version=pinned`
+     uses the baked `0.2.101`).
 5. **S5 — GitHub working.** With a scoped PAT, a read-only GitHub task (clone + summarise), assert
    success without leaking the token.
 
@@ -499,7 +615,7 @@ added as plain config recipes; S1 is the must-pass, S2-S5 extend as credentials/
 
 ## 9. Cost / rate-limit controls + usage reporting
 
-- **Controls:** `max_turns` (always set; default 20) **and** `max_budget_usd` (always set; default 5,
+- **Controls:** `max_turns` (always set; default 20) **and** `max_budget_usd` (always set; default 10,
   cf-dev ceiling 10) bound every run; `model`/`effort` tier trades cost vs capability; optional
   `PreToolUse` hook reserved for future hard guardrails (e.g. block `Bash(rm *)`). Per-task budget is
   clamped to the config ceiling. No SDK wall-clock timeout exists — turns+budget are the levers.
@@ -526,7 +642,9 @@ added as plain config recipes; S1 is the must-pass, S2-S5 extend as credentials/
   unchanged in shape; the SDK's bundled `manylinux_2_17_x86_64` CLI binary runs on the slim/glibc base.
   No `apt-get install nodejs`/`npm install -g @anthropic-ai/claude-code` (that step is **obsolete** on
   0.2.x — the reference repo's Node layer is removed for us). `uvx`/`uv` already present for stdio MCP
-  servers + `claude plugin`. `/tmp` is writable in the container for `CLAUDE_CONFIG_DIR` + workspace.
+  servers + `claude plugin`. `/tmp` is writable in the container for `CLAUDE_CONFIG_DIR` + workspace +
+  the optional `sdk-overlay` (§2.10). The runtime SDK overlay + plugin/MCP fetches need outbound HTTPS
+  egress at job start; a no-egress stack runs with `sdk_version=pinned` and no remote plugins/MCP.
 - **pyproject:** add `claude-agent-sdk==0.2.101` to `dependencies`; keep `requires-python = ~=3.14.0`
   (SDK allows `>=3.10`). VCR dev deps (`pytest-recording`/`vcrpy`) added in Phase 5. Remove the unused
   `keboola-http-client`/`keboola-utils` if not needed, or keep `keboola-http-client` for the
@@ -538,8 +656,10 @@ added as plain config recipes; S1 is the must-pass, S2-S5 extend as credentials/
   subtype `error_max_budget_usd`" / implied an `error_max_budget_usd` companion option. Verified: there
   is **only** `max_budget_usd` on `ClaudeAgentOptions`; the budget-cap-hit is signalled via the
   **`ResultMessage.subtype`** value. The spec uses subtype, not a field.
-- **`permission_mode` default is `None`** (behaves like interactive `default`), so we **must** set
-  `dontAsk` explicitly — confirmed.
+- **`permission_mode` default is `None`** (behaves like interactive `default`), so we **always set it
+  explicitly**. It is user-configurable (§6.5) but the UI offers **only the non-prompting modes**
+  (`dontAsk` default, `bypassPermissions`, `auto`); prompting modes would hang headless. Verified enum
+  literal: `default | acceptEdits | plan | bypassPermissions | dontAsk | auto`.
 - **Concrete pin = `claude-agent-sdk==0.2.101`** (the summary said "≈0.2.10x"); bundled-CLI confirmed
   via platform wheels. Node-free Dockerfile confirmed viable.
 - **Node-install fallback (only if the bundled binary ever fails on the slim base):** add
@@ -558,4 +678,6 @@ added as plain config recipes; S1 is the must-pass, S2-S5 extend as credentials/
 | R5 | Runaway cost / infinite loop. | `max_turns` + `max_budget_usd` both always set; per-task clamp to config ceiling; $10 cf-dev ceiling. | Phase 4 |
 | R6 | Keboola-MCP convenience needs `forward_token: true` (Keboola approval). | Not a hard dependency — component works without it; request in Phase 6 if wanted; document. | Phase 6 |
 | R7 | Secret leakage in logs/transcripts (the LIVE guardrail concern). | Never log secret values; `claude plugin`/MCP subprocess output is logged with secret-scrubbing; transcript writer scrubs known secret values; VCR sanitizers; the PreToolUse hook protects the dev loop. | Phase 4/5 |
-| R8 | `query()` API shape drift on SDK upgrades. | Hard pin `==0.2.101`; the single `ClaudeRunner` seam localises any future change. | Phase 4 |
+| R8 | `query()` API shape drift on SDK upgrades. | Hard pin `==0.2.101` baked in; the single `ClaudeRunner` seam localises any future change; runtime `sdk_version=latest` is opt-in and at the user's risk (§2.10). | Phase 4 |
+| R9 | Runtime SDK overlay (§2.10) fails (no egress, bad version, registry down) or a `latest` upgrade breaks our code. | Default `sdk_version=pinned` (no network); `sdk_version_on_failure=fail` (default) surfaces the pip error as `UserException` so no silent downgrade; bundled CLI moves with the package (no SDK↔CLI skew within the upgrade); resolved version recorded in `claude_runs`. | Phase 4/7 (S4b) |
+| R10 | Plugin pin/latest: a `latest` re-pull fails mid-run, a pinned ref is gone, or a private source lacks the token. | `CLAUDE_CODE_PLUGIN_KEEP_MARKETPLACE_ON_FAILURE=1` keeps a usable stale cache on a failed `latest` re-pull; missing token for `private:true` → `UserException`; install failure names the source; resolved refs recorded in `claude_runs.plugins_resolved`. | Phase 4/7 (S4) |

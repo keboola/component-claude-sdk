@@ -27,6 +27,9 @@
   intact; only ensure `src/` modules are copied.
 - Quick container sanity (Phase 7 will do the real check): note R1 (bundled-binary-on-slim) for the
   smoke test; do **not** add the Node fallback unless R1 fires.
+- `0.2.101` is the **baked** version; the optional runtime overlay (Task 4.3a / spec §2.10) installs
+  into `/tmp/sdk-overlay` and is not part of the image. Ensure `pip` is available in the production
+  stage (slim image has it) for that overlay.
 **Done when:** `uv sync` resolves with the pinned SDK; `uv.lock` updated; Dockerfile has no Node;
 `ruff` clean. **Verify:** `uv run python -c "import claude_agent_sdk; print(claude_agent_sdk.__version__)"`
 prints `0.2.101`.
@@ -35,13 +38,23 @@ prints `0.2.101`.
 **Owner:** `component-develop`.
 - Replace the scaffold model with the typed tree from spec §5: `Configuration` + nested
   `McpServerConfig` (stdio/http/sse discriminated on `type`, each with `#`-secret fields via
-  `Field(alias="#...")`), `PluginsConfig` (`marketplaces`, `install`, `update_on_run`), `TaskConfig`
-  (`prompt`, `system_prompt`), `OutputConfig` (`default_incremental`).
+  `Field(alias="#...")`), **`PluginEntry`** (`source`, `private: bool`, `plugins: list[str]`,
+  `version: str = "latest"`) as a `list[PluginEntry]` named `plugins` (spec §2.8 — replaces the old
+  marketplaces/install/update_on_run shape), `TaskConfig` (`prompt`, `system_prompt`), `OutputConfig`
+  (`default_incremental`).
 - `#anthropic_key` (alias) **required**; `#github_token` optional; `model` enum (default
   `claude-opus-4-8`), `fallback_model` optional, `max_turns` int default 20, `max_budget_usd` float
-  default 5.0, `effort` optional enum, `permission_mode` enum default `dontAsk`, `allowed_tools`/
-  `disallowed_tools` lists default `[]`, `system_prompt` optional, `settings_json` optional,
-  `setting_sources` default `[]`, `github_enabled`/`workspace_input_files` bools default false.
+  **default 10.0**, `effort` optional enum, `allowed_tools`/`disallowed_tools` lists default `[]`,
+  `system_prompt` optional, `settings_json` optional, `setting_sources` default `[]`,
+  `github_enabled`/`workspace_input_files` bools default false.
+- **`permission_mode`** (spec §6.5): enum **restricted to the non-prompting modes** `dontAsk` (default)
+  / `bypassPermissions` / `auto`; a validator rejects a prompting mode (`default`/`acceptEdits`/`plan`)
+  with a `UserException` explaining it would hang headless. Always passed explicitly to the SDK.
+- **`sdk_version`** (spec §2.10): str default `"pinned"` (`pinned` | a concrete version | `latest`);
+  **`sdk_version_on_failure`**: enum default `"fail"` (`fail` | `fallback_pinned`).
+- **`PluginEntry` validation:** `private=true` with no `#github_token` set → `UserException`; `version`
+  free-text (`latest` or a ref). A small built-in registry maps public shorthands (e.g. `superpowers`)
+  to canonical `owner/repo` (used by `PluginManager`, Task 4.3).
 - **`task_id_filter`** (spec §2.3.1): optional `str | list[str] | None`, default `None` (= all rows).
   A field validator normalises a bare string to a one-element list and an empty string/empty list to
   `None`. Expose a typed accessor `selected_task_ids() -> list[str] | None` for `TaskSource`.
@@ -73,20 +86,49 @@ asserts the alias + required behaviour.
 `task_id_filter` selects only its row(s); a non-matching filter → exit 1 with a helpful message;
 `ruff` clean.
 
+### Task 4.3a — SDK version manager (`src/sdk_version_manager.py`) — runs FIRST
+**Owner:** `component-develop`.
+- `SdkVersionManager.ensure(sdk_version: str, on_failure: str) -> str` (returns the resolved version,
+  spec §2.10):
+  - `sdk_version == "pinned"` → no-op; return the baked `claude_agent_sdk.__version__`.
+  - else `subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "--target",
+    "/tmp/sdk-overlay", spec])` where `spec` = `claude-agent-sdk==<ver>` or bare `claude-agent-sdk`
+    (latest); then `sys.path.insert(0, "/tmp/sdk-overlay")` so the overlay shadows the baked package.
+    Resolve and return the installed version (read the overlay dist metadata).
+  - On install failure: `on_failure == "fail"` → `UserException` with the pip error; `"fallback_pinned"`
+    → log a warning, return the baked version.
+- **Must run before any module that imports `claude_agent_sdk` is used** — `ClaudeRunner` and
+  `PluginManager` import the SDK **lazily** (inside methods, not at module top) so the overlay is on the
+  path first. `component.run()` calls `SdkVersionManager.ensure(...)` as step 1a (spec §6.1).
+- The resolved version is handed to `TranscriptWriter` for `claude_runs.sdk_version_resolved`.
+**Done when:** unit test (pip `subprocess` mocked) covers pinned no-op, concrete-version install +
+`sys.path` prepend, latest, and both failure modes; `ruff` clean. **Note:** real install validated at
+Phase 7 S4b.
+
 ### Task 4.3 — Plugin manager (`src/plugin_manager.py`)
 **Owner:** `component-develop`.
-- `PluginManager.prepare(plugins_config, env) -> list[SdkPluginConfig]`:
+- `PluginManager.prepare(plugins: list[PluginEntry], env) -> tuple[list[SdkPluginConfig], dict]`
+  (second item = resolved refs for the run log), spec §2.8 / §6.4:
   - mkdir `/tmp/claude-home`; set env `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_PLUGIN_CACHE_DIR`,
     `CLAUDE_CODE_PLUGIN_KEEP_MARKETPLACE_ON_FAILURE=1`.
-  - per marketplace: `claude plugin marketplace add <source> [--scope ...]`; if `update_on_run`:
-    `claude plugin marketplace update`.
-  - per install: `claude plugin install <plugin>@<marketplace>`.
-  - resolve cache paths (`claude plugin marketplace list --json`) → return
-    `[{"type":"local","path": ...}]`.
-  - all `subprocess.run` with captured output **logged with secret-scrubbing**; non-zero → `UserException`.
-- No-op cleanly when no plugins configured (returns `[]`).
-**Done when:** unit test with `subprocess` mocked exercises add/update/install ordering and the no-op
-path; `ruff` clean. **Note:** real non-interactive behaviour (R2) is validated at Phase 7 S4.
+  - **per entry:** resolve `source` (public shorthand via the built-in registry, else `owner/repo`/URL
+    verbatim); if `private` and no `#github_token` → `UserException`.
+    - `version == "latest"` → `claude plugin marketplace add <source>` then
+      `claude plugin marketplace update` (re-pull newest).
+    - `version == <ref>` (pin) → `claude plugin marketplace add <source>@<ref>` (or `#<ref>` for a git
+      URL); **no** `marketplace update` (pinned = reproducible).
+  - per requested plugin name (or all if `["*"]`/omitted): `claude plugin install <plugin>@<marketplace>`.
+  - resolve cache paths (`claude plugin marketplace list --json`) → `[{"type":"local","path": ...}]`;
+    capture the resolved ref/version per plugin for `claude_runs.plugins_resolved`.
+  - all `subprocess.run` with captured output **logged with secret-scrubbing** (never echo the token);
+    non-zero → `UserException` naming the failing source.
+  - lazy `import claude_agent_sdk` only where the `SdkPluginConfig` type/path is needed (overlay-safe).
+- No-op cleanly when `plugins` is empty (returns `([], {})`).
+**Done when:** unit test with `subprocess` mocked exercises **both** a pinned entry (`add @ref`, no
+update) and a `latest` entry (`add` + `update`), install ordering, the private-without-token →
+`UserException`, the public-shorthand resolution, and the no-op path; resolved-refs dict populated;
+`ruff` clean. **Note:** real non-interactive behaviour + the `@ref` pin form (R2/R10) validated at
+Phase 7 S4.
 
 ### Task 4.4 — Claude runner: the SDK boundary (`src/claude_runner.py`)
 **Owner:** `component-develop`.
@@ -95,15 +137,20 @@ path; `ruff` clean. **Note:** real non-interactive behaviour (R2) is validated a
 - `ClaudeRunner.build_options(task, config, plugin_paths, env) -> ClaudeAgentOptions` mapping every
   field per spec §5.1 (model/fallback/max_turns/max_budget_usd(clamped)/effort/permission_mode/
   allowed+disallowed tools/system_prompt(per-task override)/mcp_servers(dict, secrets→env or headers)/
-  plugins/setting_sources/settings/cwd(/tmp workspace)/env). Set `permission_mode="dontAsk"` default
-  explicitly. GitHub toggle → ensure `Bash` + `Bash(gh *)`/`Bash(git *)` allow entries and token in env.
-- `async run_task(task, options, on_message) -> ClaudeRunResult`: `async for message in query(prompt,
-  options)`, call `on_message(message)` for each (the transcript tee), capture terminal
+  plugins/setting_sources/settings/cwd(/tmp workspace)/env). Set `permission_mode` **explicitly** from
+  config (validated to the non-prompting set in Task 4.1; default `dontAsk`). GitHub toggle → ensure
+  `Bash` + `Bash(gh *)`/`Bash(git *)` allow entries and token in env.
+- `async run_task(task, options, on_message) -> ClaudeRunResult`: `async for message in self._query(
+  prompt, options)`, call `on_message(message)` for each (the transcript tee), capture terminal
   `ResultMessage`; map budget/turn-cap `subtype` to `success=False`. Handle `result_message is None`.
-- **This is the single seam tests monkeypatch.** Keep `query` imported at module top so tests can patch
-  `claude_runner.query`.
-**Done when:** options-builder unit test asserts the full mapping incl. budget clamp, `dontAsk`,
-secret→env/header wiring; `ruff` clean.
+- **Overlay-safe SDK import + the test seam:** do **not** import `claude_agent_sdk` at module top
+  (the runtime overlay, Task 4.3a, must be on `sys.path` first). Instead `_query` does a **lazy**
+  `from claude_agent_sdk import query` on first call. Expose the seam as `ClaudeRunner._query` (a thin
+  instance/staticmethod) so **tests monkeypatch `ClaudeRunner._query`** to yield the canned stream —
+  no module-top `query` needed. (Same lazy rule for any `ClaudeAgentOptions`/message-type imports.)
+**Done when:** options-builder unit test asserts the full mapping incl. budget clamp, explicit
+`permission_mode`, secret→env/header wiring; the `_query` seam is patchable; no module-top SDK import;
+`ruff` clean.
 
 ### Task 4.5 — Transcript writer (`src/transcript_writer.py`)
 **Owner:** `component-develop`.
@@ -111,7 +158,9 @@ secret→env/header wiring; `ruff` clean.
   and writes a `.manifest` with `write_always: true` + tags. `on_message(message)` serializes each SDK
   message to one JSON line (file) **and** appends a structured row to the in-memory `claude_sessions`
   buffer (columns per spec §2.6.1, incl. `raw_json`).
-- After a task: append a `claude_runs` row from `ClaudeRunResult`.
+- After a task: append a `claude_runs` row from `ClaudeRunResult` **plus** `sdk_version_resolved`
+  (from `SdkVersionManager`, Task 4.3a) and `plugins_resolved` (from `PluginManager`, Task 4.3) — spec
+  §2.6.1.
 - `flush()`: write `/data/out/tables/claude_sessions.csv` + `claude_runs.csv` with **authoritative
   `schema` manifests**, `has_header=True`, `write_always: true`, `incremental: true`, PKs per spec.
   `claude_runs` gets real numeric types (cost/turns/duration); `claude_sessions` mostly STRING + the
@@ -147,12 +196,14 @@ secret→env/header wiring; `ruff` clean.
 
 ### Task 4.8 — Component orchestrator (`src/component.py`)
 **Owner:** `component-develop`.
-- `__init__`: `super().__init__()`, build `ClaudeRunner`, `PluginManager`, `TranscriptWriter`,
-  `OutputWriter`, `TaskSource` (clients in `__init__`, not `run()`).
-- `run()` (thin, <30 lines) per spec §6.1: parse config → `PluginManager.prepare` → `TaskSource.load`
-  → for each task `asyncio.run(runner.run_task(..., on_message=transcript.on_message))` → flush
-  outputs + transcript (always) → decide exit (any task `is_error` + fail-on-error default → raise
-  `UserException`; else 0). Logic in private methods (`_prepare_env`, `_run_one_task`, `_finalize`).
+- `__init__`: `super().__init__()`, build `SdkVersionManager`, `ClaudeRunner`, `PluginManager`,
+  `TranscriptWriter`, `OutputWriter`, `TaskSource` (clients in `__init__`, not `run()`).
+- `run()` (thin, <30 lines) per spec §6.1: parse config → **`SdkVersionManager.ensure(...)` (step 1a —
+  before any SDK use)** → `PluginManager.prepare` → `TaskSource.load` → for each task
+  `asyncio.run(runner.run_task(..., on_message=transcript.on_message))` → flush outputs + transcript
+  (always) → decide exit (any task `is_error` + fail-on-error default → raise `UserException`; else 0).
+  Logic in private methods (`_ensure_sdk`, `_prepare_env`, `_run_one_task`, `_finalize`). Pass the
+  resolved SDK version + plugin refs into `TranscriptWriter`.
 - Keep the `__main__` guard (UserException→exit 1, else exit 2 — already in scaffold).
 - `execute_action()` dispatch covers `run` + `testConnection`.
 **Done when:** `run()` is <30 lines and delegates; orchestrates a canned (mocked) run end-to-end; `ruff`
@@ -163,10 +214,14 @@ configuration, error-handling, logging, output-state, infra (run cold).
 **Delegated to `component-build-ui` by `component-develop`.**
 - Build `component_config/configSchema.json` for the full §5.1 parameter set with §5.2 conditionals
   (`options.dependencies`, never root-level): MCP server `type` switch, `github_enabled` reveal,
-  plugins advanced group, `task_id_filter` field (free-text/array near the tasks mapping, described as
-  tasks-table-mode-only, empty = all rows — spec §2.3.1 / §5.2), `#`-field names matching the Pydantic
-  `alias=` exactly, `format: "test-connection"` widget (auto-invokes `testConnection`), `propertyOrder`
-  only on existing props, titles/descriptions on required fields.
+  **`plugins` array** (per-entry `source` / `private` / `plugins` / `version`; private reveals a
+  `#github_token`-required note — spec §2.8), **`permission_mode` enum restricted to `dontAsk` /
+  `bypassPermissions` / `auto`** with the hang-headless rationale in the description (spec §6.5),
+  **`sdk_version` + `sdk_version_on_failure`** advanced group with the egress/non-reproducible warning
+  (spec §2.10), `max_budget_usd` default 10, `task_id_filter` field (free-text/array near the tasks
+  mapping, described as tasks-table-mode-only, empty = all rows — spec §2.3.1 / §5.2), `#`-field names
+  matching the Pydantic `alias=` exactly, `format: "test-connection"` widget (auto-invokes
+  `testConnection`), `propertyOrder` only on existing props, titles/descriptions on required fields.
 - **Remove `component_config/configRowSchema.json`** (single config — spec §2.1). Replace the
   placeholder `sample-config/` with a realistic config-prompt-mode sample (no secret values).
 - Update `component_config` descriptions / `uiOptions.md` minimally (full portal value setup is Phase 6).
@@ -177,9 +232,11 @@ configuration, error-handling, logging, output-state, infra (run cold).
 
 ### Task 5.1 — Mock-boundary fixtures + the canned-stream conftest
 **Owner:** `component-test`.
-- A `tests/conftest.py` (or helper) that monkeypatches `claude_runner.query` to yield a typed message
-  stream assembled from small JSON fixtures under `tests/fixtures/streams/`: `happy/`, `budget_cap/`
-  (terminal `ResultMessage.subtype` = budget error), `error/` (`is_error=True`), `multi_task/`.
+- A `tests/conftest.py` (or helper) that monkeypatches the **`ClaudeRunner._query` seam** (Task 4.4 —
+  not a module-top `query`, which doesn't exist because the SDK import is lazy/overlay-safe) to yield a
+  typed message stream assembled from small JSON fixtures under `tests/fixtures/streams/`: `happy/`,
+  `budget_cap/` (terminal `ResultMessage.subtype` = budget error), `error/` (`is_error=True`),
+  `multi_task/`.
 - The stream builder constructs real SDK message objects (`SystemMessage`, `AssistantMessage` with
   `TextBlock`/`ToolUseBlock`/`ToolResultBlock`, `ResultMessage`).
 **Done when:** a unit test drives `ClaudeRunner.run_task` through each fixture and asserts the mapped
@@ -192,10 +249,17 @@ configuration, error-handling, logging, output-state, infra (run cold).
   `tasks_table_filtered` (a `task_id_filter` selecting a subset → only those rows run; assert
   `claude_runs` has exactly the filtered `task_id`s), `task_filter_no_match` (→ exit 1 with the
   available-`task_id`s message), `missing_anthropic_key` (→ exit 1), `missing_tasks_column` (→ exit 1),
-  `budget_cap`, `agent_error`.
+  `budget_cap`, `agent_error`, `bad_permission_mode` (a prompting mode in config → exit 1 per spec
+  §6.5), `sdk_version_pinned` (assert `claude_runs.sdk_version_resolved == 0.2.101`, no pip call — the
+  pip subprocess is mocked/asserted-not-called).
+- **Plugin pin vs latest (mock):** a unit/datadir case with `PluginManager` `subprocess` mocked
+  asserting a **pinned** entry issues `marketplace add <src>@<ref>` and **no** `marketplace update`,
+  while a **`latest`** entry issues `add` + `update`; both populate `claude_runs.plugins_resolved`.
+  (Real plugin/CLI behaviour is Phase 7 S4; this proves our command construction.)
 - Each happy case asserts expected `out/files/*.jsonl`, `out/tables/claude_sessions.csv(.manifest)`,
-  `claude_runs.csv(.manifest)` (authoritative `schema`, `write_always`, PK/incremental, `has_header`),
-  and a promoted agent output table. Inspect a real produced CSV row, not just the manifest.
+  `claude_runs.csv(.manifest)` (authoritative `schema`, `write_always`, PK/incremental, `has_header`,
+  incl. the `sdk_version_resolved`/`plugins_resolved` columns), and a promoted agent output table.
+  Inspect a real produced CSV row, not just the manifest.
 - Secret injection: the test runner reads `secrets.json` itself and merges `#anthropic_key` into each
   case's `config.json` (agent never reads it; key NAME only).
 **Done when:** `uv run pytest tests/ -v` is green (paste the `N passed` line); manifests verified.
@@ -221,14 +285,17 @@ output-state (run cold) + the cassette validation gate.
 - **Phase 7 — `component-test` (tier 4):** build an `initial-implementation` image; create the **S1**
   cf-dev config (image tag overridden, `max_budget_usd ≤ $10`); run; confirm `success` + resolved
   image tag == branch build + expected output/transcript tables (read from platform). Then extend
-  S2-S5 as credentials/approvals land. Validates R1 (bundled binary on slim), R2 (plugin CLI),
-  R4 (Storage typing).
+  S2-S5 as credentials/approvals land — incl. **S4** (public plugin pinned + latest, private if a
+  `#github_token` is provided; assert `plugins_resolved`) and **S4b** (runtime `sdk_version` overlay;
+  assert `sdk_version_resolved`). Validates R1 (bundled binary on slim), R2/R10 (plugin CLI + pin/latest
+  + `@ref`), R9 (runtime SDK overlay), R4 (Storage typing).
 - **Phase 8 — `component-checklist-review`:** full CF-standards audit; no open blocking/important
   findings; then the single PR to `main`.
 
 ## Task dependency order
 
-4.0 → 4.1 → {4.2, 4.3, 4.4, 4.5, 4.6, 4.7 can proceed once 4.1 lands; 4.4 before 4.5/4.6 consumers} →
-4.8 (needs all 4.x modules) → 4.9 (schema, parallel-safe after 4.1) → 5.1 → 5.2 → 5.3.
-4.2-4.7 are largely independent module builds and can be parallelised across subagents; 4.8 integrates
-them.
+4.0 → 4.1 → {4.2, 4.3, 4.3a, 4.4, 4.5, 4.6, 4.7 can proceed once 4.1 lands; 4.4 before 4.5/4.6
+consumers} → 4.8 (needs all 4.x modules incl. 4.3a) → 4.9 (schema, parallel-safe after 4.1) → 5.1 →
+5.2 → 5.3.
+4.2-4.7 (incl. 4.3a) are largely independent module builds and can be parallelised across subagents;
+4.8 integrates them and wires 4.3a as `run()` step 1a.
