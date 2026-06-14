@@ -42,6 +42,9 @@ prints `0.2.101`.
   default 5.0, `effort` optional enum, `permission_mode` enum default `dontAsk`, `allowed_tools`/
   `disallowed_tools` lists default `[]`, `system_prompt` optional, `settings_json` optional,
   `setting_sources` default `[]`, `github_enabled`/`workspace_input_files` bools default false.
+- **`task_id_filter`** (spec §2.3.1): optional `str | list[str] | None`, default `None` (= all rows).
+  A field validator normalises a bare string to a one-element list and an empty string/empty list to
+  `None`. Expose a typed accessor `selected_task_ids() -> list[str] | None` for `TaskSource`.
 - `model_config` sets `extra="ignore"`, `populate_by_name=True`. **No `debug` field** (platform
   handles it). Validation errors → `UserException` (reuse the reference's `__init__` try/except
   pattern). A **partial** instantiation path must allow `testConnection` with only `#anthropic_key`.
@@ -56,12 +59,19 @@ asserts the alias + required behaviour.
   extra: dict`).
 - `TaskSource.load(configuration, input_tables) -> list[Task]`:
   - **config-prompt mode** when no input table named `tasks` (and not exactly-one-fallback): one Task
-    from `config.task`.
+    from `config.task`. `task_id_filter` is ignored here (info log if set) — spec §2.3.1.
   - **tasks-table mode** when a `tasks`-named table exists (or exactly one input table → accept + log
     assumption): one Task per CSV row; validate required columns `task_id`,`prompt`
     (missing → `UserException` naming the column); unknown columns → `extra` (JSON blob appended to the
     prompt envelope). `task_id` uniqueness enforced.
-**Done when:** both modes produce correct `list[Task]`; missing required column → exit 1; `ruff` clean.
+  - **Row selector (`task_id_filter`, spec §2.3.1):** after building the row list, if
+    `configuration.selected_task_ids()` is not `None`, keep only rows whose `task_id` is in that set
+    (exact string equality, preserve file order). **No surviving row → `UserException` (exit 1)** whose
+    message names the requested filter value(s) and lists the available `task_id`s. Default (`None`) =
+    keep all rows.
+**Done when:** both modes produce correct `list[Task]`; missing required column → exit 1; a
+`task_id_filter` selects only its row(s); a non-matching filter → exit 1 with a helpful message;
+`ruff` clean.
 
 ### Task 4.3 — Plugin manager (`src/plugin_manager.py`)
 **Owner:** `component-develop`.
@@ -153,9 +163,10 @@ configuration, error-handling, logging, output-state, infra (run cold).
 **Delegated to `component-build-ui` by `component-develop`.**
 - Build `component_config/configSchema.json` for the full §5.1 parameter set with §5.2 conditionals
   (`options.dependencies`, never root-level): MCP server `type` switch, `github_enabled` reveal,
-  plugins advanced group, `#`-field names matching the Pydantic `alias=` exactly, `format:
-  "test-connection"` widget (auto-invokes `testConnection`), `propertyOrder` only on existing props,
-  titles/descriptions on required fields.
+  plugins advanced group, `task_id_filter` field (free-text/array near the tasks mapping, described as
+  tasks-table-mode-only, empty = all rows — spec §2.3.1 / §5.2), `#`-field names matching the Pydantic
+  `alias=` exactly, `format: "test-connection"` widget (auto-invokes `testConnection`), `propertyOrder`
+  only on existing props, titles/descriptions on required fields.
 - **Remove `component_config/configRowSchema.json`** (single config — spec §2.1). Replace the
   placeholder `sample-config/` with a realistic config-prompt-mode sample (no secret values).
 - Update `component_config` descriptions / `uiOptions.md` minimally (full portal value setup is Phase 6).
@@ -178,7 +189,10 @@ configuration, error-handling, logging, output-state, infra (run cold).
 **Owner:** `component-test`.
 - `tests/functional/<case>/` cases (single merged `config.json`, no row/root split; `secrets.json`
   injected by the runner per spec §7): `happy_config_prompt`, `tasks_table_multi`,
-  `missing_anthropic_key` (→ exit 1), `missing_tasks_column` (→ exit 1), `budget_cap`, `agent_error`.
+  `tasks_table_filtered` (a `task_id_filter` selecting a subset → only those rows run; assert
+  `claude_runs` has exactly the filtered `task_id`s), `task_filter_no_match` (→ exit 1 with the
+  available-`task_id`s message), `missing_anthropic_key` (→ exit 1), `missing_tasks_column` (→ exit 1),
+  `budget_cap`, `agent_error`.
 - Each happy case asserts expected `out/files/*.jsonl`, `out/tables/claude_sessions.csv(.manifest)`,
   `claude_runs.csv(.manifest)` (authoritative `schema`, `write_always`, PK/incremental, `has_header`),
   and a promoted agent output table. Inspect a real produced CSV row, not just the manifest.

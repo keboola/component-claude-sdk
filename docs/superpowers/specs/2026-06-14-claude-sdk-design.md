@@ -51,8 +51,10 @@ We use a **single configuration**, not config rows. Rationale:
   machinery buys us nothing.
 
 **Override condition:** if a user genuinely wants per-task isolation/parallelism at the platform level
-(separate containers, separate budgets, independent retry), they can create multiple **configs**. We
-do not ship `configRowSchema.json`; `component_config/configRowSchema.json` is removed in Phase 4.
+(separate containers, separate budgets, independent retry), they can create multiple **configs** —
+and the `task_id_filter` row selector (§2.3.1) lets each of those configs own a specific row/subset of
+a **shared** `tasks` table, bridging single-config and config-rows without the config-rows overhead.
+We do not ship `configRowSchema.json`; `component_config/configRowSchema.json` is removed in Phase 4.
 
 ### 2.2 Component type & output behaviour
 
@@ -92,6 +94,33 @@ allowed/disallowed tools, GitHub toggle, `settings.json` passthrough, budget cei
 is **config-level** — entered once and shared by all tasks. *Per-run task content* (prompt, system
 prompt, optional model/turn/budget overrides, output hint) is **row-level** in the `tasks` table, or
 the single config-level `task` block when no table is mapped.
+
+#### 2.3.1 Row selector — `task_id_filter` (decision 3a, shared-table fan-out)
+
+A single optional config parameter, **`task_id_filter`**, picks which rows of the `tasks` table this
+config processes:
+
+- **Default (absent / empty):** process **all rows** of the `tasks` table (the behaviour above).
+- **Set to a `task_id` or a list of `task_id`s:** process **only** the matching row(s), in file order;
+  all other rows are skipped. Accepts a single string (`"sync-orders"`) or a list
+  (`["sync-orders","summarize"]`); a bare string is normalised to a one-element list.
+
+**First-class use case (document this):** *one shared `tasks` input table + N configs/agents, each
+config sets its own `task_id_filter` to own a specific row or subset.* The same curated table of agent
+tasks can be mapped into many configs; each config (or each agent/schedule) runs only the row(s) it
+owns. This **bridges single-config and config-rows** — you get per-row ownership and independent
+scheduling/retry of a row across configs **without** the config-rows overhead (no per-row plugin
+re-install / MCP re-resolve / fragmented state).
+
+**Semantics & edge cases:**
+- `task_id_filter` is **only meaningful in tasks-table mode** — it has no effect in config-prompt mode
+  (no table). If set in config-prompt mode, it is ignored with an info log.
+- **No match → `UserException` (exit 1)** with a clear message naming the filter value(s) and the
+  available `task_id`s, so a typo'd filter fails loudly rather than silently running nothing.
+- A filter value that matches a `task_id` present but **disabled/empty-prompt** still surfaces that
+  row's own validation error (empty `prompt` → `UserException` as above).
+- Kept deliberately simple for v1 — **explicit `task_id` / list of `task_id`s only**, no expression or
+  glob/regex filters (a documented future enhancement). Matching is exact string equality on `task_id`.
 
 ### 2.4 Secrets → `#`-prefixed config keys
 
@@ -288,6 +317,7 @@ below maps to a concrete `ClaudeAgentOptions` field or subprocess `env` var.
 | `github_enabled` | bool, default **false** | enables `Bash` + `gh`/`git` working dir + injects token; convenience toggle that allow-lists `Bash(gh *)`,`Bash(git *)` |
 | `workspace_input_files` | bool, default **false** | if true, stage `/data/in/files/` into the agent `cwd` so the agent can read uploaded files; via `cwd` + `add_dirs` |
 | `output.default_incremental` | bool, default **false** | default `incremental` for agent-produced tables |
+| `task_id_filter` | str or list[str], optional (default: all rows) | row selector for tasks-table mode — process only the matching `task_id`(s); no match → `UserException`; ignored in config-prompt mode (§2.3.1) |
 | `task.prompt` | str (config-prompt mode) | the prompt when no `tasks` table mapped |
 | `task.system_prompt` | str, optional | per-run system prompt in config-prompt mode |
 | `debug` | (platform-handled) | **NOT** a config-model field — the component base consumes the platform `debug` param and switches the root logger to DEBUG automatically (configuration.md). We do not add a model `debug`. |
@@ -298,6 +328,10 @@ below maps to a concrete `ClaudeAgentOptions` field or subprocess `env` var.
 - `mcp_servers[i].type` switches between stdio fields (`command`,`args`,`env`,`#secrets`) and
   http/sse fields (`url`,`headers`,`#secrets`) via `options.dependencies`.
 - `plugins.*` is a collapsible advanced group.
+- `task_id_filter` is a free-text / array field (a `task_id` or list of `task_id`s) presented near the
+  tasks-table mapping, with a description that it only applies when a `tasks` table is mapped and that
+  leaving it empty runs all rows (§2.3.1). No async/enum dropdown in v1 (the `task_id` set lives in the
+  input table, not the config). `task.*` is the config-prompt-mode group.
 - Use `options.dependencies` for all conditionals (never root-level `dependencies`).
 
 ### 5.3 Sync actions
@@ -334,7 +368,8 @@ src/
 1. Parse `config.json` → `Configuration` (Pydantic), raising `UserException` on validation error.
 2. Build the writable home + `PluginManager.prepare()` (env dirs, marketplace add/update/install) →
    returns local plugin paths.
-3. `TaskSource.load()` → `list[Task]` (config-prompt single task, or rows of the `tasks` table).
+3. `TaskSource.load()` → `list[Task]` (config-prompt single task, or rows of the `tasks` table after
+   applying the `task_id_filter` row selector — §2.3.1; no filter match → `UserException`).
 4. For each task: `ClaudeRunner.run_task(task, plugin_paths)` inside `asyncio.run`, teeing every
    message to `TranscriptWriter` (file + sessions rows) as it arrives; capture the final
    `ResultMessage`.
@@ -357,7 +392,8 @@ workspace. **This is the single function the tests mock** (§7).
 ### 6.3 Error handling — exit codes
 
 - **`UserException` (exit 1):** missing/invalid config (no `#anthropic_key`, bad model enum), missing
-  required `tasks` column, empty prompt, budget/turn cap hit when fail-on-error is on, Anthropic auth
+  required `tasks` column, **`task_id_filter` matching no row** (message names the filter value(s) and
+  the available `task_id`s), empty prompt, budget/turn cap hit when fail-on-error is on, Anthropic auth
   failure (401), plugin marketplace add/install failure for a user-supplied source, MCP server launch
   failure. All user-actionable, message shown in UI.
 - **Unexpected (exit 2):** any other unhandled exception (SDK internal crash, unexpected message
