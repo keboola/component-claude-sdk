@@ -10,6 +10,12 @@
       "description": "<b>Two ways to drive this component.</b><br/><b>1. Config-prompt mode</b> — leave input mapping empty and write a single prompt under <i>Task</i> below. One agent run.<br/><b>2. Tasks-table mode</b> — map one input table named <b>tasks</b> (or a single table by convention). Each row is one agent task, run sequentially. Required columns: <code>task_id</code> (unique) and <code>prompt</code>; optional per-row overrides: <code>system_prompt</code>, <code>model</code>, <code>max_turns</code>, <code>max_budget_usd</code>, <code>output_table</code>. Use <i>Task ID Filter</i> to let several configs share one curated tasks table, each owning a row subset. Everything else on this page (auth, model, tools, MCP, plugins, budget) is the shared environment for every task.",
       "propertyOrder": 0
     },
+    "_section_auth": {
+      "type": "string",
+      "format": "info",
+      "description": "<b>Authentication & secrets</b>",
+      "propertyOrder": 1
+    },
     "#anthropic_key": {
       "type": "string",
       "title": "Anthropic API Key",
@@ -18,12 +24,12 @@
       "options": {
         "tooltip": "Injected into the agent subprocess as ANTHROPIC_API_KEY — the only credential the Claude agent loop needs to talk to api.anthropic.com. Get it at console.anthropic.com under API Keys. The value is encrypted at rest and never logged."
       },
-      "propertyOrder": 1
+      "propertyOrder": 2
     },
     "test_connection": {
       "type": "button",
       "format": "test-connection",
-      "propertyOrder": 2,
+      "propertyOrder": 3,
       "options": {
         "async": {
           "label": "Test Connection",
@@ -39,7 +45,13 @@
       "options": {
         "tooltip": "Fine-grained PAT (Contents r/w, Pull requests r/w) or a classic token with the repo scope. At runtime it is injected as both GITHUB_TOKEN and GH_TOKEN so the agent's gh and git commands authenticate automatically, and it is used to clone private plugin marketplaces. Encrypted at rest, never logged."
       },
-      "propertyOrder": 3
+      "propertyOrder": 4
+    },
+    "_section_model": {
+      "type": "string",
+      "format": "info",
+      "description": "<b>Model &amp; budget</b> — capability vs. cost, and the limits that bound every run.",
+      "propertyOrder": 9
     },
     "model": {
       "type": "string",
@@ -125,6 +137,12 @@
       },
       "propertyOrder": 14
     },
+    "_section_permissions": {
+      "type": "string",
+      "format": "info",
+      "description": "<b>Permissions &amp; tools</b> — what the agent is allowed to do.",
+      "propertyOrder": 15
+    },
     "permission_mode": {
       "type": "string",
       "title": "Permission Mode",
@@ -143,7 +161,7 @@
         "tooltip": "Set explicitly on every run. 'Don't ask' only lets the agent use tools you put in Allowed Tools below — the safest default. 'Bypass permissions' lets the agent run ANY tool (deny rules still apply); powerful, use only when you trust the prompt. 'Auto' lets an SDK classifier decide. Prompting modes (default / acceptEdits / plan) are intentionally hidden because they would block the container until the job times out."
       },
       "default": "dontAsk",
-      "propertyOrder": 15
+      "propertyOrder": 16
     },
     "allowed_tools": {
       "type": "array",
@@ -156,7 +174,7 @@
       "options": {
         "tooltip": "Built-in tool names: Read, Write, Edit, Bash, Glob, Grep, WebFetch, WebSearch. Scoped Bash patterns are supported, e.g. Bash(git *). MCP tools are mcp__<server>__<tool>, or mcp__<server>__* to allow all of a server's tools. Anything not listed here is unavailable in 'Don't ask' mode. Enabling GitHub below auto-adds Bash(gh *) and Bash(git *)."
       },
-      "propertyOrder": 16
+      "propertyOrder": 17
     },
     "disallowed_tools": {
       "type": "array",
@@ -169,7 +187,13 @@
       "options": {
         "tooltip": "A deny rule always wins, even under 'Bypass permissions'. Use it to fence off dangerous tools (e.g. a destructive Bash pattern) while leaving the rest open."
       },
-      "propertyOrder": 17
+      "propertyOrder": 18
+    },
+    "_section_prompt": {
+      "type": "string",
+      "format": "info",
+      "description": "<b>Prompt &amp; advanced settings</b> — the config-level system prompt and SDK passthrough.",
+      "propertyOrder": 19
     },
     "system_prompt": {
       "type": "string",
@@ -180,7 +204,7 @@
         "input_height": "120px",
         "tooltip": "Shared by all tasks in this config. In tasks-table mode a per-row 'system_prompt' column overrides this for that row only; the per-task Task block below overrides it in config-prompt mode. Use it to tell the agent how to behave and how to shape its output tables."
       },
-      "propertyOrder": 18
+      "propertyOrder": 20
     },
     "settings_json": {
       "type": "object",
@@ -194,7 +218,7 @@
         },
         "tooltip": "Raw passthrough for SDK settings not exposed as their own field above. Leave empty unless you have a specific advanced setting to inject. Combine with Setting Sources below to control which ambient settings files the agent reads."
       },
-      "propertyOrder": 19
+      "propertyOrder": 21
     },
     "setting_sources": {
       "type": "array",
@@ -209,7 +233,13 @@
       "options": {
         "tooltip": "Maps to ClaudeAgentOptions.setting_sources. Leave empty unless you deliberately want the agent to pick up user/project/local settings from the workspace — adding sources makes runs less reproducible."
       },
-      "propertyOrder": 20
+      "propertyOrder": 22
+    },
+    "_section_github": {
+      "type": "string",
+      "format": "info",
+      "description": "<b>GitHub</b> — let the agent work against GitHub with gh and git (needs the GitHub Token above).",
+      "propertyOrder": 30
     },
     "github_enabled": {
       "type": "boolean",
@@ -236,6 +266,12 @@
       },
       "propertyOrder": 32
     },
+    "_section_workspace": {
+      "type": "string",
+      "format": "info",
+      "description": "<b>Workspace</b> — what the agent can see in its working directory.",
+      "propertyOrder": 35
+    },
     "workspace_input_files": {
       "type": "boolean",
       "title": "Stage Input Files into Workspace",
@@ -244,7 +280,13 @@
       "options": {
         "tooltip": "When on, files mapped to /data/in/files/ are staged into the agent's /tmp working directory (cwd) and exposed via add_dirs, so a prompt can say e.g. 'read report.pdf'. Leave off if the agent only works with input TABLES or fetches its own data."
       },
-      "propertyOrder": 33
+      "propertyOrder": 36
+    },
+    "_section_task": {
+      "type": "string",
+      "format": "info",
+      "description": "<b>Task &amp; output</b> — the prompt (config-prompt mode), the tasks-table row filter, and output-table defaults.",
+      "propertyOrder": 39
     },
     "task": {
       "type": "object",
@@ -315,6 +357,12 @@
           "propertyOrder": 1
         }
       }
+    },
+    "_section_mcp": {
+      "type": "string",
+      "format": "info",
+      "description": "<b>MCP servers</b> — extra tools from Model Context Protocol servers (remember to allow-list their tools above).",
+      "propertyOrder": 59
     },
     "mcp_servers": {
       "type": "array",
@@ -442,6 +490,12 @@
         }
       }
     },
+    "_section_plugins": {
+      "type": "string",
+      "format": "info",
+      "description": "<b>Plugins</b> — Claude Code plugin marketplaces installed at job start (public or private, pinned or latest).",
+      "propertyOrder": 69
+    },
     "plugins": {
       "type": "array",
       "title": "Plugins (Advanced)",
@@ -523,6 +577,12 @@
           }
         }
       }
+    },
+    "_section_sdk": {
+      "type": "string",
+      "format": "info",
+      "description": "<b>Runtime SDK version</b> — optionally run a newer claude-agent-sdk without rebuilding the image. Future enhancement: the Model &amp; budget fields above could be laid out as side-by-side grid columns via a sub-object + grid-strict + a back-compat flatten validator — deferred because it changes the persisted config shape (pending owner approval).",
+      "propertyOrder": 79
     },
     "sdk_version": {
       "type": "string",
