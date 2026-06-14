@@ -83,6 +83,33 @@ def test_build_options_plugins_passed_through():
     assert opts.plugins == plugins
 
 
+def test_settings_json_object_written_to_file_and_path_passed(tmp_path):
+    import json
+
+    home = str(tmp_path / "home")
+    cfg = _config(settings_json={"permissions": {"allow": ["Bash"]}})
+    runner = ClaudeRunner(workspace_dir="/tmp/ws")
+    opts = runner.build_options(_task(), cfg, [], {"CLAUDE_CONFIG_DIR": home})
+    assert opts.settings == f"{home}/settings.json"
+    written = json.load(open(opts.settings, encoding="utf-8"))
+    assert written == {"permissions": {"allow": ["Bash"]}}
+
+
+def test_settings_json_string_written_verbatim(tmp_path):
+    home = str(tmp_path / "home")
+    cfg = _config(settings_json='{"raw": true}')
+    runner = ClaudeRunner(workspace_dir="/tmp/ws")
+    opts = runner.build_options(_task(), cfg, [], {"CLAUDE_CONFIG_DIR": home})
+    assert open(opts.settings, encoding="utf-8").read() == '{"raw": true}'
+
+
+def test_settings_json_absent_no_settings_option(tmp_path):
+    cfg = _config()  # no settings_json
+    runner = ClaudeRunner(workspace_dir="/tmp/ws")
+    opts = runner.build_options(_task(), cfg, [], {"CLAUDE_CONFIG_DIR": str(tmp_path)})
+    assert opts.settings is None
+
+
 def _make_stream(result_message):
     async def gen(prompt, options):
         yield SystemMessage(subtype="init", data={"session_id": "sess-1"})

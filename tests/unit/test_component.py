@@ -13,6 +13,7 @@ def _make_datadir(tmp_path, parameters):
     """Build a minimal KBC data dir with a config.json."""
     data_dir = tmp_path / "data"
     (data_dir / "in" / "tables").mkdir(parents=True)
+    (data_dir / "in" / "files").mkdir(parents=True)
     (data_dir / "out" / "tables").mkdir(parents=True)
     (data_dir / "out" / "files").mkdir(parents=True)
     (data_dir / "config.json").write_text(json.dumps({"parameters": parameters}), encoding="utf-8")
@@ -121,3 +122,53 @@ def test_failed_task_raises_user_exception(tmp_path, monkeypatch):
         comp.run()
     # transcript still written (write_always) despite the failure
     assert os.path.isfile(os.path.join(data_dir, "out", "tables", "claude_runs.csv"))
+
+
+def test_workspace_input_files_staged_into_workspace(tmp_path, monkeypatch):
+    import component as component_module
+
+    data_dir = _make_datadir(
+        tmp_path,
+        {"#anthropic_key": "KEY_NAME_ONLY", "workspace_input_files": True, "task": {"prompt": "read it"}},
+    )
+    # an uploaded input file (+ a manifest that must NOT be staged)
+    in_files = os.path.join(data_dir, "in", "files")
+    with open(os.path.join(in_files, "doc.txt"), "w", encoding="utf-8") as fh:
+        fh.write("hello")
+    with open(os.path.join(in_files, "doc.txt.manifest"), "w", encoding="utf-8") as fh:
+        fh.write("{}")
+
+    workspace = str(tmp_path / "ws")
+    monkeypatch.setattr(component_module, "WORKSPACE_DIR", workspace)
+    monkeypatch.setenv("KBC_DATADIR", data_dir)
+    comp = Component()
+    comp._runner._workspace_dir = workspace  # keep runner cwd aligned with the patched workspace
+    _patch_sdk(monkeypatch, comp, _canned_stream())
+
+    comp.run()
+
+    assert os.path.isfile(os.path.join(workspace, "doc.txt"))
+    assert open(os.path.join(workspace, "doc.txt"), encoding="utf-8").read() == "hello"
+    # the manifest sidecar is not staged
+    assert not os.path.exists(os.path.join(workspace, "doc.txt.manifest"))
+
+
+def test_workspace_input_files_off_does_not_stage(tmp_path, monkeypatch):
+    import component as component_module
+
+    data_dir = _make_datadir(
+        tmp_path,
+        {"#anthropic_key": "KEY_NAME_ONLY", "task": {"prompt": "x"}},  # toggle off (default)
+    )
+    with open(os.path.join(data_dir, "in", "files", "doc.txt"), "w", encoding="utf-8") as fh:
+        fh.write("hello")
+
+    workspace = str(tmp_path / "ws2")
+    monkeypatch.setattr(component_module, "WORKSPACE_DIR", workspace)
+    monkeypatch.setenv("KBC_DATADIR", data_dir)
+    comp = Component()
+    comp._runner._workspace_dir = workspace
+    _patch_sdk(monkeypatch, comp, _canned_stream())
+
+    comp.run()
+    assert not os.path.exists(os.path.join(workspace, "doc.txt"))

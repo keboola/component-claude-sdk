@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 
 from keboola.component.base import ComponentBase, sync_action
 from keboola.component.exceptions import UserException
@@ -57,7 +58,28 @@ class Component(ComponentBase):
         plugin_result = self._plugin_manager.prepare(config.plugins, env, github_token=config.github_token)
         os.makedirs(WORKSPACE_DIR, exist_ok=True)
         self._output_writer.ensure_dir()
+        if config.workspace_input_files:
+            self._stage_input_files()
         return sdk_version, plugin_result, env
+
+    def _stage_input_files(self) -> None:
+        """Copy /data/in/files/ into the agent workspace so the agent can read them.
+
+        Paired with ``add_dirs=[workspace]`` on ClaudeAgentOptions (spec §5.1), this
+        makes user-uploaded files available to the agent. No-op when there are none.
+        """
+        in_files = self.files_in_path
+        if not os.path.isdir(in_files):
+            return
+        staged = 0
+        for name in os.listdir(in_files):
+            src = os.path.join(in_files, name)
+            if not os.path.isfile(src) or name.endswith(".manifest"):
+                continue
+            shutil.copy2(src, os.path.join(WORKSPACE_DIR, name))
+            staged += 1
+        if staged:
+            logging.info("Staged %d input file(s) into the agent workspace.", staged)
 
     @staticmethod
     def _build_env(config: Configuration) -> dict[str, str]:

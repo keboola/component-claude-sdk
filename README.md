@@ -75,10 +75,16 @@ Output
 The component writes:
 
 - **Agent-produced tables** — see the hand-off convention below.
-- **`claude_sessions`** — one row per SDK message event (queryable transcript).
+- **`claude_sessions`** — one row per SDK message event (queryable transcript),
+  `write_always` so it is uploaded **even on a failed job**. Each row's
+  `raw_json` holds the verbatim JSONL line, making this table the durable,
+  failure-proof transcript of record.
 - **`claude_runs`** — one row per task with cost/turns/duration, the resolved SDK
-  version and resolved plugin refs.
+  version and resolved plugin refs (also `write_always`).
 - **JSONL file artifacts** under `out/files/` — the full-fidelity transcript.
+  NOTE: Keboola file output mapping has no `write_always`, so these files are
+  uploaded only on a **successful** job; the always-on durability guarantee is
+  the `claude_sessions` table above.
 
 Agent → table hand-off convention
 ----------------------------------

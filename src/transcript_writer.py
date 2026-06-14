@@ -1,13 +1,21 @@
-"""Always-on session transcript sinks (spec §2.6.1).
+"""Session transcript sinks (spec §2.6.1).
 
-Every run writes the SDK message stream regardless of success/failure via two
-complementary ``write_always`` sinks:
+Every run writes the SDK message stream via two complementary sinks:
 
-1. **Raw JSONL file artifacts** under ``/data/out/files/`` — one line per SDK
-   message, full fidelity (large tool payloads survive).
-2. **Structured tables** ``claude_sessions`` (one row per event) and
-   ``claude_runs`` (one row per task) under ``/data/out/tables/`` — queryable in
-   Storage, native ``schema`` manifests, incremental with PKs.
+1. **Structured tables** ``claude_sessions`` (one row per event, the verbatim
+   line preserved in ``raw_json``) and ``claude_runs`` (one row per task) under
+   ``/data/out/tables/`` — queryable in Storage, native ``schema`` manifests,
+   incremental with PKs, and a real ``write_always=True``. **This is the
+   always-on, failure-durable transcript of record** — it survives an exit-1 job.
+2. **Raw JSONL file artifacts** under ``/data/out/files/`` — one line per SDK
+   message, full fidelity (large tool payloads survive). Keboola file output
+   mapping has **no** ``write_always`` (it is a ``TableDefinition``-only
+   attribute), so this artifact is uploaded only on a **successful** job; it is
+   the full-fidelity success-path convenience, not the durability guarantee.
+
+The brief's "all the session JSONL lines, regardless of success/failure"
+requirement is satisfied by sink 1 (every line lands in ``claude_sessions``
+verbatim, write_always); sink 2 adds untruncated fidelity on the success path.
 
 The writer is given the component (for the library's manifest/path machinery)
 and the resolved SDK version + plugin refs (for ``claude_runs`` traceability).
@@ -31,16 +39,19 @@ RUNS_TABLE = "claude_runs"
 SESSION_TAGS = ["claude-sdk", "session-transcript"]
 
 
-def _string_col(primary_key: bool = False) -> ColumnDefinition:
-    return ColumnDefinition(data_types=BaseType.string(), primary_key=primary_key)
+# PK columns are non-nullable; everything else is explicitly nullable so an
+# empty cell (e.g. total_cost_usd / api_error_status when the SDK returns None)
+# loads as NULL into the authoritative-typed column instead of failing the load.
+def _string_col(primary_key: bool = False, nullable: bool = True) -> ColumnDefinition:
+    return ColumnDefinition(data_types=BaseType.string(), primary_key=primary_key, nullable=not primary_key and nullable)
 
 
-def _int_col(primary_key: bool = False) -> ColumnDefinition:
-    return ColumnDefinition(data_types=BaseType.integer(), primary_key=primary_key)
+def _int_col(primary_key: bool = False, nullable: bool = True) -> ColumnDefinition:
+    return ColumnDefinition(data_types=BaseType.integer(), primary_key=primary_key, nullable=not primary_key and nullable)
 
 
-def _float_col() -> ColumnDefinition:
-    return ColumnDefinition(data_types=BaseType.float())
+def _float_col(nullable: bool = True) -> ColumnDefinition:
+    return ColumnDefinition(data_types=BaseType.float(), nullable=nullable)
 
 
 # claude_sessions: one row per SDK message event (mostly STRING + numeric seq).
@@ -157,14 +168,22 @@ class TranscriptWriter:
         self._write_table(RUNS_TABLE, RUNS_SCHEMA, self._runs_rows)
 
     def _write_file_manifests(self) -> None:
-        """Register every produced JSONL file as a write_always file artifact."""
+        """Register every produced JSONL file as a tagged file artifact.
+
+        NOTE: Keboola file output mapping has **no** ``write_always`` (it is a
+        ``TableDefinition``-only attribute in ``keboola.component.dao``), so a
+        JSONL file artifact is uploaded only on a SUCCESSFUL job. The always-on
+        durable transcript-of-record is the ``claude_sessions`` TABLE sink — it
+        stores every JSONL line verbatim in ``raw_json`` and carries a real
+        ``write_always=True`` (so it survives an exit-1 job). The file is the
+        full-fidelity success-path convenience.
+        """
         if not os.path.isdir(self._files_path):
             return
         for name in os.listdir(self._files_path):
             if not name.endswith(".jsonl"):
                 continue
             file_def = self._component.create_out_file_definition(name, tags=SESSION_TAGS)
-            file_def.write_always = True
             self._component.write_manifest(file_def)
 
     def _write_table(self, name: str, schema: dict[str, ColumnDefinition], rows: list[dict[str, Any]]) -> None:

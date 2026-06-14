@@ -8,7 +8,9 @@ is touched.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -92,7 +94,31 @@ class ClaudeRunner:
         if config.workspace_input_files:
             kwargs["add_dirs"] = [self._workspace_dir]
 
+        settings_path = self._write_settings_file(config.settings_json, env)
+        if settings_path:
+            kwargs["settings"] = settings_path
+
         return ClaudeAgentOptions(**kwargs)
+
+    def _write_settings_file(self, settings_json: dict | str | None, env: dict[str, str]) -> str | None:
+        """Persist the ``settings_json`` passthrough to a file and return its path.
+
+        ``ClaudeAgentOptions.settings`` is a file PATH, so we materialise the
+        config object (or a raw JSON string) under the writable home and hand the
+        SDK the path (spec §5.1). Returns ``None`` when nothing is configured.
+        """
+        if not settings_json:
+            return None
+        home = env.get("CLAUDE_CONFIG_DIR") or self._workspace_dir
+        os.makedirs(home, exist_ok=True)
+        path = os.path.join(home, "settings.json")
+        if isinstance(settings_json, str):
+            content = settings_json
+        else:
+            content = json.dumps(settings_json)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        return path
 
     @staticmethod
     def _build_mcp_servers(config: Configuration) -> dict[str, dict[str, Any]]:

@@ -184,25 +184,30 @@ Grounded in `output-mapping.md`, `default-bucket.md`, `native-data-types.md`:
   `CLAUDE_CONFIG_DIR` is under `/tmp` too — **never** `/data/out/tables/` (or scratch becomes spurious
   tables). State, if any, goes to `/data/out/state.json`.
 
-#### 2.6.1 Always-on JSONL session transcript (decision 3) — BOTH a file and a table, `write_always`
+#### 2.6.1 Always-on JSONL session transcript (decision 3) — a `write_always` table + a success-path file
 
-Every run writes the SDK's streaming session transcript **regardless of success/failure**, via **two
-complementary sinks, both `write_always`:**
+Every run writes the SDK's streaming session transcript via **two complementary sinks**. The
+**durable, always-on guarantee lives on the TABLE sink** (which supports `write_always`); the file sink
+is a success-path full-fidelity convenience. (Library-verified: `write_always` is a `TableDefinition`
+attribute in `keboola.component.dao`; Keboola **file** output mapping has no such attribute, so a file
+artifact uploads only on a successful job. The earlier draft's claim that *both* sinks are
+`write_always` was wrong and is corrected here.)
 
-1. **Raw JSONL file artifacts → `/data/out/files/`.** As each message is yielded by `query()` we
+1. **A structured sessions table → `/data/out/tables/claude_sessions.csv`** (+ `.manifest`,
+   **`write_always: true`** — uploaded even on an exit-1 job, `incremental: true`, PK
+   `["task_id","session_id","seq"]`, native `schema`). One row per JSONL event, columns: `task_id,
+   session_id, seq, ts, type, subtype, role, text, tool_name, tool_input_json, tool_result_json,
+   is_error, raw_json`. `raw_json` carries the **verbatim** JSONL line so nothing is lost; the typed
+   columns are the convenience projection. **This is the failure-durable transcript of record** — it
+   satisfies the brief's "all the session JSONL lines … regardless of success/failure" (every line is
+   in `raw_json`, and `write_always` carries it through a failed job) and is queryable in Storage.
+2. **Raw JSONL file artifacts → `/data/out/files/`.** As each message is yielded by `query()` we
    append it (serialized to one JSON line) to `/data/out/files/claude_session_<task_id>.jsonl`, and its
-   `.manifest` sets **`write_always: true`** and tags `["claude-sdk","session-transcript"]`. After the
-   loop we also locate the SDK's own on-disk transcript
-   (`$CLAUDE_CONFIG_DIR/projects/<encoded-cwd>/<session_id>.jsonl`) and copy it alongside as
-   `claude_session_<task_id>_sdk.jsonl` (belt-and-suspenders: the streamed tee survives partial runs;
-   the on-disk file is the SDK's canonical record). The file sink preserves the **full fidelity** of
-   every event including large tool payloads.
-2. **A structured sessions table → `/data/out/tables/claude_sessions.csv`** (+ `.manifest`,
-   `write_always: true`, `incremental: true`, PK `["task_id","session_id","seq"]`, native `schema`).
-   One row per JSONL event, columns: `task_id, session_id, seq, ts, type, subtype, role, text,
-   tool_name, tool_input_json, tool_result_json, is_error, raw_json`. This makes the transcript
-   **queryable in Storage** without parsing files. `raw_json` carries the verbatim line so nothing is
-   lost; the typed columns are the convenience projection.
+   `.manifest` tags `["claude-sdk","session-transcript"]`. After the loop we also locate the SDK's own
+   on-disk transcript (`$CLAUDE_CONFIG_DIR/projects/<encoded-cwd>/<session_id>.jsonl`) and copy it
+   alongside as `claude_session_<task_id>_sdk.jsonl`. The file sink preserves **full fidelity** of every
+   event including large tool payloads, but — because file output mapping has no `write_always` — it is
+   **uploaded only on a successful job**; on failure the durability falls to sink 1.
 
 We also always write a **`claude_runs.csv`** summary table (one row per task) from the final
 `ResultMessage`: `task_id, session_id, success, subtype, is_error, num_turns, duration_ms,
@@ -212,10 +217,12 @@ plugin refs (§2.8) — so a `latest` run for either is traceable. `write_always
 `incremental: true`, PK `["task_id","session_id"]`, native `schema` with real numeric types. This is
 the usage/cost report (§9) and the at-a-glance run outcome.
 
-**Why both file + table:** the table is for querying/monitoring/cost-tracking in SQL; the file is the
-full-fidelity debug artifact (some tool payloads are large/awkward for a table cell). The brief
-requires "all the session JSONL lines … regardless of success/failure" — `write_always` on both
-satisfies "regardless of failure"; the dual sink satisfies "all the lines" without lossy truncation.
+**Why both file + table:** the table is the failure-durable transcript (`write_always`) and is for
+querying/monitoring/cost-tracking in SQL; the file is the success-path full-fidelity debug artifact
+(some tool payloads are large/awkward for a table cell). The brief requires "all the session JSONL
+lines … regardless of success/failure" — the **table sink** satisfies "regardless of failure" (the
+verbatim line is in `raw_json`, carried by `write_always` through an exit-1 job); the file sink adds
+untruncated fidelity on the success path.
 
 ### 2.7 Budget ceiling & cost
 
