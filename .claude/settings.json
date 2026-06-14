@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "permissions": {
+    "deny": [
+      "Read(secrets.json)",
+      "Read(./secrets.json)",
+      "Read(/Users/matyasjirat/VSCodeProjects/Keboola/component-claude-sdk/secrets.json)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read|Edit|Write|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/deny-secrets-access.py\"",
+            "timeout": 10,
+            "statusMessage": "Checking secrets.json guardrail"
+          }
+        ]
+      }
+    ]
+  }
+}

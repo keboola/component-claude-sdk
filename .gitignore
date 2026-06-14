@@ -8,6 +8,12 @@ __pycache__/
 *.egg-info
 venv
 .claude
+# but DO commit the project-level guardrail (settings + hooks); keep settings.local.json ignored
+!.claude/
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
+!.claude/hooks/**
 .DS_Store
 
 # kbc datafolder
