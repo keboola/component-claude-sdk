@@ -1,1 +1,1 @@
-https://github.com/keboola/component-claude-sdk/blob/master/README.md
+https://github.com/keboola/component-claude-sdk/blob/main/README.md
