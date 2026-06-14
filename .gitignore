@@ -17,3 +17,6 @@ venv
 secrets.json
 tests/functional/*/source/data/out/
 tests/functional/*/source/data/in/
+
+# local build-lifecycle tracker (never committed)
+docs/superpowers/*-lifecycle.md
