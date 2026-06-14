@@ -35,39 +35,132 @@ Prerequisites
 - Optionally a **GitHub token** (`#github_token`) for GitHub work and private
   plugin marketplaces.
 
-Configuration
-=============
+How to set it up
+================
 
-All parameters live at config level (single configuration, no config rows). The
-full parameter set and its mapping to `ClaudeAgentOptions` is documented in the
-design spec (`docs/superpowers/specs/2026-06-14-claude-sdk-design.md`, §5.1).
-Highlights:
+This component runs in one of **two input modes**. The whole configuration page
+(auth, model, tools, MCP servers, plugins, budget) describes the **shared
+environment** every task runs in; only the *prompt* differs between the two
+modes.
 
-- `#anthropic_key` (required), `#github_token` (optional).
-- `model` / `fallback_model`, `max_turns` (default 20), `max_budget_usd`
-  (default 10), `effort`.
-- `permission_mode` — only the non-prompting modes `dontAsk` (default),
-  `bypassPermissions`, `auto` are offered; prompting modes would hang a headless
-  run.
-- `allowed_tools` / `disallowed_tools`, `system_prompt`, `settings_json`,
-  `setting_sources`.
-- `mcp_servers` — stdio or http/sse servers with per-server secrets.
-- `plugins` — public shorthand or `owner/repo`/git-URL sources, each `latest` or
-  a pinned ref; private sources authenticate via `#github_token`.
-- `github_enabled`, `workspace_input_files`, `output.default_incremental`.
-- `task_id_filter` — in tasks-table mode, process only the matching task_id(s).
-- `sdk_version` / `sdk_version_on_failure` — optionally run a newer SDK/CLI at
-  runtime without rebuilding the image (`pinned` by default).
+### Mode 1 — Config-prompt (a single prompt)
+
+The simplest path. Leave the **input mapping empty** and write one prompt.
+
+1. Set **Anthropic API Key** (`#anthropic_key`) and click **Test Connection**.
+2. Pick a **Model** and set **Max Turns** + **Max Budget (USD)** — these two
+   together hard-bound the run (there is no wall-clock timeout).
+3. Under **Task**, write the **Prompt** — be explicit about the table(s) you want
+   the agent to produce (e.g. *"write a CSV named `order_summary` with …"*).
+4. Run. One agent task executes; its output tables and the transcript tables land
+   in Storage.
+
+### Mode 2 — Tasks-table (one row per task)
+
+For batches of tasks driven by data.
+
+1. Set up the shared environment as in Mode 1 (auth, model, budget, tools, …) —
+   but leave the **Task** prompt empty.
+2. **Map exactly one input table** whose destination name is **`tasks`** (if only
+   one table is mapped, any name is accepted and the assumption is logged).
+3. Each **row is one agent task**, run sequentially in file order. Columns:
+
+   | Column | Required | Meaning |
+   |---|---|---|
+   | `task_id` | **yes** | Unique id; correlation key in the transcript/sessions tables. |
+   | `prompt` | **yes** | The agent goal for this row. Empty → that row fails (exit 1). |
+   | `system_prompt` | no | Per-row system prompt; overrides the config-level one. |
+   | `model` | no | Per-row model id; falls back to the config `model`. |
+   | `max_turns` | no | Per-row turn cap; falls back to the config value. |
+   | `max_budget_usd` | no | Per-row budget; **clamped down** to the config ceiling. |
+   | `output_table` | no | Hint for the agent's primary output table name. |
+
+   Unknown extra columns are passed to the agent as per-task JSON context.
+4. Optionally set **Task ID Filter** to process only some rows — see below.
+
+#### One shared tasks table, many configs (`task_id_filter`)
+
+Map **one curated `tasks` table into several configs** and give each config a
+different **Task ID Filter** (a `task_id` or comma-separated list). Each config
+then owns its own row(s) — per-row ownership and independent
+scheduling/retry **without** the overhead of Keboola config rows. Empty filter =
+all rows. A filter matching no row **fails the job with a clear error** (a typo is
+loud, not silent). Exact `task_id` matching; ignored in config-prompt mode.
+
+Configuration reference
+=======================
+
+All parameters live at config level (single configuration, no config rows). Full
+parameter → `ClaudeAgentOptions` mapping is in the design spec
+(`docs/superpowers/specs/2026-06-14-claude-sdk-design.md`, §5.1).
+
+**Secrets**
+
+- `#anthropic_key` — **required**. Injected as `ANTHROPIC_API_KEY`.
+- `#github_token` — optional. Injected as `GITHUB_TOKEN` + `GH_TOKEN`; needed only
+  when **Enable GitHub** is on or a **private** plugin source is used. Fine-grained
+  PAT (Contents r/w, Pull requests r/w) or a classic `repo`-scope token.
+- Per-MCP-server secrets — put a `#`-prefixed key in a stdio server's `env` or an
+  HTTP/SSE server's `headers` (e.g. `{"Authorization": "Bearer …"}`).
+
+**Model & budget**
+
+- `model` (default `claude-opus-4-8`) / `fallback_model` (optional).
+- `max_turns` (default 20) and `max_budget_usd` (default 10) — **always keep both
+  set**; they are the only stop conditions. Per-task overrides are clamped to the
+  budget ceiling. `effort` (optional) trades quality for cost.
+
+**Permissions & tools**
+
+- `permission_mode` (default `dontAsk`) — only **non-prompting** modes are
+  offered: `dontAsk` (deny anything not allow-listed), `bypassPermissions`
+  (auto-approve all; deny rules still apply — use deliberately), `auto`
+  (classifier-gated). Prompting modes (`default` / `acceptEdits` / `plan`) are
+  rejected because they would **hang a headless job** until it times out.
+- `allowed_tools` / `disallowed_tools` — built-ins `Read, Write, Edit, Bash, Glob,
+  Grep, WebFetch, WebSearch` (scoped Bash like `Bash(git *)` works); MCP tools as
+  `mcp__<server>__<tool>` or `mcp__<server>__*`. In `dontAsk` mode the agent can
+  use **only** allow-listed tools; a deny rule always wins.
+- `system_prompt`, `settings_json`, `setting_sources` (advanced passthrough).
+
+**MCP servers** (`mcp_servers`)
+
+- `stdio` (in-container subprocess: `command`/`args`/`env`) or `http`/`sse`
+  (remote: `url`/`headers`). Defining a server only makes its tools *visible* — you
+  must also allow-list them in `allowed_tools`.
+
+**Plugins** (`plugins`) — installed at job start, nothing baked into the image
+
+- `source`: a public shorthand (e.g. `superpowers`), an `owner/repo`, a git URL, or
+  a `marketplace.json` URL. **Private** sources (e.g. a private CF Kit repo) set
+  `private: true` and authenticate via `#github_token`.
+- `version`: a **pinned** tag/SHA/branch (reproducible) or **`latest`** (re-pull
+  newest each run, not reproducible). The resolved version is recorded in
+  `claude_runs`.
+- `plugins`: the plugin name(s) to install (or `["*"]` / empty for all).
+
+**GitHub & workspace**
+
+- `github_enabled` (default false) — adds `Bash(gh *)`/`Bash(git *)` to the
+  allow-list and exports the token; needs `#github_token`.
+- `workspace_input_files` (default false) — stages `/data/in/files/` into the
+  agent's working directory.
+
+**SDK version** (advanced)
+
+- `sdk_version` (default `pinned`) — `pinned` uses the baked-in `claude-agent-sdk`
+  (offline-safe, deterministic). A concrete version (e.g. `0.2.105`) or `latest`
+  pip-installs at job start (**needs HTTPS egress**; `latest` is non-reproducible).
+  The bundled CLI moves with the package, so there is no SDK/CLI skew.
+- `sdk_version_on_failure` (default `fail`) — `fail` raises if a non-pinned install
+  fails (no silent downgrade); `fallback_pinned` warns and uses the baked version.
 
 Input
 =====
 
 - **Config-prompt mode:** no input table; the prompt comes from `task.prompt`.
-- **Tasks-table mode:** map one input table named `tasks` (or a single table by
-  convention). Each row is one task. Columns: `task_id` (required, unique),
-  `prompt` (required), and optional `system_prompt`, `model`, `max_turns`,
-  `max_budget_usd`, `output_table`. Unknown columns are passed to the agent as
-  per-task context.
+- **Tasks-table mode:** map one input table named `tasks` (one row per task) — see
+  the [How to set it up](#how-to-set-it-up) table above for the column contract.
 
 Output
 ======

@@ -1,11 +1,18 @@
 ### Configuration
 
-Provide your Anthropic API key and use **Test Connection** to validate it. Choose the model, set the
-`max_turns` and `max_budget_usd` limits that bound every run, and pick a non-prompting permission mode.
+Provide your **Anthropic API key** and use **Test Connection** to validate it. Choose the **model**,
+set the **Max Turns** and **Max Budget (USD)** limits that bound every run (there is no wall-clock
+timeout, so keep both set), and pick a non-prompting **permission mode**.
 
-In **config-prompt mode** enter a single prompt under **Task**. In **tasks-table mode** map a `tasks`
-input table (one row per task) and optionally set `task_id_filter` to process only specific rows.
+This component has **two setup modes**:
 
-Optionally configure allowed/disallowed tools, MCP servers (stdio / HTTP / SSE) with their own
-secrets, runtime plugin marketplaces, GitHub access (`#github_token` + **Enable GitHub**), and the
-runtime SDK version. See the documentation for the full parameter reference.
+- **Config-prompt mode** — leave the input mapping empty and enter one prompt under **Task**. One agent run.
+- **Tasks-table mode** — map one input table named **`tasks`** (required columns `task_id` + `prompt`,
+  optional per-row `system_prompt` / `model` / `max_turns` / `max_budget_usd` / `output_table`). Each row
+  is one task. Set **Task ID Filter** to let several configs share one curated tasks table, each owning a
+  row subset.
+
+Optionally configure **allowed/disallowed tools**, **MCP servers** (stdio / HTTP / SSE) with their own
+encrypted secrets, runtime **plugin** marketplaces (public or private, pinned or `latest`), **GitHub**
+access (`#github_token` + **Enable GitHub**), and the runtime **SDK version**. See the documentation
+for the full parameter reference and the agent-to-table output contract.
