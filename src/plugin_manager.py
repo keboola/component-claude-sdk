@@ -15,12 +15,48 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform
+import shutil
 import subprocess
 from dataclasses import dataclass, field
+from functools import cache
+from pathlib import Path
 
 from keboola.component.exceptions import UserException
 
 from configuration import PUBLIC_MARKETPLACE_REGISTRY, PluginEntry
+
+
+@cache
+def _resolve_claude_cli() -> str:
+    """Resolve the absolute path of the bundled ``claude`` CLI.
+
+    The CLI is shipped INSIDE the ``claude-agent-sdk`` package (``_bundled/claude``)
+    and is NOT on ``PATH`` in the slim image, so a bare ``"claude"`` would fail with
+    ``FileNotFoundError``. We resolve it the same way the SDK's own transport does
+    (``<claude_agent_sdk package dir>/_bundled/claude``), importing the package
+    lazily so this works against either the baked SDK or a runtime ``sdk_version``
+    overlay (the overlay is on ``sys.path`` before this is first called).
+    """
+    cli_name = "claude.exe" if platform.system() == "Windows" else "claude"
+    try:
+        import claude_agent_sdk
+
+        package_dir = Path(claude_agent_sdk.__file__).resolve().parent
+        bundled = package_dir / "_bundled" / cli_name
+        if bundled.is_file():
+            return str(bundled)
+    except Exception as exc:  # ImportError or a malformed install
+        logging.warning("Could not locate the bundled claude CLI via claude_agent_sdk: %s", exc)
+
+    # Fall back to a PATH lookup so a system-wide install still works locally.
+    if found := shutil.which("claude"):
+        return found
+
+    raise UserException(
+        "Claude CLI not found: the bundled 'claude' binary could not be located in the "
+        "claude-agent-sdk package and no 'claude' is on PATH. Plugin install cannot proceed."
+    )
 
 CLAUDE_HOME = "/tmp/claude-home"  # noqa: S108 — /tmp is the only writable path in the read-only image
 PLUGIN_CACHE_DIR = f"{CLAUDE_HOME}/plugins/cache"
@@ -158,8 +194,15 @@ class PluginManager:
         check: bool = True,
     ) -> subprocess.CompletedProcess:
         """Run a ``claude`` CLI command, logging scrubbed output."""
-        cmd = ["claude", *args]
-        proc = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, **env})
+        cmd = [_resolve_claude_cli(), *args]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, **env})
+        except OSError as exc:
+            # FileNotFoundError / PermissionError on launch — surface as a clean
+            # UserException (exit 1) instead of an unhandled crash (exit 2).
+            raise UserException(
+                f"Claude CLI failed to launch for plugin install (source '{source}'): {exc}"
+            ) from exc
         logging.info("claude %s -> exit %s", " ".join(args), proc.returncode)
         scrubbed_out = self._scrub(proc.stdout)
         if scrubbed_out.strip():

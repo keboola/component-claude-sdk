@@ -36,6 +36,19 @@ PUBLIC_MARKETPLACE_REGISTRY: dict[str, str] = {
 NON_PROMPTING_PERMISSION_MODES = frozenset({"dontAsk", "bypassPermissions", "auto"})
 
 
+def _coerce_empty_object(v):
+    """Coerce the job runtime's empty-object artefact ``[]`` back to ``{}``.
+
+    Keboola's job runtime rewrites an empty JSON object ``{}`` in the container
+    config.json to an empty array ``[]``. A ``dict``-typed field that is left
+    empty therefore arrives as ``[]`` and would fail validation. Only the EMPTY
+    list is coerced; a populated list is left untouched so it still fails loudly.
+    """
+    if isinstance(v, list) and not v:
+        return {}
+    return v
+
+
 class Model(StrEnum):
     """User-selectable Claude model ids (bare ids, no date suffix)."""
 
@@ -83,6 +96,8 @@ class McpStdioServer(BaseModel):
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
 
+    _coerce_env = field_validator("env", mode="before")(_coerce_empty_object)
+
 
 class McpRemoteServer(BaseModel):
     """An HTTP or SSE MCP server. Secrets live in ``headers`` (Bearer token)."""
@@ -93,6 +108,8 @@ class McpRemoteServer(BaseModel):
     name: str
     url: str
     headers: dict[str, str] = Field(default_factory=dict)
+
+    _coerce_headers = field_validator("headers", mode="before")(_coerce_empty_object)
 
 
 # Discriminated union on ``type`` so a config entry is parsed into the right shape.
@@ -195,6 +212,8 @@ class Configuration(BaseModel):
         except ValidationError as e:
             error_messages = [f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}" for err in e.errors()]
             raise UserException(f"Configuration validation error: {', '.join(error_messages)}") from e
+
+    _coerce_settings_json = field_validator("settings_json", mode="before")(_coerce_empty_object)
 
     @field_validator("permission_mode", mode="before")
     @classmethod

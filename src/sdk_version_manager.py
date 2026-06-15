@@ -15,6 +15,7 @@ overlay is on the path before any SDK symbol is touched.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import sys
 from importlib.metadata import PathDistribution
@@ -24,6 +25,7 @@ from keboola.component.exceptions import UserException
 
 PINNED = "pinned"
 OVERLAY_DIR = "/tmp/sdk-overlay"  # noqa: S108 — /tmp is the only writable path in the read-only image
+PIP_CACHE_DIR = "/tmp/pip-cache"  # noqa: S108 — writable cache so pip doesn't warn about a read-only home
 PACKAGE = "claude-agent-sdk"
 
 
@@ -61,10 +63,14 @@ class SdkVersionManager:
         return resolved
 
     def _pip_install(self, spec: str) -> None:
+        # Point pip at a writable /tmp cache; the image's home dir is read-only,
+        # which would otherwise emit a "cache dir not writable" warning.
+        env = {**os.environ, "PIP_CACHE_DIR": PIP_CACHE_DIR}
         result = subprocess.run(
             [sys.executable, "-m", "pip", "install", "--upgrade", "--target", self._overlay_dir, spec],
             capture_output=True,
             text=True,
+            env=env,
         )
         if result.returncode != 0:
             raise subprocess.CalledProcessError(

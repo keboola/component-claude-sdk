@@ -101,6 +101,53 @@ def test_mcp_http_server_discriminated():
     assert cfg.mcp_servers[0].url == "https://example.com/mcp"
 
 
+def test_mcp_stdio_empty_env_list_coerced_to_dict():
+    """The job runtime rewrites empty {} -> []; an MCP env=[] must parse to {}."""
+    cfg = Configuration(
+        **_base(
+            mcp_servers=[
+                {"type": "stdio", "name": "kbc", "command": "uvx", "env": []},
+            ]
+        )
+    )
+    assert cfg.mcp_servers[0].env == {}
+
+
+def test_mcp_remote_empty_headers_list_coerced_to_dict():
+    cfg = Configuration(
+        **_base(
+            mcp_servers=[
+                {"type": "http", "name": "remote", "url": "https://example.com/mcp", "headers": []},
+            ]
+        )
+    )
+    assert cfg.mcp_servers[0].headers == {}
+
+
+def test_mcp_populated_env_dict_still_parses():
+    cfg = Configuration(
+        **_base(
+            mcp_servers=[
+                {"type": "stdio", "name": "kbc", "command": "uvx", "env": {"TOKEN": "abc"}},
+            ]
+        )
+    )
+    assert cfg.mcp_servers[0].env == {"TOKEN": "abc"}
+
+
+def test_mcp_non_empty_list_env_still_rejected():
+    """Only the EMPTY list is coerced; a populated list must still fail loudly."""
+    with pytest.raises(UserException) as exc:
+        Configuration(
+            **_base(
+                mcp_servers=[
+                    {"type": "stdio", "name": "kbc", "command": "uvx", "env": ["A", "B"]},
+                ]
+            )
+        )
+    assert "env" in str(exc.value)
+
+
 def test_private_plugin_without_token_raises():
     with pytest.raises(UserException) as exc:
         Configuration(

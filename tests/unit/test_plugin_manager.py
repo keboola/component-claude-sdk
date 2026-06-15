@@ -5,8 +5,9 @@ import subprocess
 import pytest
 from keboola.component.exceptions import UserException
 
+import plugin_manager
 from configuration import PluginEntry
-from plugin_manager import PluginManager
+from plugin_manager import PluginManager, _resolve_claude_cli
 
 
 class FakeRunner:
@@ -135,6 +136,58 @@ def test_token_scrubbed_from_logs(monkeypatch, caplog):
         PluginManager().prepare([entry], {}, github_token="GH_SECRET_VALUE")
     assert "GH_SECRET_VALUE" not in str(exc.value)
     assert "***" in str(exc.value)
+
+
+def test_resolves_bundled_cli_absolute_path_not_bare_claude():
+    """The CLI must resolve to the SDK's bundled absolute path, never bare 'claude'
+    (which is not on PATH in the slim image and would raise FileNotFoundError)."""
+    _resolve_claude_cli.cache_clear()
+    cli = _resolve_claude_cli()
+    assert cli != "claude"
+    assert cli.endswith("/_bundled/claude") or cli.endswith("\\_bundled\\claude.exe")
+    assert "claude_agent_sdk" in cli
+
+
+def test_run_invokes_resolved_cli_not_bare_claude(monkeypatch):
+    """The subprocess command's argv[0] must be the resolved bundled path."""
+    _resolve_claude_cli.cache_clear()
+    runner = FakeRunner()
+    monkeypatch.setattr(subprocess, "run", runner)
+    monkeypatch.setattr("os.makedirs", lambda *a, **k: None)
+
+    entry = PluginEntry(source="superpowers", plugins=["sp"], version="latest")
+    PluginManager().prepare([entry], {})
+
+    # FakeRunner records args (cmd[1:]); fetch the captured argv[0] via the run call.
+    # Re-run a single command to capture cmd[0] directly.
+    captured = {}
+
+    def capture(cmd, capture_output, text, env):
+        captured["argv0"] = cmd[0]
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", capture)
+    PluginManager().prepare([entry], {})
+    assert captured["argv0"] == _resolve_claude_cli()
+    assert captured["argv0"] != "claude"
+
+
+def test_cli_launch_failure_raises_user_exception(monkeypatch):
+    """A failed launch (FileNotFoundError) must become a clean UserException (exit 1),
+    not an unhandled OSError (exit 2)."""
+    _resolve_claude_cli.cache_clear()
+    monkeypatch.setattr(plugin_manager, "_resolve_claude_cli", lambda: "/nonexistent/claude")
+    monkeypatch.setattr("os.makedirs", lambda *a, **k: None)
+
+    def raise_fnf(cmd, capture_output, text, env):
+        raise FileNotFoundError(2, "No such file or directory", cmd[0])
+
+    monkeypatch.setattr(subprocess, "run", raise_fnf)
+    entry = PluginEntry(source="acme/repo", plugins=["x"], version="latest")
+    with pytest.raises(UserException) as exc:
+        PluginManager().prepare([entry], {})
+    assert "Claude CLI failed to launch" in str(exc.value)
+    assert "acme/repo" in str(exc.value)
 
 
 def test_full_secret_set_scrubbed_not_just_github_token(monkeypatch):
