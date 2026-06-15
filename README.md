@@ -128,6 +128,10 @@ parameter → `ClaudeAgentOptions` mapping is in the design spec
 - `stdio` (in-container subprocess: `command`/`args`/`env`) or `http`/`sse`
   (remote: `url`/`headers`). Defining a server only makes its tools *visible* — you
   must also allow-list them in `allowed_tools`.
+- The image ships the launchers stdio servers need: **`uvx`/`uv`** (Python MCP
+  servers, e.g. `uvx mcp-server-fetch`) and **`npx`/`node`** (npm MCP servers, e.g.
+  the GitHub MCP server), plus **`git`** for plugin marketplace clones and GitHub
+  work. Their caches and `HOME` are redirected to the writable `/tmp` automatically.
 
 **Plugins** (`plugins`) — installed at job start, nothing baked into the image
 

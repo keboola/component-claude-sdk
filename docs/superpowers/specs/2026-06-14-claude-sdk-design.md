@@ -541,7 +541,9 @@ constrained `/tmp` `cwd`. Tool names: built-ins `Read/Write/Edit/Bash/Glob/Grep/
   `requires-python >=3.10`, compatible with the scaffold's 3.14). **Bundles a native Claude Code CLI
   binary per platform** (confirmed: the release ships platform-specific wheels incl.
   `manylinux_2_17_x86_64`, plus the package description states the CLI is auto-bundled, no Node
-  needed). → **Dockerfile is Python-only (uv), NO Node.** (See §11 infra + the §12 fallback.) The
+  needed). → **The SDK/CLI itself needs no Node** (the bundled CLI is a self-contained Node SEA). **But
+  the AGENT RUNTIME needs `git` (plugin clone / GitHub / private sources) and `nodejs`+`npm` (npx-based
+  MCP servers); see the refined §11 infra** — proven in-container in Phase 8 (Findings 4+5). The
   runtime `sdk_version` field (§2.10) can shadow this baked version with a `/tmp/sdk-overlay` install;
   the `import claude_agent_sdk` used for the run is therefore **deferred** until after the overlay (if
   any) is on `sys.path` — `SdkVersionManager` (§6 module list) owns this and is the first thing `run()`
@@ -643,13 +645,33 @@ added as plain config recipes; S1 is the must-pass, S2-S5 extend as credentials/
 
 ## 11. Infra (Dockerfile / pyproject) — concrete
 
-- **Dockerfile: Python-only, no Node.** Keep the scaffold's `python:3.14-slim` + `uv` multi-stage build
-  unchanged in shape; the SDK's bundled `manylinux_2_17_x86_64` CLI binary runs on the slim/glibc base.
-  No `apt-get install nodejs`/`npm install -g @anthropic-ai/claude-code` (that step is **obsolete** on
-  0.2.x — the reference repo's Node layer is removed for us). `uvx`/`uv` already present for stdio MCP
-  servers + `claude plugin`. `/tmp` is writable in the container for `CLAUDE_CONFIG_DIR` + workspace +
-  the optional `sdk-overlay` (§2.10). The runtime SDK overlay + plugin/MCP fetches need outbound HTTPS
-  egress at job start; a no-egress stack runs with `sdk_version=pinned` and no remote plugins/MCP.
+- **The SDK/CLI is Python-only (no Node needed FOR THE SDK) — but the AGENT RUNTIME needs a small
+  toolchain (git + node, plus the baked uv).** Refinement of the earlier "Python-only, no Node"
+  decision (§6.6/§12), proven in-container against the branch production image during the Phase 8
+  re-gate (Findings 4 + 5):
+  - The SDK's bundled `manylinux_2_17_x86_64` CLI binary (a ~250 MB Node SEA with Node embedded) runs
+    on the slim/glibc base with **no system Node** — so `npm install -g @anthropic-ai/claude-code` stays
+    obsolete and the SDK itself needs nothing extra. That part of the original decision holds.
+  - **`git` is REQUIRED** for the agent runtime: `claude plugin marketplace add <owner/repo>` shells out
+    to `git clone … --recurse-submodules` (verified via `strace`). On the bare slim image the clone fails
+    (`Failed to clone marketplace repository … Premature close`), which surfaces as the reported
+    "Marketplace file not found … marketplace.json" — i.e. the clone never landed. With `git` (+
+    `ca-certificates` for TLS) the add succeeds deterministically. `git` also backs GitHub working and
+    private plugin sources.
+  - **`nodejs` + `npm` (for `npx`)** are added so **npx-based stdio MCP servers** (the official GitHub
+    MCP server and many others) can launch — the component's "generic MCP configs" requirement. uvx-based
+    Python MCP servers already work via the baked `uv`/`uvx`.
+  - **Writable caches/HOME (Finding 5, code-side fix, NOT a Dockerfile change).** The image root is
+    read-only at runtime; `uvx`/`npx` default their cache + `HOME` to the read-only filesystem
+    (`/root/.cache/uv` → `Read-only file system (os error 30)`) and die before the MCP server starts. The
+    component sets `HOME=/tmp/agent-home`, `UV_CACHE_DIR=/tmp/uv-cache`, `NPM_CONFIG_CACHE=/tmp/npm-cache`,
+    `XDG_CACHE_HOME=/tmp/xdg-cache` in the subprocess `env` (all under writable `/tmp`).
+  - Toolchain added via `apt-get install --no-install-recommends git ca-certificates nodejs npm` with
+    `/var/lib/apt/lists` removed in the same layer. **Image-size delta: ~83 MB for git+ca-certs alone,
+    ~398 MB for git+ca-certs+node+npm** (node/npm dominate). `/tmp` is writable for `CLAUDE_CONFIG_DIR` +
+    workspace + caches + the optional `sdk-overlay` (§2.10). The runtime SDK overlay + plugin/MCP fetches
+    need outbound HTTPS egress at job start; a no-egress stack runs with `sdk_version=pinned` and no
+    remote plugins/MCP.
 - **pyproject:** add `claude-agent-sdk==0.2.101` to `dependencies`; keep `requires-python = ~=3.14.0`
   (SDK allows `>=3.10`). VCR dev deps (`pytest-recording`/`vcrpy`) added in Phase 5. Remove the unused
   `keboola-http-client`/`keboola-utils` if not needed, or keep `keboola-http-client` for the
@@ -666,11 +688,17 @@ added as plain config recipes; S1 is the must-pass, S2-S5 extend as credentials/
   (`dontAsk` default, `bypassPermissions`, `auto`); prompting modes would hang headless. Verified enum
   literal: `default | acceptEdits | plan | bypassPermissions | dontAsk | auto`.
 - **Concrete pin = `claude-agent-sdk==0.2.101`** (the summary said "≈0.2.10x"); bundled-CLI confirmed
-  via platform wheels. Node-free Dockerfile confirmed viable.
-- **Node-install fallback (only if the bundled binary ever fails on the slim base):** add
-  `apt-get install -y nodejs npm && npm install -g @anthropic-ai/claude-code` and point
-  `ClaudeAgentOptions.cli_path` at the system `claude`. Not expected to be needed; documented for
-  completeness.
+  via platform wheels and runs on the slim base with no system Node FOR THE SDK.
+- **SDK-bundled-CLI Node fallback (only if the bundled binary ever fails on the slim base):** add
+  `npm install -g @anthropic-ai/claude-code` and point `ClaudeAgentOptions.cli_path` at the system
+  `claude`. Not needed — the bundled CLI runs fine. (Distinct from the agent-runtime `nodejs`+`npm`
+  added in §11 for `npx`-based MCP servers, which IS required.)
+- **REFINEMENT (Phase 8, Findings 4+5): agent-runtime toolchain is NOT optional.** The earlier
+  "Python-only, no Node" decision was scoped only to the SDK's own needs and missed the agent runtime:
+  `claude plugin marketplace add` clones via `git` (so `git`+`ca-certificates` are required, proven by
+  `strace` + a deterministic before/after in-container repro), and `npx`-based MCP servers need
+  `nodejs`+`npm`. Plus the read-only image breaks `uvx`/`npx` caches unless `HOME`/`UV_CACHE_DIR`/
+  `NPM_CONFIG_CACHE`/`XDG_CACHE_HOME` point at writable `/tmp`. See §11 for the full evidence + size delta.
 
 ## 13. Open risks & mitigations
 

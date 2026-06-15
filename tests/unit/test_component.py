@@ -231,6 +231,26 @@ def test_transcript_flushed_when_run_task_raises(tmp_path, monkeypatch):
     assert os.path.isfile(os.path.join(data_dir, "out", "tables", "claude_sessions.csv"))
 
 
+def test_build_env_sets_writable_caches_for_read_only_image():
+    """uvx/npx MCP launchers default their cache + HOME to the read-only image
+    root and die before the server starts (Finding 5). _build_env must redirect
+    HOME and the uv/npm/xdg caches to the writable /tmp."""
+    import component as component_module
+    from configuration import Configuration
+
+    cfg = Configuration(**{"#anthropic_key": "KEY_NAME_ONLY"})
+    env = Component._build_env(cfg)
+    assert env["HOME"] == component_module.AGENT_HOME
+    assert env["UV_CACHE_DIR"] == component_module.UV_CACHE_DIR
+    assert env["NPM_CONFIG_CACHE"] == component_module.NPM_CONFIG_CACHE
+    assert env["XDG_CACHE_HOME"] == component_module.XDG_CACHE_HOME
+    # every redirected path is under the writable /tmp
+    for key in ("HOME", "UV_CACHE_DIR", "NPM_CONFIG_CACHE", "XDG_CACHE_HOME"):
+        assert env[key].startswith("/tmp/")
+    # secrets still threaded
+    assert env["ANTHROPIC_API_KEY"] == "KEY_NAME_ONLY"
+
+
 def test_run_task_launch_failure_is_user_exception(tmp_path, monkeypatch):
     """A CLI-not-found / connection failure surfaces as a clear exit-1 message."""
     import pytest

@@ -49,6 +49,15 @@ VCR_SANITIZERS = [
 
 WORKSPACE_DIR = "/tmp/claude-workspace"  # noqa: S108 — /tmp is the only writable path in the read-only image
 
+# The image root is read-only at runtime; the agent-runtime launchers (uvx for
+# Python MCP servers, npx for Node MCP servers) default their caches/HOME to the
+# read-only filesystem and die before the MCP server starts. Point them at the
+# writable /tmp so configured stdio MCP servers actually launch (Finding 5).
+AGENT_HOME = "/tmp/agent-home"  # noqa: S108 — only /tmp is writable in the read-only image
+UV_CACHE_DIR = "/tmp/uv-cache"  # noqa: S108
+NPM_CONFIG_CACHE = "/tmp/npm-cache"  # noqa: S108
+XDG_CACHE_HOME = "/tmp/xdg-cache"  # noqa: S108
+
 
 class Component(ComponentBase):
     """Orchestrates a configured Claude agent run over Keboola data."""
@@ -89,6 +98,8 @@ class Component(ComponentBase):
         """Step 1a + 2: resolve the SDK version, prepare plugins and the env."""
         sdk_version = self._sdk_manager.ensure(config.sdk_version, config.sdk_version_on_failure.value)
         env = self._build_env(config)
+        for cache_dir in (AGENT_HOME, UV_CACHE_DIR, NPM_CONFIG_CACHE, XDG_CACHE_HOME):
+            os.makedirs(cache_dir, exist_ok=True)
         plugin_result = self._plugin_manager.prepare(
             config.plugins, env, github_token=config.github_token, secret_values=self._secret_values(config)
         )
@@ -128,10 +139,21 @@ class Component(ComponentBase):
 
     @staticmethod
     def _build_env(config: Configuration) -> dict[str, str]:
-        """Build the subprocess env (secrets injected; never logged)."""
+        """Build the subprocess env (secrets injected; never logged).
+
+        Besides the Anthropic/GitHub secrets, this redirects the agent-runtime
+        launchers' caches and HOME to the writable ``/tmp`` (the image root is
+        read-only at runtime). Without this, ``uvx``/``npx`` MCP servers fail to
+        initialise their cache and never launch (Finding 5).
+        """
         env: dict[str, str] = {
             "ANTHROPIC_API_KEY": config.anthropic_key,
             "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+            # Writable HOME + caches for the read-only image (Finding 5).
+            "HOME": AGENT_HOME,
+            "UV_CACHE_DIR": UV_CACHE_DIR,
+            "NPM_CONFIG_CACHE": NPM_CONFIG_CACHE,
+            "XDG_CACHE_HOME": XDG_CACHE_HOME,
         }
         if config.github_token:
             env["GITHUB_TOKEN"] = config.github_token
