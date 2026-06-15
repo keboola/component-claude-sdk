@@ -35,6 +35,27 @@ PUBLIC_MARKETPLACE_REGISTRY: dict[str, str] = {
 # container until the job times out, so they are rejected (spec §6.5).
 NON_PROMPTING_PERMISSION_MODES = frozenset({"dontAsk", "bypassPermissions", "auto"})
 
+# Display-only section wrappers introduced by the sectioned configSchema UI
+# (grid / grid-strict groups). The persisted JSON nests fields under these
+# objects, but the config MODEL stays flat — the ``_flatten_sections``
+# validator below lifts these wrappers back up so BOTH the historical flat
+# shape and the new nested shape parse to the same model. Keep this list in
+# sync with the top-level object properties in ``configSchema.json`` that exist
+# purely for layout. NB: ``task`` and ``output`` are REAL nested model fields
+# (TaskConfig / OutputConfig) and must NOT be listed here.
+_SECTION_WRAPPERS = frozenset(
+    {
+        "connection",
+        "model_budget",
+        "permissions",
+        "github",
+        "task_output",
+        "mcp_section",
+        "plugins_section",
+        "advanced",
+    }
+)
+
 
 def _coerce_empty_object(v):
     """Coerce the job runtime's empty-object artefact ``[]`` back to ``{}``.
@@ -214,6 +235,36 @@ class Configuration(BaseModel):
             raise UserException(f"Configuration validation error: {', '.join(error_messages)}") from e
 
     _coerce_settings_json = field_validator("settings_json", mode="before")(_coerce_empty_object)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _flatten_sections(cls, data):
+        """Accept BOTH the flat config shape and the new sectioned shape.
+
+        The sectioned configSchema groups fields under display-only wrapper
+        objects (``connection``, ``model_budget``, ``advanced``, ...). Those
+        wrappers are layout only — the model is flat — so lift each wrapper's
+        contents up to the root before normal validation. The historical flat
+        config (no wrappers) is left untouched, so every existing config,
+        datadir fixture and VCR cassette still parses unchanged.
+
+        An explicit root-level value always wins over a wrapper's value, so a
+        hand-edited mix of both shapes is deterministic rather than ambiguous.
+        """
+        if not isinstance(data, dict):
+            return data
+        if not any(key in data for key in _SECTION_WRAPPERS):
+            return data
+        flattened = {k: v for k, v in data.items() if k not in _SECTION_WRAPPERS}
+        for wrapper in _SECTION_WRAPPERS:
+            section = data.get(wrapper)
+            # The job runtime rewrites an empty {} to []; treat any non-dict
+            # (or absent) wrapper as empty and skip it.
+            if not isinstance(section, dict):
+                continue
+            for field_name, value in section.items():
+                flattened.setdefault(field_name, value)
+        return flattened
 
     @field_validator("permission_mode", mode="before")
     @classmethod
