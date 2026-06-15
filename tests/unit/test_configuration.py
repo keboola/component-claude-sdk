@@ -288,3 +288,23 @@ def test_flat_shape_still_parses_alongside_sections():
     cfg = Configuration(**_base(max_turns=3, github_enabled=True))
     assert cfg.max_turns == 3
     assert cfg.github_enabled is True
+
+
+def test_system_prompt_lifts_from_either_section():
+    """system_prompt moved Advanced -> Task,Prompt&Output; both placements lift.
+
+    The flatten validator lifts any section wrapper, so a config saved with
+    system_prompt under the new 'task_output' section AND one saved with it
+    under the old 'advanced' section both reach the same config field.
+    """
+    new_placement = Configuration(
+        connection={"#anthropic_key": "KEY_NAME_ONLY"},
+        task_output={"system_prompt": "role-new", "task": {"prompt": "p"}},
+    )
+    assert new_placement.system_prompt == "role-new"
+
+    old_placement = Configuration(
+        connection={"#anthropic_key": "KEY_NAME_ONLY"},
+        advanced={"system_prompt": "role-legacy"},
+    )
+    assert old_placement.system_prompt == "role-legacy"

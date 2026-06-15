@@ -240,13 +240,24 @@
     },
     "task_output": {
       "type": "object",
-      "title": "Task & Output",
+      "title": "Task, Prompt & Output",
       "format": "grid",
       "options": {
-        "tooltip": "Config-prompt mode: write the single prompt here. Tasks-table mode: use the Task ID Filter to pick which rows this config runs. Output settings apply to the tables the agent produces."
+        "tooltip": "The System Prompt shapes every task. Config-prompt mode: write the single prompt here. Tasks-table mode: use the Task ID Filter to pick which rows this config runs. Output settings apply to the tables the agent produces."
       },
       "propertyOrder": 50,
       "properties": {
+        "system_prompt": {
+          "type": "string",
+          "title": "System Prompt",
+          "description": "Optional system prompt prepended to every task; sets the agent's role and output conventions.",
+          "format": "textarea",
+          "options": {
+            "input_height": "120px",
+            "tooltip": "Shared by all tasks in this config. In tasks-table mode a per-row 'system_prompt' column overrides it for that row; the per-task System Prompt below overrides it in config-prompt mode. Use it to tell the agent how to behave and how to shape its output tables."
+          },
+          "propertyOrder": 0
+        },
         "task": {
           "type": "object",
           "title": "Task (Config-Prompt Mode)",
@@ -277,7 +288,7 @@
               "options": {
                 "input_height": "100px",
                 "grid_columns": 12,
-                "tooltip": "Leave empty to use the config-level System Prompt (in Advanced). Set it to give this one run a different role or set of constraints."
+                "tooltip": "Leave empty to use the config-level System Prompt at the top of this section. Set it to give this one run a different role or set of constraints."
               },
               "propertyOrder": 2
             }
@@ -554,21 +565,10 @@
       "title": "Advanced",
       "format": "grid",
       "options": {
-        "tooltip": "Shared system prompt, SDK settings passthrough, the workspace file toggle, and the runtime SDK version. Most runs leave these at their defaults."
+        "tooltip": "SDK settings passthrough, on-disk settings sources, the workspace file toggle, and the runtime SDK version. Most runs leave these at their defaults."
       },
       "propertyOrder": 80,
       "properties": {
-        "system_prompt": {
-          "type": "string",
-          "title": "System Prompt",
-          "description": "Optional system prompt prepended to every task; sets the agent's role and output conventions.",
-          "format": "textarea",
-          "options": {
-            "input_height": "120px",
-            "tooltip": "Shared by all tasks in this config. In tasks-table mode a per-row 'system_prompt' column overrides it for that row; the per-task System Prompt in Task & Output overrides it in config-prompt mode. Use it to tell the agent how to behave and how to shape its output tables."
-          },
-          "propertyOrder": 1
-        },
         "settings_json": {
           "type": "object",
           "title": "Custom Claude Settings (JSON)",

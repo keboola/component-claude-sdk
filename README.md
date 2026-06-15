@@ -121,7 +121,8 @@ parameter → `ClaudeAgentOptions` mapping is in the design spec
   Grep, WebFetch, WebSearch` (scoped Bash like `Bash(git *)` works); MCP tools as
   `mcp__<server>__<tool>` or `mcp__<server>__*`. In `dontAsk` mode the agent can
   use **only** allow-listed tools; a deny rule always wins.
-- `system_prompt`, `settings_json`, `setting_sources` (advanced passthrough).
+- `system_prompt` — shared system prompt prepended to every task (shapes the
+  agent's role/output); `settings_json`, `setting_sources` (advanced passthrough).
 
 **MCP servers** (`mcp_servers`)
 
@@ -210,8 +211,8 @@ Configuration shape (sectioned vs. flat)
 ----------------------------------------
 
 The configuration form groups fields into labelled, boxed sections (Connection &
-Authentication, Model & Budget, Permissions & Tools, GitHub, Task & Output, MCP
-Servers, Plugins, Advanced) and lays related short fields out side-by-side with
+Authentication, Model & Budget, Permissions & Tools, GitHub, Task, Prompt & Output,
+MCP Servers, Plugins, Advanced) and lays related short fields out side-by-side with
 Keboola's `grid-strict` multi-column layout. Because `grid-strict` only works on a
 sub-object, those sections are sub-objects, so **the UI saves a nested config**
 (e.g. `parameters.model_budget.model`, `parameters.connection.#anthropic_key`).
