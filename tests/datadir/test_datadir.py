@@ -170,9 +170,7 @@ def test_task_id_filter_no_match_fails(datadir, monkeypatch):
 
 def test_prompting_permission_mode_rejected(datadir, monkeypatch):
     """A prompting permission_mode (would hang headless) → exit 1 at config parse."""
-    datadir.config(
-        {"#anthropic_key": "KEY_NAME_ONLY", "permission_mode": "acceptEdits", "task": {"prompt": "x"}}
-    )
+    datadir.config({"#anthropic_key": "KEY_NAME_ONLY", "permission_mode": "acceptEdits", "task": {"prompt": "x"}})
     install(monkeypatch, canned_stream())
 
     with pytest.raises(UserException) as exc:

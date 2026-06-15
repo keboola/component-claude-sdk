@@ -90,8 +90,14 @@ def test_agent_output_table_promoted(tmp_path, monkeypatch):
                 w.writerow(["id", "label"])
                 w.writerow(["1", "x"])
             yield ResultMessage(
-                subtype="success", duration_ms=10, duration_api_ms=5, is_error=False,
-                num_turns=1, session_id="s", total_cost_usd=0.0, result="ok",
+                subtype="success",
+                duration_ms=10,
+                duration_api_ms=5,
+                is_error=False,
+                num_turns=1,
+                session_id="s",
+                total_cost_usd=0.0,
+                result="ok",
             )
 
         return gen()

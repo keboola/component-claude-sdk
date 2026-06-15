@@ -72,9 +72,7 @@ def test_tasks_table_empty_prompt_raises(tmp_path):
 
 
 def test_tasks_table_duplicate_id_raises(tmp_path):
-    table = _write_csv(
-        tmp_path, "tasks.csv", ["task_id", "prompt"], [["t1", "a"], ["t1", "b"]]
-    )
+    table = _write_csv(tmp_path, "tasks.csv", ["task_id", "prompt"], [["t1", "a"], ["t1", "b"]])
     with pytest.raises(UserException) as exc:
         TaskSource(_config()).load([table])
     assert "Duplicate" in str(exc.value)
@@ -105,9 +103,7 @@ def test_per_task_overrides_parsed(tmp_path):
 
 
 def test_invalid_int_override_raises(tmp_path):
-    table = _write_csv(
-        tmp_path, "tasks.csv", ["task_id", "prompt", "max_turns"], [["t1", "a", "notanint"]]
-    )
+    table = _write_csv(tmp_path, "tasks.csv", ["task_id", "prompt", "max_turns"], [["t1", "a", "notanint"]])
     with pytest.raises(UserException):
         TaskSource(_config()).load([table])
 

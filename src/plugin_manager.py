@@ -58,6 +58,7 @@ def _resolve_claude_cli() -> str:
         "claude-agent-sdk package and no 'claude' is on PATH. Plugin install cannot proceed."
     )
 
+
 CLAUDE_HOME = "/tmp/claude-home"  # noqa: S108 — /tmp is the only writable path in the read-only image
 PLUGIN_CACHE_DIR = f"{CLAUDE_HOME}/plugins/cache"
 
@@ -115,9 +116,7 @@ class PluginManager:
             self._prepare_entry(entry, env, github_token, result)
         return result
 
-    def _prepare_entry(
-        self, entry: PluginEntry, env: dict[str, str], github_token: str, result: PluginResult
-    ) -> None:
+    def _prepare_entry(self, entry: PluginEntry, env: dict[str, str], github_token: str, result: PluginResult) -> None:
         source = self._resolve_source(entry, github_token)
 
         if entry.version == "latest":
@@ -178,7 +177,7 @@ class PluginManager:
         try:
             with open(manifest, encoding="utf-8") as fh:
                 data = json.load(fh)
-        except (OSError, json.JSONDecodeError):
+        except OSError, json.JSONDecodeError:
             return []
         plugins = data.get("plugins") if isinstance(data, dict) else None
         if not isinstance(plugins, list):
@@ -189,9 +188,7 @@ class PluginManager:
     def _resolve_source(entry: PluginEntry, github_token: str) -> str:
         """Resolve a public shorthand to owner/repo; pass explicit sources through."""
         if entry.private and not github_token:
-            raise UserException(
-                f"Plugin source '{entry.source}' is marked private but no #github_token is set."
-            )
+            raise UserException(f"Plugin source '{entry.source}' is marked private but no #github_token is set.")
         if "/" not in entry.source and ":" not in entry.source:
             resolved = PUBLIC_MARKETPLACE_REGISTRY.get(entry.source)
             if resolved is None:
@@ -286,9 +283,7 @@ class PluginManager:
         except OSError as exc:
             # FileNotFoundError / PermissionError on launch — surface as a clean
             # UserException (exit 1) instead of an unhandled crash (exit 2).
-            raise UserException(
-                f"Claude CLI failed to launch for plugin install (source '{source}'): {exc}"
-            ) from exc
+            raise UserException(f"Claude CLI failed to launch for plugin install (source '{source}'): {exc}") from exc
         logging.info("claude %s -> exit %s", " ".join(args), proc.returncode)
         scrubbed_out = self._scrub(proc.stdout)
         if scrubbed_out.strip():

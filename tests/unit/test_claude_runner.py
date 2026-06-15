@@ -51,9 +51,7 @@ def test_build_options_budget_clamped_to_config_ceiling():
 def test_build_options_per_task_overrides():
     cfg = _config()
     runner = ClaudeRunner(workspace_dir="/tmp/ws")
-    opts = runner.build_options(
-        _task(model="claude-haiku-4-5", max_turns=3, system_prompt="be brief"), cfg, [], {}
-    )
+    opts = runner.build_options(_task(model="claude-haiku-4-5", max_turns=3, system_prompt="be brief"), cfg, [], {})
     assert opts.model == "claude-haiku-4-5"
     assert opts.max_turns == 3
     assert opts.system_prompt == "be brief"

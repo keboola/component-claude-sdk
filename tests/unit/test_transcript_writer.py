@@ -78,8 +78,15 @@ def _messages():
 
 def _result():
     return ClaudeRunResult(
-        task_id="t1", success=True, session_id="sess-1", subtype="success",
-        is_error=False, result_text="all done", total_cost_usd=0.02, duration_ms=1500, num_turns=3,
+        task_id="t1",
+        success=True,
+        session_id="sess-1",
+        subtype="success",
+        is_error=False,
+        result_text="all done",
+        total_cost_usd=0.02,
+        duration_ms=1500,
+        num_turns=3,
     )
 
 

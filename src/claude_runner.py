@@ -168,9 +168,7 @@ class ClaudeRunner:
                 if type(message).__name__ == "ResultMessage":
                     result_message = message
         except (CLINotFoundError, CLIConnectionError) as exc:
-            raise UserException(
-                f"The agent CLI/MCP failed to launch for task '{task.task_id}': {exc}"
-            ) from exc
+            raise UserException(f"The agent CLI/MCP failed to launch for task '{task.task_id}': {exc}") from exc
         except ProcessError as exc:
             raise self._map_run_error(task, exc) from exc
         except UserException:
@@ -201,22 +199,15 @@ class ClaudeRunner:
     def _looks_like_cap_error(detail: str) -> bool:
         """Whether an error string is a turn-cap / budget-cap exhaustion."""
         lowered = detail.lower()
-        return any(
-            s in lowered
-            for s in ("error_max_turns", "error_max_budget", "maximum number of turns", "budget")
-        )
+        return any(s in lowered for s in ("error_max_turns", "error_max_budget", "maximum number of turns", "budget"))
 
     def _map_run_error(self, task: Task, exc: Exception) -> UserException:
         """Translate a query-loop raise into an actionable exit-1 UserException."""
         detail = str(exc)
         if self._looks_like_cap_error(detail):
-            return UserException(
-                f"Task '{task.task_id}' hit its turn/budget cap and stopped: {detail}"
-            )
+            return UserException(f"Task '{task.task_id}' hit its turn/budget cap and stopped: {detail}")
         if self._looks_like_auth_error(detail):
-            return UserException(
-                f"Anthropic authentication failed for task '{task.task_id}' — check #anthropic_key."
-            )
+            return UserException(f"Anthropic authentication failed for task '{task.task_id}' — check #anthropic_key.")
         return UserException(f"The agent process failed for task '{task.task_id}': {detail}")
 
     @staticmethod

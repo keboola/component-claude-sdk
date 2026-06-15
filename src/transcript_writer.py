@@ -44,11 +44,15 @@ SESSION_TAGS = ["claude-sdk", "session-transcript"]
 # empty cell (e.g. total_cost_usd / api_error_status when the SDK returns None)
 # loads as NULL into the authoritative-typed column instead of failing the load.
 def _string_col(primary_key: bool = False, nullable: bool = True) -> ColumnDefinition:
-    return ColumnDefinition(data_types=BaseType.string(), primary_key=primary_key, nullable=not primary_key and nullable)
+    return ColumnDefinition(
+        data_types=BaseType.string(), primary_key=primary_key, nullable=not primary_key and nullable
+    )
 
 
 def _int_col(primary_key: bool = False, nullable: bool = True) -> ColumnDefinition:
-    return ColumnDefinition(data_types=BaseType.integer(), primary_key=primary_key, nullable=not primary_key and nullable)
+    return ColumnDefinition(
+        data_types=BaseType.integer(), primary_key=primary_key, nullable=not primary_key and nullable
+    )
 
 
 def _float_col(nullable: bool = True) -> ColumnDefinition:

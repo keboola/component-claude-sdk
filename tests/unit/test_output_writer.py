@@ -16,10 +16,10 @@ class FakeComponent:
         os.makedirs(self.tables_path, exist_ok=True)
         self.manifests = []
 
-    def create_out_table_definition(self, name, schema=None, primary_key=None, incremental=None,
-                                    has_header=None, **kwargs):
-        return _TableDef(os.path.join(self.tables_path, name), name, schema, primary_key,
-                         incremental, has_header)
+    def create_out_table_definition(
+        self, name, schema=None, primary_key=None, incremental=None, has_header=None, **kwargs
+    ):
+        return _TableDef(os.path.join(self.tables_path, name), name, schema, primary_key, incremental, has_header)
 
     def write_manifest(self, definition):
         self.manifests.append(definition)
@@ -72,8 +72,9 @@ def test_promotes_plain_csv(tmp_path):
 def test_meta_declares_incremental_and_pk(tmp_path):
     comp = FakeComponent(str(tmp_path))
     agent_dir = str(tmp_path / "agent_out")
-    _agent_csv(agent_dir, "orders.csv", ["id", "amount"], [["1", "10"]],
-               meta={"incremental": True, "primary_key": ["id"]})
+    _agent_csv(
+        agent_dir, "orders.csv", ["id", "amount"], [["1", "10"]], meta={"incremental": True, "primary_key": ["id"]}
+    )
     writer = OutputWriter(comp, agent_output_dir=agent_dir)
     writer.promote()
     manifest = comp.manifests[0]
@@ -94,8 +95,9 @@ def test_incremental_without_pk_raises(tmp_path):
 def test_default_incremental_applies_when_no_meta(tmp_path):
     comp = FakeComponent(str(tmp_path))
     agent_dir = str(tmp_path / "agent_out")
-    _agent_csv(agent_dir, "t.csv", ["pk", "v"], [["1", "x"]],
-               meta={"primary_key": ["pk"]})  # no explicit incremental flag
+    _agent_csv(
+        agent_dir, "t.csv", ["pk", "v"], [["1", "x"]], meta={"primary_key": ["pk"]}
+    )  # no explicit incremental flag
     writer = OutputWriter(comp, agent_output_dir=agent_dir)
     writer.promote(default_incremental=True)
     assert comp.manifests[0].incremental is True

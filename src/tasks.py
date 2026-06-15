@@ -97,9 +97,7 @@ class TaskSource:
             for line_no, row in enumerate(reader, start=2):  # row 1 is the header
                 task = self._row_to_task(row, line_no)
                 if task.task_id in seen_ids:
-                    raise UserException(
-                        f"Duplicate task_id '{task.task_id}' in tasks table; task_id must be unique."
-                    )
+                    raise UserException(f"Duplicate task_id '{task.task_id}' in tasks table; task_id must be unique.")
                 seen_ids.add(task.task_id)
                 tasks.append(task)
         if not tasks:
@@ -111,9 +109,7 @@ class TaskSource:
         present = set(fieldnames or [])
         missing = [c for c in REQUIRED_TASK_COLUMNS if c not in present]
         if missing:
-            raise UserException(
-                f"Tasks table '{table_name}' is missing required column(s): {', '.join(missing)}."
-            )
+            raise UserException(f"Tasks table '{table_name}' is missing required column(s): {', '.join(missing)}.")
 
     def _row_to_task(self, row: dict[str, str], line_no: int) -> Task:
         task_id = (row.get("task_id") or "").strip()

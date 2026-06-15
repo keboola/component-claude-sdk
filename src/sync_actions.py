@@ -55,6 +55,4 @@ def check_anthropic_connection(anthropic_key: str, http_client: HttpClient | Non
         return ValidationResult("Connection to the Anthropic API succeeded.")
     if response.status_code in (401, 403):
         raise UserException("Anthropic API rejected the key (authentication failed). Check #anthropic_key.")
-    raise UserException(
-        f"Anthropic connection test failed with HTTP {response.status_code}: {response.text[:300]}"
-    )
+    raise UserException(f"Anthropic connection test failed with HTTP {response.status_code}: {response.text[:300]}")

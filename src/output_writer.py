@@ -81,7 +81,9 @@ class OutputWriter:
                 f"(unbounded append). Add a primary_key to its .meta.json or make it non-incremental."
             )
 
-        schema = {col: ColumnDefinition(data_types=BaseType.string(), primary_key=col in primary_key) for col in columns}
+        schema = {
+            col: ColumnDefinition(data_types=BaseType.string(), primary_key=col in primary_key) for col in columns
+        }
         table_def = self._component.create_out_table_definition(
             filename,
             schema=schema,

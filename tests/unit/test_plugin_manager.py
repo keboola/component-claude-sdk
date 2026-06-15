@@ -168,9 +168,7 @@ def test_pinned_git_url_uses_hash_ref(monkeypatch):
     monkeypatch.setattr(subprocess, "run", runner)
     monkeypatch.setattr("os.makedirs", lambda *a, **k: None)
 
-    entry = PluginEntry(
-        source="https://github.com/acme/repo.git", plugins=["t"], version="abc123"
-    )
+    entry = PluginEntry(source="https://github.com/acme/repo.git", plugins=["t"], version="abc123")
     PluginManager().prepare([entry], {})
     strings = runner.arg_strings()
     assert "plugin marketplace add https://github.com/acme/repo.git#abc123" in strings

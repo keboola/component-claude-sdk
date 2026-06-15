@@ -118,9 +118,7 @@ def canned_stream(blocks=("done",), *, subtype="success", is_error=False, write_
             if write_outputs:
                 _write_agent_outputs(agent_out_dir, write_outputs)
             for text in blocks:
-                yield AssistantMessage(
-                    content=[TextBlock(text=text)], model="claude-opus-4-8", session_id="sess-test"
-                )
+                yield AssistantMessage(content=[TextBlock(text=text)], model="claude-opus-4-8", session_id="sess-test")
             yield ResultMessage(
                 subtype=subtype,
                 duration_ms=120,
