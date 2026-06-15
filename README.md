@@ -99,7 +99,10 @@ parameter → `ClaudeAgentOptions` mapping is in the design spec
 - `#anthropic_key` — **required**. Injected as `ANTHROPIC_API_KEY`.
 - `#github_token` — optional. Injected as `GITHUB_TOKEN` + `GH_TOKEN`; needed only
   when **Enable GitHub** is on or a **private** plugin source is used. Fine-grained
-  PAT (Contents r/w, Pull requests r/w) or a classic `repo`-scope token.
+  PAT (Contents r/w, Pull requests r/w) or a classic `repo`-scope token. Scope the
+  token as narrowly as possible — ideally a fine-grained PAT limited to only the
+  repo(s) the agent needs, with just the permissions required; a broad token lets
+  the agent see and act on everything your account can.
 - Per-MCP-server secrets — put a `#`-prefixed key in a stdio server's `env` or an
   HTTP/SSE server's `headers` (e.g. `{"Authorization": "Bearer …"}`).
 

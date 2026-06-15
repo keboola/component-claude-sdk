@@ -177,7 +177,8 @@ class PluginManager:
         try:
             with open(manifest, encoding="utf-8") as fh:
                 data = json.load(fh)
-        except OSError, json.JSONDecodeError:
+        except (OSError, json.JSONDecodeError) as exc:
+            logging.warning("Could not read declared plugins from '%s': %s", manifest, exc)
             return []
         plugins = data.get("plugins") if isinstance(data, dict) else None
         if not isinstance(plugins, list):
