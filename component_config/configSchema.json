@@ -7,7 +7,7 @@
     "_setup_modes_note": {
       "type": "string",
       "format": "info",
-      "description": "<b>Two ways to drive this component.</b><br/><b>1. Config-prompt mode</b> — leave the input mapping empty and write a single prompt in <i>Task &amp; Output</i> below. One agent run.<br/><b>2. Tasks-table mode</b> — map one input table named <b>tasks</b>; each row is one agent task, run in order. Required columns <code>task_id</code> + <code>prompt</code>; optional per-row overrides <code>system_prompt</code>, <code>model</code>, <code>max_turns</code>, <code>max_budget_usd</code>, <code>output_table</code>. Everything else on this page is the shared environment for every task.",
+      "description": "Two ways to drive this component.\n1. Config-prompt mode — leave the input mapping empty and write a single prompt in Task, Prompt & Output below. One agent run.\n2. Tasks-table mode — map one input table named 'tasks'; each row is one agent task, run in order. Required columns: task_id and prompt; optional per-row overrides: system_prompt, model, max_turns, max_budget_usd, output_table. Everything else on this page is the shared environment for every task.",
       "propertyOrder": 1
     },
     "connection": {
@@ -180,11 +180,10 @@
           "title": "Allowed Tools",
           "description": "Allow-list of tools the agent may use (the only tools available in 'Don't ask' mode).",
           "items": {
-            "type": "string",
-            "title": "Tool"
+            "type": "string"
           },
           "options": {
-            "grid_columns": 6,
+            "grid_columns": 12,
             "tooltip": "Built-in tool names: Read, Write, Edit, Bash, Glob, Grep, WebFetch, WebSearch. Scoped Bash patterns are supported, e.g. Bash(git *). MCP tools are mcp__<server>__<tool>, or mcp__<server>__* for all of a server's tools. Anything not listed is unavailable in 'Don't ask' mode. Enabling GitHub auto-adds Bash(gh *) and Bash(git *)."
           },
           "propertyOrder": 2
@@ -194,11 +193,10 @@
           "title": "Disallowed Tools",
           "description": "Deny-list. Blocked regardless of permission mode or the allow-list.",
           "items": {
-            "type": "string",
-            "title": "Tool"
+            "type": "string"
           },
           "options": {
-            "grid_columns": 6,
+            "grid_columns": 12,
             "tooltip": "A deny rule always wins, even under 'Bypass permissions'. Use it to fence off dangerous tools (e.g. a destructive Bash pattern) while leaving the rest open."
           },
           "propertyOrder": 3
@@ -220,19 +218,22 @@
           "description": "Let the agent run gh and git commands against GitHub.",
           "default": false,
           "options": {
-            "grid_columns": 4,
-            "tooltip": "When on, Bash(gh *) and Bash(git *) are added to Allowed Tools and the GitHub token is exported as GITHUB_TOKEN / GH_TOKEN so gh and git authenticate automatically. Requires the GitHub Token field. Leave off if the agent does not need GitHub."
+            "grid_columns": 12,
+            "tooltip": "When on, Bash(gh *) and Bash(git *) are added to Allowed Tools and the GitHub token is exported as GITHUB_TOKEN / GH_TOKEN so gh and git authenticate automatically. Reveals the GitHub Token field. Leave off if the agent does not need GitHub."
           },
           "propertyOrder": 1
         },
         "#github_token": {
           "type": "string",
           "title": "GitHub Token",
-          "description": "GitHub PAT — needed only for GitHub work or a private plugin source.",
+          "description": "GitHub PAT, needed for GitHub work or a private plugin source. Turn on Enable GitHub above to set it.",
           "format": "password",
           "options": {
-            "grid_columns": 8,
-            "tooltip": "Fine-grained PAT (Contents r/w, Pull requests r/w) or a classic token with the repo scope. Injected at runtime as GITHUB_TOKEN and GH_TOKEN so the agent's gh and git commands authenticate, and used to clone private plugin marketplaces. Encrypted at rest, never logged."
+            "dependencies": {
+              "github_enabled": true
+            },
+            "grid_columns": 12,
+            "tooltip": "Fine-grained PAT (Contents r/w, Pull requests r/w) or a classic token with the repo scope. Injected at runtime as GITHUB_TOKEN and GH_TOKEN so the agent's gh and git commands authenticate, and used to clone private plugin marketplaces. A private plugin source also needs this token, so enable GitHub here even if you only use private plugins. Encrypted at rest, never logged."
           },
           "propertyOrder": 2
         }
@@ -322,7 +323,7 @@
               "default": false,
               "options": {
                 "grid_columns": 12,
-                "tooltip": "Applies only when the agent does not declare its own intent for a table. Incremental append needs a primary key on the table, otherwise the run fails rather than appending unbounded duplicates."
+                "tooltip": "Applies only when the agent does not declare its own intent for a table. The primary key is set per table by the agent (in each table's .meta.json sidecar), not here. Incremental append needs a primary key on the table, otherwise the run fails rather than appending unbounded duplicates."
               },
               "propertyOrder": 1
             }
@@ -354,14 +355,12 @@
           "items": {
             "type": "object",
             "title": "MCP Server",
-            "format": "grid-strict",
             "properties": {
               "name": {
                 "type": "string",
                 "title": "Server Name",
                 "description": "Identifier referenced in Allowed Tools as mcp__<name>__<tool>.",
                 "options": {
-                  "grid_columns": 8,
                   "tooltip": "Use a short, stable name with no spaces — it becomes part of the tool id the agent calls (mcp__<name>__*)."
                 },
                 "propertyOrder": 1
@@ -377,7 +376,6 @@
                     "http — remote HTTP",
                     "sse — remote SSE"
                   ],
-                  "grid_columns": 4,
                   "tooltip": "stdio launches a local process inside the container (use Command/Args/Env). http and sse connect to a remote server (use Server URL/Headers). The form swaps the relevant fields automatically."
                 },
                 "default": "stdio",
@@ -391,7 +389,6 @@
                   "dependencies": {
                     "type": "stdio"
                   },
-                  "grid_columns": 4,
                   "tooltip": "uvx and uv are already in the image; npx is available too. The process is spawned inside the Keboola container at job start."
                 },
                 "propertyOrder": 10
@@ -401,14 +398,12 @@
                 "title": "Arguments",
                 "description": "Command-line arguments passed to the stdio command.",
                 "items": {
-                  "type": "string",
-                  "title": "Argument"
+                  "type": "string"
                 },
                 "options": {
                   "dependencies": {
                     "type": "stdio"
                   },
-                  "grid_columns": 8,
                   "tooltip": "One entry per argument, e.g. for `uvx some-mcp --flag value` add: some-mcp, --flag, value."
                 },
                 "propertyOrder": 11
@@ -426,7 +421,6 @@
                     "mode": "application/json",
                     "lineNumbers": true
                   },
-                  "grid_columns": 12,
                   "tooltip": "This is where a stdio server's secrets go — always use a #-prefixed key (e.g. {\"#API_TOKEN\": \"...\"}) so the value is encrypted at rest and scrubbed from logs. Non-secret config can use a plain key."
                 },
                 "propertyOrder": 12
@@ -439,7 +433,6 @@
                   "dependencies": {
                     "type": ["http", "sse"]
                   },
-                  "grid_columns": 12,
                   "tooltip": "The full https:// endpoint of the remote MCP server. Authentication, if any, goes in Headers."
                 },
                 "propertyOrder": 20
@@ -457,7 +450,6 @@
                     "mode": "application/json",
                     "lineNumbers": true
                   },
-                  "grid_columns": 12,
                   "tooltip": "Put auth here, e.g. {\"Authorization\": \"Bearer <token>\"}. Use a #-prefixed key for the secret part so it is encrypted at rest and never logged."
                 },
                 "propertyOrder": 21
@@ -528,14 +520,14 @@
               "private_token_note": {
                 "type": "string",
                 "title": "Note",
-                "description": "This source is marked private — set the GitHub Token in the GitHub section to authenticate the marketplace fetch.",
+                "description": "This source is marked private. Turn on Enable GitHub in the GitHub section and set the GitHub Token there to authenticate the marketplace fetch.",
                 "options": {
                   "dependencies": {
                     "private": true
                   },
                   "inputAttributes": {
                     "readonly": true,
-                    "placeholder": "Set the GitHub Token (GitHub section) to authenticate this private plugin source."
+                    "placeholder": "Enable GitHub in the GitHub section and set the GitHub Token to authenticate this private plugin source."
                   },
                   "grid_columns": 12
                 },
@@ -546,8 +538,7 @@
                 "title": "Plugin Names",
                 "description": "Plugin name(s) to install. Leave empty or use [\"*\"] for all it offers.",
                 "items": {
-                  "type": "string",
-                  "title": "Plugin Name"
+                  "type": "string"
                 },
                 "options": {
                   "grid_columns": 12,
