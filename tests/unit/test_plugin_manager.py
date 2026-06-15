@@ -82,6 +82,74 @@ def test_uses_declared_marketplace_name_not_source_derived(monkeypatch):
     } in result.sdk_plugins
 
 
+def test_wildcard_installs_declared_plugin_names_not_marketplace_name(tmp_path, monkeypatch):
+    """Finding 8: plugins ['*'] (install all) must enumerate the marketplace's
+    DECLARED plugin names from its marketplace.json and install each — never the
+    marketplace name. The marketplace is NAMED 'superpowers-dev' but contains a
+    plugin NAMED 'superpowers'; installing 'superpowers-dev' fails on-platform."""
+    import json as _json
+
+    install_loc = tmp_path / "marketplaces" / "superpowers-dev"
+    (install_loc / ".claude-plugin").mkdir(parents=True)
+    (install_loc / ".claude-plugin" / "marketplace.json").write_text(
+        _json.dumps({"name": "superpowers-dev", "plugins": [{"name": "superpowers"}]}),
+        encoding="utf-8",
+    )
+    declared = _json.dumps(
+        [{"name": "superpowers-dev", "repo": "obra/superpowers", "installLocation": str(install_loc)}]
+    )
+    runner = FakeRunner(list_json=declared)
+    monkeypatch.setattr(subprocess, "run", runner)
+    monkeypatch.setattr("os.makedirs", lambda *a, **k: None)
+
+    entry = PluginEntry(source="superpowers", plugins=["*"], version="latest")
+    result = PluginManager().prepare([entry], {})
+    strings = runner.arg_strings()
+    # the DECLARED plugin name is installed, NOT the marketplace name or "*"
+    assert "plugin install superpowers@superpowers-dev" in strings
+    assert not any("install superpowers-dev@" in s for s in strings)
+    assert not any(s.endswith("install *") or "install *@" in s for s in strings)
+    assert result.resolved == {"superpowers-dev/superpowers": "latest"}
+
+
+def test_empty_plugins_enumerates_declared_names(tmp_path, monkeypatch):
+    """An empty plugins list behaves like ['*'] — enumerate declared names."""
+    import json as _json
+
+    install_loc = tmp_path / "marketplaces" / "kit"
+    (install_loc / ".claude-plugin").mkdir(parents=True)
+    (install_loc / ".claude-plugin" / "marketplace.json").write_text(
+        _json.dumps({"name": "kit", "plugins": [{"name": "alpha"}, {"name": "beta"}]}),
+        encoding="utf-8",
+    )
+    declared = _json.dumps([{"name": "kit", "repo": "acme/kit", "installLocation": str(install_loc)}])
+    runner = FakeRunner(list_json=declared)
+    monkeypatch.setattr(subprocess, "run", runner)
+    monkeypatch.setattr("os.makedirs", lambda *a, **k: None)
+
+    entry = PluginEntry(source="acme/kit", plugins=[], version="latest")
+    result = PluginManager().prepare([entry], {})
+    strings = runner.arg_strings()
+    assert "plugin install alpha@kit" in strings
+    assert "plugin install beta@kit" in strings
+    assert result.resolved == {"kit/alpha": "latest", "kit/beta": "latest"}
+
+
+def test_wildcard_with_no_declarable_plugins_raises(tmp_path, monkeypatch):
+    """If '*' is given but no declared plugins can be enumerated, fail clearly
+    rather than installing the (invalid) marketplace name."""
+    # installLocation has no readable marketplace.json -> no declared names
+    declared = '[{"name": "kit", "repo": "acme/kit", "installLocation": "/nonexistent/kit"}]'
+    runner = FakeRunner(list_json=declared)
+    monkeypatch.setattr(subprocess, "run", runner)
+    monkeypatch.setattr("os.makedirs", lambda *a, **k: None)
+
+    entry = PluginEntry(source="acme/kit", plugins=["*"], version="latest")
+    with pytest.raises(UserException) as exc:
+        PluginManager().prepare([entry], {})
+    assert "no installable plugins" in str(exc.value) or "explicitly" in str(exc.value)
+
+
 def test_pinned_entry_adds_with_ref_no_update(monkeypatch):
     runner = FakeRunner()
     monkeypatch.setattr(subprocess, "run", runner)

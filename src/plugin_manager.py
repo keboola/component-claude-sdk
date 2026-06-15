@@ -137,13 +137,53 @@ class PluginManager:
         if entry.version == "latest":
             self._run(["plugin", "marketplace", "update", marketplace], env, source)
 
-        plugin_names = entry.plugins or ["*"]
+        plugin_names = self._resolve_plugin_names(entry, marketplace, install_location, source)
         for name in plugin_names:
             self._install_plugin(name, marketplace, env, source)
             result.resolved[f"{marketplace}/{name}"] = entry.version
 
         for path in self._cache_paths(marketplace, install_location):
             result.sdk_plugins.append({"type": "local", "path": path})
+
+    def _resolve_plugin_names(
+        self, entry: PluginEntry, marketplace: str, install_location: str | None, source: str
+    ) -> list[str]:
+        """The plugin NAMES to install for this entry.
+
+        Explicit names are used as given. An empty list or ``["*"]`` means
+        "install all": the marketplace is NAMED (e.g. ``superpowers-dev``) but
+        contains plugins under their OWN names (e.g. ``superpowers``), so we must
+        enumerate the DECLARED plugin names from the marketplace's
+        ``marketplace.json`` — never pass ``"*"`` or the marketplace name to
+        ``claude plugin install`` (Finding 8).
+        """
+        explicit = [n for n in entry.plugins if n and n != "*"]
+        if explicit:
+            return explicit
+        declared = self._declared_plugin_names(install_location)
+        if declared:
+            return declared
+        raise UserException(
+            f"Plugin source '{source}' (marketplace '{marketplace}') declares no installable "
+            f"plugins, or its marketplace.json could not be read to enumerate them. "
+            f"List the plugin name(s) explicitly in the 'plugins' field."
+        )
+
+    @staticmethod
+    def _declared_plugin_names(install_location: str | None) -> list[str]:
+        """Read the plugin names declared in ``<installLocation>/.claude-plugin/marketplace.json``."""
+        if not install_location:
+            return []
+        manifest = os.path.join(install_location, ".claude-plugin", "marketplace.json")
+        try:
+            with open(manifest, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return []
+        plugins = data.get("plugins") if isinstance(data, dict) else None
+        if not isinstance(plugins, list):
+            return []
+        return [p["name"] for p in plugins if isinstance(p, dict) and p.get("name")]
 
     @staticmethod
     def _resolve_source(entry: PluginEntry, github_token: str) -> str:
@@ -216,8 +256,9 @@ class PluginManager:
         return f"{source}@{ref}"
 
     def _install_plugin(self, name: str, marketplace: str, env: dict[str, str], source: str) -> None:
-        target = marketplace if name == "*" else f"{name}@{marketplace}"
-        self._run(["plugin", "install", target], env, source)
+        # Always a concrete <plugin>@<marketplace> target — "*"/the marketplace
+        # name is never installable (Finding 8); callers resolve names first.
+        self._run(["plugin", "install", f"{name}@{marketplace}"], env, source)
 
     def _cache_paths(self, marketplace: str, install_location: str | None) -> list[str]:
         """The local cache path the SDK loads the plugin from.
