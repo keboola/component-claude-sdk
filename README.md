@@ -159,7 +159,47 @@ parameter → `ClaudeAgentOptions` mapping is in the design spec
 - `sdk_version_on_failure` (default `fail`) — `fail` raises if a non-pinned install
   fails (no silent downgrade); `fallback_pinned` warns and uses the baked version.
 
-Future UI enhancement
+Memory & backend size
+---------------------
+
+The component runs with a **1 GB default memory limit**. That is enough for a
+typical prompt → output run, but launching MCP servers (each `uvx`/`npx` server is
+its own subprocess) or installing heavy plugins/marketplaces at job start can need
+more. If a job is killed for running out of memory, scale it up with a **dynamic
+backend**.
+
+Set the backend size per configuration via the top-level `runtime` block (a sibling
+of `parameters`, not inside it):
+
+```json
+{
+  "parameters": { "...": "..." },
+  "runtime": {
+    "backend": {
+      "type": "medium"
+    }
+  }
+}
+```
+
+Container backend sizes (Python/component jobs):
+
+| `runtime.backend.type` | RAM | CPU |
+| --- | --- | --- |
+| `xsmall` | 8 GB | 1 core |
+| `small` | 16 GB | 2 cores |
+| `medium` | 32 GB | 4 cores |
+| `large` | 114 GB | 14 cores |
+
+Notes:
+
+- There is **no `xlarge`** for container jobs — `large` (114 GB) is the ceiling.
+- A job-level `backend.type` in the job-run request overrides the configuration.
+- Dynamic backends require a paid plan (not available on Free / Pay-As-You-Go) and
+  the stack's dynamic-backend feature; without them the job uses the 1 GB default.
+- The 1 GB default is the component's Developer Portal `memory` property
+  (`requiredMemory: "1024m"`) — a separate, static limit from `runtime.backend.type`
+  (which is the opt-in per-config way for a user to scale up).
 ---------------------
 
 The configuration form groups the flat root fields into labelled sections, and the

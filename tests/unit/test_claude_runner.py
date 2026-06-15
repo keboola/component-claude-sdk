@@ -240,6 +240,38 @@ def test_run_task_cli_connection_error_becomes_user_exception(monkeypatch):
     assert "t1" in str(exc.value)
 
 
+def test_run_task_bare_exception_cap_maps_to_user_exception(monkeypatch):
+    """The SDK re-raises a turn/budget cap from receive_messages as a BARE Exception
+    (not a typed SDK error), which escaped run_task's except list and crashed as
+    exit 2 (Finding 7). It must map to a clean exit-1 UserException."""
+    runner = ClaudeRunner(workspace_dir="/tmp/ws")
+
+    async def raising(prompt, options):
+        # mimic claude_agent_sdk receive_messages raising the structured cap text
+        raise Exception("Claude Code returned an error result: error_max_turns")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(runner, "_query", raising)
+    with pytest.raises(UserException) as exc:
+        _run(runner, _task(), lambda m: None)
+    assert "turn/budget cap" in str(exc.value)
+    assert "t1" in str(exc.value)
+
+
+def test_run_task_bare_exception_generic_maps_to_user_exception(monkeypatch):
+    """A non-cap bare Exception from the loop still becomes a clean exit-1, not exit 2."""
+    runner = ClaudeRunner(workspace_dir="/tmp/ws")
+
+    async def raising(prompt, options):
+        raise Exception("some unexpected stream failure")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(runner, "_query", raising)
+    with pytest.raises(UserException) as exc:
+        _run(runner, _task(), lambda m: None)
+    assert "agent process failed" in str(exc.value)
+
+
 def test_run_task_no_result_message(monkeypatch):
     runner = ClaudeRunner(workspace_dir="/tmp/ws")
 

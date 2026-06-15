@@ -262,9 +262,17 @@ version: "latest"}` and a private `{source: "keboola/cf-claude-code-kit", privat
 reproducible pinned install (no `marketplace update`); `version: latest` = re-pull newest on every run
 (not reproducible — the resolved ref is recorded in the run log). Private sources authenticate via
 `GITHUB_TOKEN`/`GH_TOKEN` (and `GITLAB_TOKEN`/`BITBUCKET_TOKEN` if supplied) injected into the
-subprocess `env`. A fetch/install failure for a user-supplied source is a clear `UserException` (the
-`CLAUDE_CODE_PLUGIN_KEEP_MARKETPLACE_ON_FAILURE=1` env keeps a usable stale cache when a `latest`
-re-pull fails mid-run).
+subprocess `env`. A fetch/install failure for a user-supplied source is a clear `UserException`.
+
+> **Correction (Phase 8, Finding 4 — confirmed in-container):** do **NOT** set
+> `CLAUDE_CODE_PLUGIN_KEEP_MARKETPLACE_ON_FAILURE=1`. It was originally added to keep a usable stale
+> cache on a failed `latest` re-pull, but it deterministically BREAKS the very first `marketplace add`:
+> the CLI then leaves the clone under the source-derived temp name and skips the rename-to-declared-name
+> + validation, so `…/<source>/.claude-plugin/marketplace.json` is never found and the add fails
+> ("Marketplace file not found …"). Proven 3/3 fail with the flag vs 3/3 success without it. The
+> component no longer sets it. Separately, the CLI registers a marketplace under the name DECLARED in
+> its `marketplace.json` (e.g. `obra/superpowers` → `superpowers-dev`), so `PluginManager` discovers the
+> real name + `installLocation` from `marketplace list --json` rather than guessing from the source.
 
 ### 2.9 Platform env & token forwarding
 
@@ -484,8 +492,9 @@ workspace. **This is the single function the tests mock** (§7).
 
 `prepare(plugins: list[PluginEntry], env) -> list[SdkPluginConfig]`:
 1. `mkdir -p /tmp/claude-home` ; set `env CLAUDE_CONFIG_DIR=/tmp/claude-home`,
-   `CLAUDE_CODE_PLUGIN_CACHE_DIR=/tmp/claude-home/plugins/cache`,
-   `CLAUDE_CODE_PLUGIN_KEEP_MARKETPLACE_ON_FAILURE=1`.
+   `CLAUDE_CODE_PLUGIN_CACHE_DIR=/tmp/claude-home/plugins/cache`.
+   (Do NOT set `CLAUDE_CODE_PLUGIN_KEEP_MARKETPLACE_ON_FAILURE` — it breaks the clone/validate; see the
+   Finding 4 correction in §2.8.)
 2. **Resolve `source`** (§2.8): a known-public shorthand (e.g. `superpowers`) → its canonical public
    `owner/repo` via a small built-in registry of vetted public marketplaces; otherwise use the explicit
    `owner/repo`/git-url/marketplace.json verbatim. If `private` and no `#github_token` → `UserException`.
@@ -713,4 +722,4 @@ added as plain config recipes; S1 is the must-pass, S2-S5 extend as credentials/
 | R7 | Secret leakage in logs/transcripts (the LIVE guardrail concern). | Never log secret values; `claude plugin`/MCP subprocess output is logged with secret-scrubbing; transcript writer scrubs known secret values; VCR sanitizers; the PreToolUse hook protects the dev loop. | Phase 4/5 |
 | R8 | `query()` API shape drift on SDK upgrades. | Hard pin `==0.2.101` baked in; the single `ClaudeRunner` seam localises any future change; runtime `sdk_version=latest` is opt-in and at the user's risk (§2.10). | Phase 4 |
 | R9 | Runtime SDK overlay (§2.10) fails (no egress, bad version, registry down) or a `latest` upgrade breaks our code. | Default `sdk_version=pinned` (no network); `sdk_version_on_failure=fail` (default) surfaces the pip error as `UserException` so no silent downgrade; bundled CLI moves with the package (no SDK↔CLI skew within the upgrade); resolved version recorded in `claude_runs`. | Phase 4/7 (S4b) |
-| R10 | Plugin pin/latest: a `latest` re-pull fails mid-run, a pinned ref is gone, or a private source lacks the token. | `CLAUDE_CODE_PLUGIN_KEEP_MARKETPLACE_ON_FAILURE=1` keeps a usable stale cache on a failed `latest` re-pull; missing token for `private:true` → `UserException`; install failure names the source; resolved refs recorded in `claude_runs.plugins_resolved`. | Phase 4/7 (S4) |
+| R10 | Plugin pin/latest: a `latest` re-pull fails mid-run, a pinned ref is gone, or a private source lacks the token. | A failed add/update/install names the source as a `UserException`; missing token for `private:true` → `UserException`; resolved refs recorded in `claude_runs.plugins_resolved`. (Finding 4: `CLAUDE_CODE_PLUGIN_KEEP_MARKETPLACE_ON_FAILURE` is NOT used — it breaks the clone/validate; see §2.8.) | Phase 4/7 (S4) |

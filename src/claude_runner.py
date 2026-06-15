@@ -172,14 +172,16 @@ class ClaudeRunner:
                 f"The agent CLI/MCP failed to launch for task '{task.task_id}': {exc}"
             ) from exc
         except ProcessError as exc:
-            detail = str(exc)
-            if self._looks_like_auth_error(detail):
-                raise UserException(
-                    f"Anthropic authentication failed for task '{task.task_id}' — check #anthropic_key."
-                ) from exc
-            raise UserException(
-                f"The agent process failed for task '{task.task_id}': {detail}"
-            ) from exc
+            raise self._map_run_error(task, exc) from exc
+        except UserException:
+            raise
+        except Exception as exc:
+            # The SDK re-raises a non-terminal cap/error from receive_messages as a
+            # BARE Exception (claude_agent_sdk/_internal/query.py: receive_messages
+            # raises Exception(error_text)), so a turn-cap / budget-cap escapes the
+            # typed handlers above and would crash as exit 2. Map it to a clean
+            # exit-1 UserException (Finding 7) — a cap then ends the run gracefully.
+            raise self._map_run_error(task, exc) from exc
 
         if result_message is None:
             logging.warning("Task '%s' produced no ResultMessage.", task.task_id)
@@ -194,6 +196,28 @@ class ClaudeRunner:
     def _looks_like_auth_error(detail: str) -> bool:
         lowered = detail.lower()
         return any(s in lowered for s in ("401", "authentication", "unauthorized", "invalid api key", "api key"))
+
+    @staticmethod
+    def _looks_like_cap_error(detail: str) -> bool:
+        """Whether an error string is a turn-cap / budget-cap exhaustion."""
+        lowered = detail.lower()
+        return any(
+            s in lowered
+            for s in ("error_max_turns", "error_max_budget", "maximum number of turns", "budget")
+        )
+
+    def _map_run_error(self, task: Task, exc: Exception) -> UserException:
+        """Translate a query-loop raise into an actionable exit-1 UserException."""
+        detail = str(exc)
+        if self._looks_like_cap_error(detail):
+            return UserException(
+                f"Task '{task.task_id}' hit its turn/budget cap and stopped: {detail}"
+            )
+        if self._looks_like_auth_error(detail):
+            return UserException(
+                f"Anthropic authentication failed for task '{task.task_id}' — check #anthropic_key."
+            )
+        return UserException(f"The agent process failed for task '{task.task_id}': {detail}")
 
     @staticmethod
     def _to_result(task: Task, message: Any) -> ClaudeRunResult:

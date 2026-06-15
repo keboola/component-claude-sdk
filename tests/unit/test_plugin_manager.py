@@ -34,7 +34,9 @@ def test_no_plugins_is_noop_but_sets_env(monkeypatch):
     assert result.sdk_plugins == []
     assert result.resolved == {}
     assert env["CLAUDE_CONFIG_DIR"] == "/tmp/claude-home"
-    assert env["CLAUDE_CODE_PLUGIN_KEEP_MARKETPLACE_ON_FAILURE"] == "1"
+    assert env["CLAUDE_CODE_PLUGIN_CACHE_DIR"] == "/tmp/claude-home/plugins/cache"
+    # Finding 4: this flag breaks the marketplace clone/validate — must NOT be set.
+    assert "CLAUDE_CODE_PLUGIN_KEEP_MARKETPLACE_ON_FAILURE" not in env
 
 
 def test_latest_entry_adds_then_updates(monkeypatch):
@@ -47,9 +49,37 @@ def test_latest_entry_adds_then_updates(monkeypatch):
     strings = runner.arg_strings()
     # superpowers shorthand resolved to obra/superpowers
     assert "plugin marketplace add obra/superpowers" in strings
+    # list --json empty -> falls back to the source-derived name "superpowers"
     assert "plugin marketplace update superpowers" in strings
     assert "plugin install sp@superpowers" in strings
     assert result.resolved == {"superpowers/sp": "latest"}
+
+
+def test_uses_declared_marketplace_name_not_source_derived(monkeypatch):
+    """Finding 4: the CLI registers a marketplace under the name DECLARED in its
+    marketplace.json (e.g. obra/superpowers -> 'superpowers-dev'), not a name
+    derived from the source. update/install/cache-path must use the discovered
+    declared name + installLocation, or they silently fail on-platform."""
+    declared = (
+        '[{"name": "superpowers-dev", "repo": "obra/superpowers", '
+        '"installLocation": "/tmp/claude-home/plugins/cache/marketplaces/superpowers-dev"}]'
+    )
+    runner = FakeRunner(list_json=declared)
+    monkeypatch.setattr(subprocess, "run", runner)
+    monkeypatch.setattr("os.makedirs", lambda *a, **k: None)
+
+    entry = PluginEntry(source="superpowers", plugins=["sp"], version="latest")
+    result = PluginManager().prepare([entry], {})
+    strings = runner.arg_strings()
+    # discovery picks the DECLARED name, not the source-derived "superpowers"
+    assert "plugin marketplace update superpowers-dev" in strings
+    assert "plugin install sp@superpowers-dev" in strings
+    assert result.resolved == {"superpowers-dev/sp": "latest"}
+    # the SDK local-plugin path is the discovered installLocation
+    assert {
+        "type": "local",
+        "path": "/tmp/claude-home/plugins/cache/marketplaces/superpowers-dev",
+    } in result.sdk_plugins
 
 
 def test_pinned_entry_adds_with_ref_no_update(monkeypatch):
@@ -115,14 +145,19 @@ def test_failed_command_raises_with_source(monkeypatch):
     assert "acme/repo" in str(exc.value)
 
 
-def test_cache_path_from_list_json(monkeypatch):
-    runner = FakeRunner(list_json='[{"name": "superpowers", "path": "/tmp/claude-home/plugins/cache/superpowers"}]')
+def test_cache_path_falls_back_to_convention_when_no_install_location(monkeypatch):
+    """When list --json yields no installLocation (and no match), the cache path
+    falls back to the conventional <cache>/<marketplace> location."""
+    runner = FakeRunner()  # empty list -> fallback name "superpowers", no installLocation
     monkeypatch.setattr(subprocess, "run", runner)
     monkeypatch.setattr("os.makedirs", lambda *a, **k: None)
 
     entry = PluginEntry(source="superpowers", plugins=["sp"], version="latest")
     result = PluginManager().prepare([entry], {})
-    assert {"type": "local", "path": "/tmp/claude-home/plugins/cache/superpowers"} in result.sdk_plugins
+    assert {
+        "type": "local",
+        "path": "/tmp/claude-home/plugins/cache/superpowers",
+    } in result.sdk_plugins
 
 
 def test_token_scrubbed_from_logs(monkeypatch, caplog):

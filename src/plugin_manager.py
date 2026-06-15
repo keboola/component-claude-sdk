@@ -98,7 +98,13 @@ class PluginManager:
 
         env["CLAUDE_CONFIG_DIR"] = self._claude_home
         env["CLAUDE_CODE_PLUGIN_CACHE_DIR"] = self._cache_dir
-        env["CLAUDE_CODE_PLUGIN_KEEP_MARKETPLACE_ON_FAILURE"] = "1"
+        # NB: we deliberately do NOT set CLAUDE_CODE_PLUGIN_KEEP_MARKETPLACE_ON_FAILURE.
+        # Confirmed in-container (deterministic 3/3 vs 3/3): with that flag the CLI
+        # leaves the clone under the source-derived temp name and skips the
+        # rename-to-declared-name + validation, so marketplace.json is never found
+        # at the expected path and `marketplace add` fails ("Marketplace file not
+        # found …"). Without it the add succeeds and the marketplace registers under
+        # its declared name (Finding 4).
 
         result = PluginResult()
         if not plugins:
@@ -113,21 +119,30 @@ class PluginManager:
         self, entry: PluginEntry, env: dict[str, str], github_token: str, result: PluginResult
     ) -> None:
         source = self._resolve_source(entry, github_token)
-        marketplace = self._marketplace_name(source)
 
         if entry.version == "latest":
             self._run(["plugin", "marketplace", "add", source], env, source)
-            self._run(["plugin", "marketplace", "update", marketplace], env, source)
         else:
             pinned_source = self._pin_source(source, entry.version)
             self._run(["plugin", "marketplace", "add", pinned_source], env, source)
+
+        # The CLI registers the marketplace under the name DECLARED in the repo's
+        # marketplace.json (e.g. obra/superpowers registers as "superpowers-dev"),
+        # NOT a name derived from the source. Discover the real handle + install
+        # location from `marketplace list --json` and use them for everything
+        # downstream — deriving the name from the source mismatches and the
+        # install/cache-path silently fail (Finding 4).
+        marketplace, install_location = self._discover_marketplace(source, env)
+
+        if entry.version == "latest":
+            self._run(["plugin", "marketplace", "update", marketplace], env, source)
 
         plugin_names = entry.plugins or ["*"]
         for name in plugin_names:
             self._install_plugin(name, marketplace, env, source)
             result.resolved[f"{marketplace}/{name}"] = entry.version
 
-        for path in self._cache_paths(marketplace, env, source):
+        for path in self._cache_paths(marketplace, install_location):
             result.sdk_plugins.append({"type": "local", "path": path})
 
     @staticmethod
@@ -148,13 +163,50 @@ class PluginManager:
         return entry.source
 
     @staticmethod
-    def _marketplace_name(source: str) -> str:
-        """The marketplace handle the CLI registers — the repo name segment."""
-        base = source.rstrip("/").split("/")[-1]
-        for suffix in (".git",):
-            if base.endswith(suffix):
-                base = base[: -len(suffix)]
+    def _source_repo(source: str) -> str:
+        """The ``owner/repo`` slug used to match a registered marketplace's ``repo``."""
+        base = source.split("#", 1)[0].split("@github.com:", 1)[-1]
+        base = base.removeprefix("https://github.com/").removeprefix("http://github.com/")
+        base = base.rstrip("/")
+        if base.endswith(".git"):
+            base = base[: -len(".git")]
         return base
+
+    @staticmethod
+    def _fallback_marketplace_name(source: str) -> str:
+        """Last-resort handle if discovery fails — the repo name segment."""
+        base = source.split("#", 1)[0].rstrip("/").split("/")[-1]
+        if base.endswith(".git"):
+            base = base[: -len(".git")]
+        return base
+
+    def _discover_marketplace(self, source: str, env: dict[str, str]) -> tuple[str, str | None]:
+        """Find the REAL registered marketplace name + install location after add.
+
+        The CLI registers a marketplace under the name declared in its
+        ``marketplace.json``, which usually differs from anything derivable from
+        the source string. We read ``marketplace list --json`` and match the entry
+        by its ``repo``/``source`` against the requested source; on no match we
+        fall back to the repo-name-segment guess so behaviour degrades, not breaks.
+        """
+        proc = self._run(["plugin", "marketplace", "list", "--json"], env, source, check=False)
+        wanted_repo = self._source_repo(source)
+        try:
+            data = json.loads(proc.stdout or "[]")
+        except json.JSONDecodeError:
+            data = []
+        markets = data if isinstance(data, list) else data.get("marketplaces", [])
+        for market in markets:
+            if not isinstance(market, dict):
+                continue
+            repo = (market.get("repo") or market.get("source") or "").rstrip("/")
+            if repo and self._source_repo(repo) == wanted_repo and market.get("name"):
+                return market["name"], market.get("installLocation") or market.get("path")
+        # No match (e.g. only one freshly-added marketplace) — if there is exactly
+        # one entry, trust it; otherwise fall back to the source-derived guess.
+        if len(markets) == 1 and isinstance(markets[0], dict) and markets[0].get("name"):
+            return markets[0]["name"], markets[0].get("installLocation") or markets[0].get("path")
+        return self._fallback_marketplace_name(source), None
 
     @staticmethod
     def _pin_source(source: str, ref: str) -> str:
@@ -167,24 +219,17 @@ class PluginManager:
         target = marketplace if name == "*" else f"{name}@{marketplace}"
         self._run(["plugin", "install", target], env, source)
 
-    def _cache_paths(self, marketplace: str, env: dict[str, str], source: str) -> list[str]:
-        """Resolve the local cache paths of the installed marketplace plugins."""
-        proc = self._run(["plugin", "marketplace", "list", "--json"], env, source, check=False)
-        paths: list[str] = []
-        try:
-            data = json.loads(proc.stdout or "[]")
-        except json.JSONDecodeError:
-            logging.warning("Could not parse 'claude plugin marketplace list --json' output; using cache dir.")
-            data = []
-        for market in data if isinstance(data, list) else data.get("marketplaces", []):
-            if isinstance(market, dict) and market.get("name") == marketplace:
-                path = market.get("path") or market.get("localPath")
-                if path:
-                    paths.append(path)
-        if not paths:
-            # Fall back to the conventional cache location for this marketplace.
-            paths.append(f"{self._cache_dir}/{marketplace}")
-        return paths
+    def _cache_paths(self, marketplace: str, install_location: str | None) -> list[str]:
+        """The local cache path the SDK loads the plugin from.
+
+        Prefer the ``installLocation`` discovered from ``marketplace list --json``
+        (authoritative — it reflects the DECLARED marketplace name the CLI cloned
+        into). Fall back to the conventional ``<cache>/<marketplace>`` only when no
+        location was discovered.
+        """
+        if install_location:
+            return [install_location]
+        return [f"{self._cache_dir}/{marketplace}"]
 
     def _run(
         self,
