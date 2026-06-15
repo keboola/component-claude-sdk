@@ -186,3 +186,17 @@ def test_log_safe_summary_has_no_secret_values():
     assert "KEY_NAME_ONLY" not in str(summary)
     assert "GH_NAME_ONLY" not in str(summary)
     assert summary["has_github_token"] is True
+
+
+def test_log_safe_summary_includes_effort_and_fallback_model():
+    cfg = Configuration(**_base(effort="high", fallback_model="claude-haiku-4-5"))
+    summary = cfg.log_safe_summary()
+    assert summary["effort"] == "high"
+    assert summary["fallback_model"] == "claude-haiku-4-5"
+
+
+def test_log_safe_summary_effort_and_fallback_default_none():
+    cfg = Configuration(**_base())
+    summary = cfg.log_safe_summary()
+    assert summary["effort"] is None
+    assert summary["fallback_model"] is None

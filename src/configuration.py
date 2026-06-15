@@ -274,6 +274,8 @@ class Configuration(BaseModel):
         """A dict safe to log — no secret values, only their presence."""
         return {
             "model": self.model.value,
+            "fallback_model": self.fallback_model.value if self.fallback_model else None,
+            "effort": self.effort.value if self.effort else None,
             "permission_mode": self.permission_mode.value,
             "max_turns": self.max_turns,
             "max_budget_usd": self.max_budget_usd,

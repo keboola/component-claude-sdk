@@ -2,7 +2,15 @@
 
 import asyncio
 
-from claude_agent_sdk import AssistantMessage, ResultMessage, SystemMessage, TextBlock
+import pytest
+from claude_agent_sdk import (
+    AssistantMessage,
+    CLIConnectionError,
+    ResultMessage,
+    SystemMessage,
+    TextBlock,
+)
+from keboola.component.exceptions import UserException
 
 from claude_runner import ClaudeRunner, ClaudeRunResult
 from configuration import Configuration
@@ -83,6 +91,41 @@ def test_build_options_plugins_passed_through():
     assert opts.plugins == plugins
 
 
+def test_build_options_omits_optional_kwargs_when_unset():
+    """effort/fallback_model/add_dirs are only threaded when configured."""
+    cfg = _config()  # no effort, no fallback_model, workspace_input_files=False
+    runner = ClaudeRunner(workspace_dir="/tmp/ws")
+    opts = runner.build_options(_task(), cfg, [], {})
+    assert opts.effort is None
+    assert opts.fallback_model is None
+    # add_dirs defaults to empty when workspace_input_files is off
+    assert not opts.add_dirs
+
+
+@pytest.mark.parametrize(
+    "overrides, attr, expected",
+    [
+        ({"effort": "high"}, "effort", "high"),
+        ({"fallback_model": "claude-haiku-4-5"}, "fallback_model", "claude-haiku-4-5"),
+        ({"disallowed_tools": ["Bash(rm *)"]}, "disallowed_tools", ["Bash(rm *)"]),
+        ({"setting_sources": ["project"]}, "setting_sources", ["project"]),
+    ],
+)
+def test_build_options_threads_optional_kwargs(overrides, attr, expected):
+    """Each optional config field lands on the matching ClaudeAgentOptions attr."""
+    cfg = _config(**overrides)
+    runner = ClaudeRunner(workspace_dir="/tmp/ws")
+    opts = runner.build_options(_task(), cfg, [], {})
+    assert getattr(opts, attr) == expected
+
+
+def test_build_options_add_dirs_set_when_workspace_input_files():
+    cfg = _config(workspace_input_files=True)
+    runner = ClaudeRunner(workspace_dir="/tmp/ws")
+    opts = runner.build_options(_task(), cfg, [], {})
+    assert opts.add_dirs == ["/tmp/ws"]
+
+
 def test_settings_json_object_written_to_file_and_path_passed(tmp_path):
     import json
 
@@ -160,6 +203,41 @@ def test_run_task_budget_cap_marks_failure(monkeypatch):
     res = _run(runner, _task(), lambda m: None)
     assert res.success is False
     assert "cap" in (res.error_message or "")
+
+
+def test_run_task_turn_cap_marks_failure(monkeypatch):
+    """The turn-cap subtype (error_max_turns) is the sibling of the budget cap —
+    it must also mark the run as a non-success cap hit."""
+    runner = ClaudeRunner(workspace_dir="/tmp/ws")
+    result_msg = ResultMessage(
+        subtype="error_max_turns",
+        duration_ms=700,
+        duration_api_ms=600,
+        is_error=True,
+        num_turns=20,
+        session_id="sess-3",
+    )
+    monkeypatch.setattr(runner, "_query", _make_stream(result_msg))
+    res = _run(runner, _task(), lambda m: None)
+    assert res.success is False
+    assert res.subtype == "error_max_turns"
+    assert "cap" in (res.error_message or "")
+
+
+def test_run_task_cli_connection_error_becomes_user_exception(monkeypatch):
+    """CLIConnectionError shares the launch-failure handler with CLINotFoundError;
+    it must also map to a clean UserException (exit 1), not an opaque exit 2."""
+    runner = ClaudeRunner(workspace_dir="/tmp/ws")
+
+    async def raising(prompt, options):
+        raise CLIConnectionError("could not connect to the CLI")
+        yield  # pragma: no cover — makes this an async generator
+
+    monkeypatch.setattr(runner, "_query", raising)
+    with pytest.raises(UserException) as exc:
+        _run(runner, _task(), lambda m: None)
+    assert "failed to launch" in str(exc.value)
+    assert "t1" in str(exc.value)
 
 
 def test_run_task_no_result_message(monkeypatch):

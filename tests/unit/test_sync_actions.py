@@ -45,6 +45,14 @@ def test_401_raises_auth_error():
     assert "authentication" in str(exc.value).lower()
 
 
+def test_403_raises_auth_error():
+    """403 is the sibling of 401 in the auth branch — it must also raise."""
+    client = FakeHttpClient(FakeResponse(403, "forbidden"))
+    with pytest.raises(UserException) as exc:
+        check_anthropic_connection("BAD", http_client=client)
+    assert "authentication" in str(exc.value).lower()
+
+
 def test_other_error_raises():
     client = FakeHttpClient(FakeResponse(500, "server error"))
     with pytest.raises(UserException) as exc:
