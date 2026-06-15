@@ -685,6 +685,18 @@ added as plain config recipes; S1 is the must-pass, S2-S5 extend as credentials/
   (SDK allows `>=3.10`). VCR dev deps (`pytest-recording`/`vcrpy`) added in Phase 5. Remove the unused
   `keboola-http-client`/`keboola-utils` if not needed, or keep `keboola-http-client` for the
   `testConnection` HTTP check.
+- **Memory / backend size (Finding 6 — verified on-platform).** `runtime.backend.type` (config
+  top-level, sibling of `parameters`) is THE memory lever. The default `small` backend gives the
+  **container a 256 MB cgroup limit**, which OOM-kills runs that spawn MCP servers (each `uvx`/`npx`
+  server is a subprocess) or install heavy plugins/marketplaces; `medium` gives those headroom, `large`
+  for very heavy runs. Backend VM sizes: `xsmall`=8 GB/1, `small`=16 GB/2 (default), `medium`=32 GB/4,
+  `large`=114 GB/14 — **no `xlarge`** for containers; the 256 MB is the *container* limit, separate from
+  the VM size. A job-level `backend.type` overrides the config; dynamic backends need a paid plan + the
+  stack feature. **The Dev Portal `memory`/`requiredMemory` property was found INERT for this job type
+  on this stack** (set to `1024m`, the container still ran at 256 MB / `containerSize: small`, confirmed
+  twice ~9 min post-patch) — do NOT rely on it; document `runtime.backend.type` as the only working
+  lever. The component logs a non-blocking startup WARNING when `mcp_servers`/`plugins` are configured,
+  pointing users at `runtime.backend.type: medium` if they OOM.
 
 ## 12. Corrections vs the Phase 2 research summary (verified against live 0.2.101 source)
 

@@ -231,6 +231,47 @@ def test_transcript_flushed_when_run_task_raises(tmp_path, monkeypatch):
     assert os.path.isfile(os.path.join(data_dir, "out", "tables", "claude_sessions.csv"))
 
 
+def test_memory_warning_fires_for_mcp_servers(caplog):
+    """Finding 6: configuring MCP servers must log a non-blocking memory WARNING
+    (the default 256 MB backend OOMs subprocess-spawning workloads)."""
+    import logging
+
+    from configuration import Configuration
+
+    cfg = Configuration(
+        **{
+            "#anthropic_key": "KEY_NAME_ONLY",
+            "mcp_servers": [{"type": "stdio", "name": "fetch", "command": "uvx", "args": ["mcp-server-fetch"]}],
+        }
+    )
+    with caplog.at_level(logging.WARNING):
+        Component._warn_if_memory_intensive(cfg)
+    assert any("runtime.backend.type" in r.message for r in caplog.records)
+
+
+def test_memory_warning_fires_for_plugins(caplog):
+    import logging
+
+    from configuration import Configuration
+
+    cfg = Configuration(**{"#anthropic_key": "KEY_NAME_ONLY", "plugins": [{"source": "superpowers"}]})
+    with caplog.at_level(logging.WARNING):
+        Component._warn_if_memory_intensive(cfg)
+    assert any("runtime.backend.type" in r.message for r in caplog.records)
+
+
+def test_memory_warning_silent_without_mcp_or_plugins(caplog):
+    """A lightweight setup (no MCP/plugins) must NOT emit the memory warning."""
+    import logging
+
+    from configuration import Configuration
+
+    cfg = Configuration(**{"#anthropic_key": "KEY_NAME_ONLY", "task": {"prompt": "hi"}})
+    with caplog.at_level(logging.WARNING):
+        Component._warn_if_memory_intensive(cfg)
+    assert not any("runtime.backend.type" in r.message for r in caplog.records)
+
+
 def test_build_env_sets_writable_caches_for_read_only_image():
     """uvx/npx MCP launchers default their cache + HOME to the read-only image
     root and die before the server starts (Finding 5). _build_env must redirect

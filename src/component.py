@@ -79,6 +79,7 @@ class Component(ComponentBase):
         """
         config = Configuration(**self.configuration.parameters)
         logging.info("Starting Claude SDK run: %s", config.log_safe_summary())
+        self._warn_if_memory_intensive(config)
 
         sdk_version, plugin_result, env = self._ensure_sdk_and_env(config)
         transcript = self._build_transcript(config, sdk_version, plugin_result.resolved)
@@ -108,6 +109,23 @@ class Component(ComponentBase):
         if config.workspace_input_files:
             self._stage_input_files()
         return sdk_version, plugin_result, env
+
+    @staticmethod
+    def _warn_if_memory_intensive(config: Configuration) -> None:
+        """Warn (non-blocking) that MCP servers / plugins may need a bigger backend.
+
+        MCP servers and plugins spawn subprocesses; the default ``small`` backend
+        gives the container only ~256 MB, which OOM-kills those workloads (Finding
+        6, verified on-platform). Lightweight setups may still fit, so this is a
+        logged WARNING, not a hard error — it preserves flexibility while pointing
+        users at the only working memory lever, ``runtime.backend.type``.
+        """
+        if config.mcp_servers or config.plugins:
+            logging.warning(
+                "MCP servers and/or plugins are configured; they spawn subprocesses and may exceed "
+                "the default backend's memory. If you hit an out-of-memory error, set "
+                "'runtime.backend.type: medium' (or larger) in the configuration."
+            )
 
     @staticmethod
     def _secret_values(config: Configuration) -> list[str]:

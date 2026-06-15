@@ -162,14 +162,12 @@ parameter → `ClaudeAgentOptions` mapping is in the design spec
 Memory & backend size
 ---------------------
 
-The component runs with a **1 GB default memory limit**. That is enough for a
-typical prompt → output run, but launching MCP servers (each `uvx`/`npx` server is
-its own subprocess) or installing heavy plugins/marketplaces at job start can need
-more. If a job is killed for running out of memory, scale it up with a **dynamic
-backend**.
-
-Set the backend size per configuration via the top-level `runtime` block (a sibling
-of `parameters`, not inside it):
+**`runtime.backend.type` is the memory lever for this component.** The default
+backend (`small`) gives the container a **256 MB** memory limit, which is enough
+for a lightweight prompt → output run but OOM-kills runs that launch MCP servers
+(each `uvx`/`npx` server is its own subprocess) or install heavy plugins/
+marketplaces. For those, set a larger backend per configuration via the top-level
+`runtime` block (a sibling of `parameters`, not inside it):
 
 ```json
 {
@@ -182,24 +180,33 @@ of `parameters`, not inside it):
 }
 ```
 
-Container backend sizes (Python/component jobs):
+`medium` gives MCP/plugin workloads ample headroom; go `large` for very heavy runs.
 
-| `runtime.backend.type` | RAM | CPU |
+Backend VM sizes (Python/component jobs):
+
+| `runtime.backend.type` | VM RAM | CPU |
 | --- | --- | --- |
 | `xsmall` | 8 GB | 1 core |
-| `small` | 16 GB | 2 cores |
+| `small` (default) | 16 GB | 2 cores |
 | `medium` | 32 GB | 4 cores |
 | `large` | 114 GB | 14 cores |
 
 Notes:
 
-- There is **no `xlarge`** for container jobs — `large` (114 GB) is the ceiling.
+- There is **no `xlarge`** for container jobs — `large` is the ceiling.
+- The per-size RAM above is the VM size; the component's **container** is given a
+  smaller cgroup memory limit (the default `small` container limit is **256 MB** —
+  verified on-platform). Moving up a backend size raises both, which is why
+  `medium` is what relieves MCP/plugin out-of-memory kills.
 - A job-level `backend.type` in the job-run request overrides the configuration.
 - Dynamic backends require a paid plan (not available on Free / Pay-As-You-Go) and
-  the stack's dynamic-backend feature; without them the job uses the 1 GB default.
-- The 1 GB default is the component's Developer Portal `memory` property
-  (`requiredMemory: "1024m"`) — a separate, static limit from `runtime.backend.type`
-  (which is the opt-in per-config way for a user to scale up).
+  the stack's dynamic-backend feature.
+- Note: the component's Developer Portal `memory` property does **not** raise the
+  container limit for this job type on this stack (verified inert on-platform —
+  the container stayed at 256 MB regardless). `runtime.backend.type` is the only
+  working lever; do not rely on the portal `memory` property.
+
+Future UI enhancement
 ---------------------
 
 The configuration form groups the flat root fields into labelled sections, and the
