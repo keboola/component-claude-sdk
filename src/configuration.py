@@ -71,11 +71,21 @@ def _coerce_empty_object(v):
 
 
 class Model(StrEnum):
-    """User-selectable Claude model ids (bare ids, no date suffix)."""
+    """User-selectable Claude model ids.
+
+    Both bare aliases (e.g. ``claude-haiku-4-5``) and full versioned ids
+    (e.g. ``claude-haiku-4-5-20251001``) are accepted.  Bare aliases are
+    resolved by the Anthropic API to the latest point-release; versioned ids
+    pin a specific release.  Use versioned ids when the alias is unavailable
+    on the target API key.
+    """
 
     opus_4_8 = "claude-opus-4-8"
+    opus_4_8_versioned = "claude-opus-4-8-20250514"
     sonnet_4_6 = "claude-sonnet-4-6"
+    sonnet_4_6_versioned = "claude-sonnet-4-6-20251101"
     haiku_4_5 = "claude-haiku-4-5"
+    haiku_4_5_versioned = "claude-haiku-4-5-20251001"
 
 
 class Effort(StrEnum):
