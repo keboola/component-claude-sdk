@@ -290,10 +290,12 @@ class AdvocateServer:
         log.info("AdvocateServer started on %s", self._sock_path)
 
     def stop(self) -> None:
-        """Shut down the server and background thread."""
+        """Shut down the server, background thread, and all MCP subprocesses."""
         if self._server:
             self._server.shutdown()
             self._server.server_close()
         if self._thread:
             self._thread.join(timeout=5)
+        from advocate.brokers import mcp_broker  # noqa: PLC0415
+        mcp_broker.shutdown_all()
         log.info("AdvocateServer stopped")

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -792,20 +793,25 @@ class TestMcpStdioSecretInjection:
         )
 
         # Patch subprocess.Popen to capture the env it receives.
+        # stdout must be a real file object so select.select can call fileno()
+        # on it; we pre-write the response into the write end before the call.
         captured_envs: list[dict] = []
+        response = b'{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}\n'
+
+        r_fd, w_fd = os.pipe()
+        os.write(w_fd, response)
+        os.close(w_fd)
+        real_stdout = os.fdopen(r_fd, "rb")
 
         class _FakeProc:
-            stdin = MagicMock()
-            stdout = MagicMock()
-            stderr = MagicMock()
             poll = MagicMock(return_value=None)
 
             def __init__(self, *args, env=None, **kwargs):  # noqa: ARG002
                 captured_envs.append(dict(env or {}))
+                self.stdin = MagicMock()
                 self.stdin.write = MagicMock()
                 self.stdin.flush = MagicMock()
-                response = b'{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}\n'
-                self.stdout.readline = MagicMock(return_value=response)
+                self.stdout = real_stdout
 
         mcp_broker._procs.clear()
         mcp_broker._proc_locks.clear()
@@ -830,3 +836,83 @@ class TestMcpStdioSecretInjection:
 
         body_str = _json.dumps(body)
         assert "real-secret-99" not in body_str
+
+
+# ---------------------------------------------------------------------------
+# 12. MCP stdio — hung server read timeout + proc eviction
+# ---------------------------------------------------------------------------
+
+
+class TestMcpStdioTimeout:
+    """The stdout read must be bounded; a hung server must be evicted."""
+
+    def test_hung_server_returns_502_and_evicts_proc(self) -> None:
+        """select.select reports not-ready → 502 returned, proc evicted and terminated."""
+        from configuration import McpStdioServer  # noqa: PLC0415
+
+        cfg = McpStdioServer(name="hung-mcp", command="cat", args=[], env={})
+
+        # A fake proc whose stdout.fileno() select will find not-ready.
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None  # appears alive
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdin.write = MagicMock()
+        mock_proc.stdin.flush = MagicMock()
+        # stdout needs a real fileno for select; use a real pipe read-end.
+        import os as _os  # noqa: PLC0415
+        r_fd, w_fd = _os.pipe()
+        # Leave the write end open but never write — select will time out.
+        mock_proc.stdout = _os.fdopen(r_fd, "rb")
+
+        mcp_broker._procs.clear()
+        mcp_broker._proc_locks.clear()
+        mcp_broker._procs["hung-mcp"] = mock_proc
+        mcp_broker._proc_locks["hung-mcp"] = threading.Lock()
+
+        from advocate import idempotency  # noqa: PLC0415
+        idempotency.clear()
+
+        payload = {"action_id": "hung-1", "server_name": "hung-mcp", "method": "tools/list"}
+
+        # Patch the timeout to near-zero so the test is fast.
+        with patch.object(mcp_broker, "_STDIO_READ_TIMEOUT_S", 0.05):
+            status, body = mcp_broker.handle_request(payload, {"hung-mcp": cfg})
+
+        assert status == 502
+        assert body["error"] == "MCP request failed"
+        # Proc must be evicted so the next call can relaunch a fresh one.
+        assert "hung-mcp" not in mcp_broker._procs
+        # terminate() must have been called on the hung proc.
+        mock_proc.terminate.assert_called_once()
+
+        # Clean up the pipe write end.
+        _os.close(w_fd)
+        mock_proc.stdout.close()
+
+
+# ---------------------------------------------------------------------------
+# 13. AdvocateServer.stop() wires shutdown_all()
+# ---------------------------------------------------------------------------
+
+
+class TestAdvocateServerShutdownWiring:
+    """AdvocateServer.stop() must call mcp_broker.shutdown_all() to terminate subprocesses."""
+
+    def test_stop_calls_shutdown_all_and_clears_procs(self) -> None:
+        """Registered MCP procs are terminated when the server stops."""
+        # Register a mock proc in the broker's _procs dict.
+        mock_proc = MagicMock()
+        mock_proc.terminate = MagicMock()
+        mock_proc.wait = MagicMock()
+        mcp_broker._procs["wired-mcp"] = mock_proc
+        mcp_broker._proc_locks["wired-mcp"] = threading.Lock()
+
+        sock_path = _short_sock_path("shutdown_wiring.sock")
+        server = AdvocateServer(sock_path, anthropic_key="dummy")
+        server.start()
+
+        server.stop()
+
+        # After stop, the proc must have been terminated and _procs cleared.
+        mock_proc.terminate.assert_called_once()
+        assert "wired-mcp" not in mcp_broker._procs

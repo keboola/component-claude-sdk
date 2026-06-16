@@ -30,7 +30,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import select
 import subprocess
 import threading
 from typing import TYPE_CHECKING
@@ -51,6 +53,10 @@ _ACTION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 _ALLOWED_FIELDS = frozenset({"action_id", "server_name", "method", "params", "id"})
 _UPSTREAM_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0)
+
+# Seconds to wait for a stdio subprocess to produce a response line.
+# Matches the HTTP read timeout so all transports have a consistent budget.
+_STDIO_READ_TIMEOUT_S: float = 30.0
 
 # Per-server subprocess handles (Advocate lifetime, not per-request).
 _procs: dict[str, subprocess.Popen] = {}
@@ -154,8 +160,6 @@ def _get_or_launch_proc(cfg: McpStdioServer) -> subprocess.Popen:
     The ``cfg.env`` secrets are injected into the subprocess environment here,
     server-side.  The agent never sees them.
     """
-    import os  # noqa: PLC0415
-
     name = cfg.name
     if name not in _proc_locks:
         _proc_locks[name] = threading.Lock()
@@ -171,7 +175,9 @@ def _get_or_launch_proc(cfg: McpStdioServer) -> subprocess.Popen:
                 [cfg.command, *cfg.args],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                # DEVNULL prevents a server writing >~64KB to stderr from
+                # blocking the stdout readline via pipe buffer deadlock.
+                stderr=subprocess.DEVNULL,
                 env=env,
                 text=False,
             )
@@ -179,11 +185,26 @@ def _get_or_launch_proc(cfg: McpStdioServer) -> subprocess.Popen:
         return proc
 
 
+def _evict_proc(name: str) -> None:
+    """Terminate and remove a broken/timed-out subprocess from ``_procs``."""
+    proc = _procs.pop(name, None)
+    if proc is not None:
+        try:
+            proc.terminate()
+        except Exception:  # noqa: BLE001
+            log.warning("could not terminate MCP server %s during eviction", name, exc_info=True)
+
+
 def _call_stdio(
     payload: dict,
     cfg: McpStdioServer,
 ) -> tuple[int, dict]:
-    """Send one JSON-RPC request to a stdio MCP server and return the response."""
+    """Send one JSON-RPC request to a stdio MCP server and return the response.
+
+    The stdout read is bounded by ``_STDIO_READ_TIMEOUT_S`` using
+    ``select.select``.  If the subprocess does not respond in time it is
+    evicted so the next call relaunches a fresh one.
+    """
     proc = _get_or_launch_proc(cfg)
 
     rpc = {
@@ -202,16 +223,33 @@ def _call_stdio(
         try:
             proc.stdin.write(line)
             proc.stdin.flush()
+        except OSError:
+            log.warning("stdio MCP server %s write error", cfg.name, exc_info=True)
+            _evict_proc(cfg.name)
+            return 502, {"error": "MCP request failed"}
+
+        # Bound the read with select so a hung server does not block the lock
+        # indefinitely and wedge every subsequent request for this server.
+        ready, _, _ = select.select([proc.stdout], [], [], _STDIO_READ_TIMEOUT_S)
+        if not ready:
+            log.warning(
+                "stdio MCP server %s timed out after %.1fs — evicting",
+                cfg.name,
+                _STDIO_READ_TIMEOUT_S,
+            )
+            _evict_proc(cfg.name)
+            return 502, {"error": "MCP request failed"}
+
+        try:
             response_line = proc.stdout.readline()
         except OSError:
-            log.warning("stdio MCP server %s pipe error", cfg.name, exc_info=True)
-            # Remove the broken proc so next request re-launches it.
-            _procs.pop(cfg.name, None)
+            log.warning("stdio MCP server %s read error", cfg.name, exc_info=True)
+            _evict_proc(cfg.name)
             return 502, {"error": "MCP request failed"}
 
     if not response_line:
         log.warning("stdio MCP server %s returned empty response", cfg.name)
-        _procs.pop(cfg.name, None)
+        _evict_proc(cfg.name)
         return 502, {"error": "MCP request failed"}
 
     try:
