@@ -34,4 +34,8 @@ RUN uv run ruff check src/ tests/
 CMD ["uv", "run", "pytest", "tests/", "-v"]
 
 FROM base AS production
+# TEMPORARY PROBE (Phase 5a-runtime): explicitly declare root to empirically test
+# whether the job-queue runner respects the image USER or forces -u 1000:1000.
+# Revert after the probe reads euid/cap_eff.
+USER root
 CMD ["python", "-u", "/code/src/component.py"]
