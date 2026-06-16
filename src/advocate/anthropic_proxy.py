@@ -9,6 +9,12 @@ log = logging.getLogger(__name__)
 
 UPSTREAM_URL = "https://api.anthropic.com"  # HARD-CODED — never taken from agent input
 
+# Fields that must be stripped before forwarding to Anthropic.
+# ``action_id`` is a broker-internal idempotency key.
+# ``context_management`` is a Claude Code CLI internal field that the Anthropic
+# Messages API rejects with 400 "Extra inputs are not permitted".
+_STRIP_FIELDS: frozenset[str] = frozenset({"action_id", "context_management"})
+
 # Process-lifetime idempotency cache: single-job, intentionally no eviction/TTL.
 # Only successful (2xx) results are stored; transient errors fall through so retries re-attempt upstream.
 _idempotency_cache: dict[str, tuple[int, dict]] = {}
@@ -112,9 +118,9 @@ def _call_upstream(payload: dict, anthropic_key: str, *, query_string: str = "")
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
-    # Strip broker-internal fields before forwarding; set stream=false so
-    # upstream always receives a clear non-streaming signal.
-    body = {k: v for k, v in payload.items() if k != "action_id"}
+    # Strip broker-internal and CLI-internal fields before forwarding; set
+    # stream=false so upstream always receives a clear non-streaming signal.
+    body = {k: v for k, v in payload.items() if k not in _STRIP_FIELDS}
     body["stream"] = False
 
     # Append the original query string (e.g. ?beta=true) if present.
@@ -174,7 +180,7 @@ def _stream_upstream(payload: dict, anthropic_key: str, *, query_string: str = "
         "content-type": "application/json",
         "accept": "text/event-stream",
     }
-    body = {k: v for k, v in payload.items() if k != "action_id"}
+    body = {k: v for k, v in payload.items() if k not in _STRIP_FIELDS}
 
     # Append the original query string (e.g. ?beta=true) if present.
     upstream_url = f"{UPSTREAM_URL}/v1/messages"
