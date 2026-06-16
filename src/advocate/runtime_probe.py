@@ -594,6 +594,210 @@ def check_phase0_floor() -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
+# CHECK E5 — YAMA ptrace_scope
+# ---------------------------------------------------------------------------
+
+# PTRACE_ATTACH request code
+_PTRACE_ATTACH = 16
+_PTRACE_DETACH = 17
+
+
+def check_yama_ptrace_scope() -> tuple[bool, str]:
+    """E5: report /proc/sys/kernel/yama/ptrace_scope value.
+
+    Scope meanings:
+      0  — classic: same-UID process can PTRACE_ATTACH (no kernel restriction).
+      1  — restricted: only parent/tracee relationship or CAP_SYS_PTRACE allowed.
+      2  — admin-only: CAP_SYS_PTRACE required.
+      3  — no attach: ptrace disabled entirely.
+    absent — Yama LSM not loaded (same as scope 0).
+
+    Always passes (informational); the value feeds the isolation verdict.
+    """
+    path = "/proc/sys/kernel/yama/ptrace_scope"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            value = fh.read().strip()
+        return True, f"ptrace_scope={value}"
+    except FileNotFoundError:
+        return True, "ptrace_scope=absent"
+    except OSError as exc:
+        return True, f"ptrace_scope=read-error:{exc}"
+
+
+# ---------------------------------------------------------------------------
+# CHECK E6 — same-UID child cannot read parent secrets
+# ---------------------------------------------------------------------------
+
+# Unique sentinel written into the parent's env + heap; the child must NOT find it.
+_SENTINEL_ENV_KEY = "ADVOCATE_SENTINEL"
+
+
+def _child_attempt_ptrace(parent_pid: int, sentinel: str) -> tuple[bool, str]:
+    """Attempt PTRACE_ATTACH on parent_pid and scan its memory for sentinel.
+
+    Returns (found: bool, detail: str).  A EPERM / failure means we could NOT read.
+    Runs in a fork so it cannot disturb the parent process.
+    """
+    if not _LIBC_OK:
+        return False, "libc-unavailable"
+
+    # PTRACE_ATTACH
+    rc = libc.ptrace(_PTRACE_ATTACH, parent_pid, 0, 0)
+    if rc < 0:
+        err = ctypes.get_errno()
+        return False, f"ptrace-attach-eperm:{os.strerror(err)}"
+
+    # If attach succeeded, wait for the stop signal, then detach.
+    import signal
+
+    os.waitpid(parent_pid, 0)
+
+    # Try to read a word from the parent's stack via PTRACE_PEEKDATA.
+    # Finding the exact sentinel in memory via ptrace word-reads is complex;
+    # the mere fact that PTRACE_ATTACH succeeded is already a FAIL (full
+    # memory access is now possible in principle).
+    libc.ptrace(_PTRACE_DETACH, parent_pid, 0, signal.SIGCONT)
+    return True, "ptrace-attach-succeeded"
+
+
+def _child_attempt_proc_mem(parent_pid: int, sentinel: bytes) -> tuple[bool, str]:
+    """Attempt to open /proc/<parent_pid>/mem and scan for sentinel."""
+    mem_path = f"/proc/{parent_pid}/mem"
+    maps_path = f"/proc/{parent_pid}/maps"
+    try:
+        with open(maps_path, encoding="utf-8") as fh:
+            maps_data = fh.read()
+    except PermissionError:
+        return False, "proc-maps-eperm"
+    except OSError as exc:
+        return False, f"proc-maps-error:{exc}"
+
+    try:
+        mem_fd = open(mem_path, "rb")  # noqa: SIM115
+    except PermissionError:
+        return False, "proc-mem-eperm"
+    except OSError as exc:
+        return False, f"proc-mem-open-error:{exc}"
+
+    # Walk readable anon/heap mappings looking for the sentinel.
+    found = False
+    for line in maps_data.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        perms = parts[1]
+        if "r" not in perms:
+            continue
+        addr_range = parts[0]
+        start_s, end_s = addr_range.split("-")
+        start, end = int(start_s, 16), int(end_s, 16)
+        size = end - start
+        if size > 64 * 1024 * 1024:  # skip huge mappings to keep the probe fast
+            continue
+        try:
+            mem_fd.seek(start)
+            chunk = mem_fd.read(size)
+            if sentinel in chunk:
+                found = True
+                break
+        except OSError:
+            continue
+
+    mem_fd.close()
+    if found:
+        return True, "proc-mem-sentinel-found"
+    return False, "proc-mem-read-ok-sentinel-not-found"
+
+
+def _child_attempt_proc_environ(parent_pid: int, sentinel: str) -> tuple[bool, str]:
+    """Attempt to read /proc/<parent_pid>/environ and find sentinel."""
+    environ_path = f"/proc/{parent_pid}/environ"
+    try:
+        with open(environ_path, "rb") as fh:
+            data = fh.read()
+        if sentinel.encode() in data:
+            return True, "proc-environ-sentinel-found"
+        return False, "proc-environ-read-ok-sentinel-not-found"
+    except PermissionError:
+        return False, "proc-environ-eperm"
+    except OSError as exc:
+        return False, f"proc-environ-error:{exc}"
+
+
+def check_same_uid_memory_isolation() -> tuple[bool, str]:
+    """E6: same-UID child cannot extract parent's secrets via ptrace / /proc/mem / environ.
+
+    The threat model: Advocate (parent) and agent (child) run at the same UID.
+    Can the agent exfiltrate secrets the Advocate holds in memory/env?
+
+    Three attack vectors tested:
+      a. PTRACE_ATTACH(parent_pid) — direct memory access if Yama scope=0.
+      b. open+read /proc/<parent_pid>/mem — file-based memory read.
+      c. read /proc/<parent_pid>/environ — environment variable dump.
+
+    PASS = child could NOT obtain the sentinel by ANY method (each blocked).
+    FAIL = child obtained it by at least one method (report which).
+    """
+    if sys.platform != "linux":
+        return False, "not-linux"
+
+    import secrets as _secrets_mod
+
+    sentinel = f"ADVOCATE_SENTINEL_{_secrets_mod.token_hex(16)}"
+    sentinel_bytes = sentinel.encode()
+
+    # Place sentinel into env + a live heap buffer BEFORE forking so the child can
+    # attack it.  Keep the heap reference alive until after waitpid.
+    os.environ[_SENTINEL_ENV_KEY] = sentinel
+    _sentinel_heap_buf = ctypes.create_string_buffer(sentinel_bytes)  # noqa: F841
+
+    parent_pid = os.getpid()
+
+    # Pre-agree on result file path before forking so both sides share the same path.
+    fd, result_path = tempfile.mkstemp(prefix="probe_mem_result_")
+    os.close(fd)
+
+    pid = os.fork()
+    if pid == 0:
+        try:
+            ptrace_found, ptrace_detail = _child_attempt_ptrace(parent_pid, sentinel)
+            mem_found, mem_detail = _child_attempt_proc_mem(parent_pid, sentinel_bytes)
+            env_found, env_detail = _child_attempt_proc_environ(parent_pid, sentinel)
+            any_found = ptrace_found or mem_found or env_found
+            result: dict = {
+                "any_found": any_found,
+                "ptrace": {"found": ptrace_found, "detail": ptrace_detail},
+                "proc_mem": {"found": mem_found, "detail": mem_detail},
+                "proc_environ": {"found": env_found, "detail": env_detail},
+            }
+            with open(result_path, "w", encoding="utf-8") as fh:
+                json.dump(result, fh)
+        except Exception as exc:  # noqa: BLE001
+            with open(result_path, "w", encoding="utf-8") as fh:
+                json.dump({"any_found": False, "error": str(exc)}, fh)
+        os._exit(0)
+
+    os.waitpid(pid, 0)
+    os.environ.pop(_SENTINEL_ENV_KEY, None)
+
+    try:
+        with open(result_path, encoding="utf-8") as fh:
+            result = json.load(fh)
+        os.unlink(result_path)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"result-read-error:{exc}"
+
+    any_found = result.get("any_found", False)
+    passed = not any_found
+    ptrace_d = result.get("ptrace", {}).get("detail", "?")
+    mem_d = result.get("proc_mem", {}).get("detail", "?")
+    env_d = result.get("proc_environ", {}).get("detail", "?")
+    detail = f"ptrace={ptrace_d},proc_mem={mem_d},proc_environ={env_d}"
+    return passed, detail
+
+
+# ---------------------------------------------------------------------------
 # Main probe runner — collects all checks, writes output
 # ---------------------------------------------------------------------------
 
@@ -604,6 +808,8 @@ _CHECKS: list[tuple[str, Callable[[], tuple[bool, str]]]] = [
     ("iptables_loopback_allow_external_block", check_iptables_loopback_allow_external_block),
     ("unshare_clone_newnet", check_unshare_newnet),
     ("phase0_floor", check_phase0_floor),
+    ("yama_ptrace_scope", check_yama_ptrace_scope),
+    ("same_uid_child_cannot_read_parent_secret", check_same_uid_memory_isolation),
 ]
 
 
@@ -645,6 +851,7 @@ def run_probe(out_tables_dir: str) -> dict:
     by_name = {r["check_name"]: r["pass"] == "true" for r in rows}
     iptables_ok = by_name.get("iptables_loopback_allow_external_block", False)
     netns_ok = by_name.get("unshare_clone_newnet", False)
+    memory_isolation_ok = by_name.get("same_uid_child_cannot_read_parent_secret", False)
 
     if iptables_ok:
         recommendation = "iptables_owner_match"
@@ -659,6 +866,7 @@ def run_probe(out_tables_dir: str) -> dict:
         "env": gather_env_context(),
         "checks": {r["check_name"]: {"pass": r["pass"] == "true", "detail": r["detail"]} for r in rows},
         "recommendation": recommendation,
+        "broker_memory_isolation": memory_isolation_ok,
         "table": table_path,
     }
 

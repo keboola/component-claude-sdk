@@ -284,3 +284,118 @@ def test_run_probe_tolerates_check_exception(tmp_path, monkeypatch):
     assert checks["env_context"]["pass"] is False
     assert "kaboom" in checks["env_context"]["detail"]
     assert checks["iptables_owner_match_cap"]["pass"] is True
+
+
+# ---------------------------------------------------------------------------
+# New checks: yama_ptrace_scope + same_uid_memory_isolation
+# ---------------------------------------------------------------------------
+
+
+def test_check_yama_ptrace_scope_present(tmp_path, monkeypatch):
+    """check_yama_ptrace_scope reads the value and always passes (informational)."""
+    # Patch open to simulate the file existing with scope=1.
+    import builtins
+
+    from advocate.runtime_probe import check_yama_ptrace_scope
+
+    real_open = builtins.open
+
+    def _fake_open(path, *args, **kwargs):
+        if path == "/proc/sys/kernel/yama/ptrace_scope":
+            import io
+
+            return io.StringIO("1\n")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", _fake_open)
+    passed, detail = check_yama_ptrace_scope()
+    assert passed is True
+    assert "ptrace_scope=1" in detail
+
+
+def test_check_yama_ptrace_scope_absent(monkeypatch):
+    """When /proc/sys/kernel/yama/ptrace_scope is absent, still passes with 'absent'."""
+    import builtins
+
+    from advocate.runtime_probe import check_yama_ptrace_scope
+
+    real_open = builtins.open
+
+    def _fake_open(path, *args, **kwargs):
+        if path == "/proc/sys/kernel/yama/ptrace_scope":
+            raise FileNotFoundError("no yama")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", _fake_open)
+    passed, detail = check_yama_ptrace_scope()
+    assert passed is True
+    assert "absent" in detail
+
+
+def test_run_probe_broker_memory_isolation_in_summary(tmp_path, monkeypatch):
+    """run_probe() summary includes broker_memory_isolation key mirroring the check result."""
+    import advocate.runtime_probe as rp
+
+    def _pass():
+        return True, "ok"
+
+    def _fail():
+        return False, "nope"
+
+    stubbed = [
+        ("env_context", _pass),
+        ("iptables_owner_match_cap", _fail),
+        ("iptables_loopback_allow_external_block", _fail),
+        ("unshare_clone_newnet", _fail),
+        ("phase0_floor", _fail),
+        ("yama_ptrace_scope", _pass),
+        ("same_uid_child_cannot_read_parent_secret", _pass),
+    ]
+    monkeypatch.setattr(rp, "_CHECKS", stubbed)
+
+    summary = rp.run_probe(str(tmp_path))
+    assert "broker_memory_isolation" in summary
+    assert summary["broker_memory_isolation"] is True
+
+
+def test_run_probe_broker_memory_isolation_false_when_check_fails(tmp_path, monkeypatch):
+    """broker_memory_isolation is False when same_uid check fails."""
+    import advocate.runtime_probe as rp
+
+    def _fail():
+        return False, "nope"
+
+    stubbed = [
+        ("same_uid_child_cannot_read_parent_secret", _fail),
+    ]
+    monkeypatch.setattr(rp, "_CHECKS", stubbed)
+
+    summary = rp.run_probe(str(tmp_path))
+    assert summary["broker_memory_isolation"] is False
+
+
+def test_same_uid_check_returns_tuple():
+    """check_same_uid_memory_isolation returns a (bool, str) tuple without crashing."""
+    import sys
+
+    if sys.platform != "linux":
+        return  # skip on non-Linux; the check itself guards this
+
+    from advocate.runtime_probe import check_same_uid_memory_isolation
+
+    passed, detail = check_same_uid_memory_isolation()
+    assert isinstance(passed, bool)
+    assert isinstance(detail, str)
+    # detail must contain per-method sub-keys
+    assert "ptrace=" in detail
+    assert "proc_mem=" in detail
+    assert "proc_environ=" in detail
+
+
+def test_checks_list_includes_new_checks():
+    """_CHECKS contains the two new memory-isolation checks."""
+    from advocate.runtime_probe import _CHECKS
+
+    names = [name for name, _ in _CHECKS]
+    assert "yama_ptrace_scope" in names
+    assert "same_uid_child_cannot_read_parent_secret" in names
