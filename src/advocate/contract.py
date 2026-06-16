@@ -58,6 +58,7 @@ class _ConfigProto(Protocol):
     github_enabled: bool
     mcp_servers: list[McpStdioServer | McpRemoteServer]
 
+
 # ---------------------------------------------------------------------------
 # Canonical capability names
 # ---------------------------------------------------------------------------

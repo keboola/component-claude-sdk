@@ -29,6 +29,34 @@ _MODEL_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 
 _ALLOWED_FIELDS = frozenset({"action_id", "model", "max_tokens", "messages", "stream", "system"})
 
+# Path suffixes that indicate a merge operation (case-insensitive).
+_MERGE_PATH_SUFFIXES = ("/merge", "/merges")
+
+
+def _github_capability(method: str, path: str) -> str:
+    """Map an HTTP method + GitHub API path to the narrowest capability name.
+
+    The mapping is intentionally conservative: destructive and irreversible
+    operations require capabilities (``gh.delete``, ``gh.merge``) that the
+    default derived contract does NOT grant, so they hard-deny by default.
+
+    Mapping:
+    - GET             → ``gh.read``
+    - DELETE          → ``gh.delete``       (destructive — not covered by write_branch)
+    - PUT/POST to a
+      ``…/merge(s)``  → ``gh.merge``        (irreversible — not covered by write_branch)
+    - other writes    → ``gh.write_branch``
+    """
+    if method == "GET":
+        return "gh.read"
+    if method == "DELETE":
+        return "gh.delete"
+    # Merge detection: path ends with /merge or /merges (e.g. /pulls/{n}/merge).
+    norm_path = path.rstrip("/").lower()
+    if method in ("PUT", "POST") and any(norm_path.endswith(s) for s in _MERGE_PATH_SUFFIXES):
+        return "gh.merge"
+    return "gh.write_branch"
+
 
 def _validate(raw: dict) -> tuple[dict | None, str | None]:
     """Validate the untrusted request payload.
@@ -232,17 +260,33 @@ class _Handler(BaseHTTPRequestHandler):
     def _check_gate(self, capability: str, destination: str) -> bool:
         """Run the contract gate for a single RPC.  Return True if allowed.
 
-        When no contract envelope is configured (``_NO_CONTRACT`` sentinel),
-        the gate is a no-op and the call proceeds — this preserves Phase 3
-        default behaviour for test environments that pre-date Phase 4.
+        The gate is a no-op **only** when BOTH ``contract_envelope`` and
+        ``contract_signing_secret`` are ``None`` — i.e. the server was
+        intentionally started without a contract (Phase 3 backward compat).
 
-        Returns ``True`` if the action passes (or there is no contract to gate
-        against); responds with 403 and returns ``False`` if denied.
+        If either is present without the other, the gate FAILS CLOSED (denies
+        the request) rather than silently allowing it.  This ensures a wiring
+        slip (e.g. passing an envelope but forgetting the secret) is loud and
+        safe rather than quietly fail-open.
+
+        Returns ``True`` if the action passes (or no contract is configured);
+        responds with 403 and returns ``False`` if denied.
         """
         envelope = self.server.contract_envelope
         secret = self.server.contract_signing_secret
-        if envelope is _NO_CONTRACT or secret is None:
+
+        # No contract configured → gate is a no-op (Phase 3 default).
+        if envelope is _NO_CONTRACT and secret is None:
             return True
+
+        # Envelope present but no secret (or vice versa) → wiring slip → deny.
+        if envelope is _NO_CONTRACT or secret is None:
+            log.error(
+                "gate: envelope/secret mismatch — one is set but not the other; "
+                "failing closed to avoid a silently unenforced gate"
+            )
+            self._respond(403, {"error": "contract configuration error"})
+            return False
 
         from advocate import contract as _contract  # noqa: PLC0415
         from advocate.gate import GateDenial, check_action  # noqa: PLC0415
@@ -311,11 +355,19 @@ class _Handler(BaseHTTPRequestHandler):
             return
         assert validated is not None  # github_broker.validate returns (dict, None) or (None, str)
 
-        # Gate: capability = gh.read for GET, gh.write_branch for mutating calls.
-        # Destination is api.github.com + path.
+        # Gate: map HTTP method + path to the narrowest capability that covers
+        # the operation.  The default contract grants only gh.read and
+        # gh.write_branch, so destructive ops (gh.delete, gh.merge) hard-deny
+        # unless the contract was explicitly widened.
+        #
+        # Mapping:
+        #   GET                           → gh.read
+        #   DELETE                        → gh.delete   (NOT write_branch — destructive)
+        #   PUT/POST to …/merge(s)        → gh.merge    (NOT write_branch — irreversible)
+        #   POST/PATCH/PUT (other writes) → gh.write_branch
         method: str = validated.get("method", "GET")
         path: str = validated.get("path", "")
-        cap = "gh.read" if method == "GET" else "gh.write_branch"
+        cap = _github_capability(method, path)
         dest = f"{github_broker.GITHUB_API_HOST}{path}"
 
         if not self._check_gate(cap, dest):
@@ -422,6 +474,15 @@ class AdvocateServer:
                 ``contract_envelope``; ignored when ``contract_envelope`` is
                 ``None``.
         """
+        # Validate envelope/secret are either both set or both absent.
+        # A mismatch is a programming error — fail loudly at construction time
+        # rather than silently at the first gated request.
+        if (contract_envelope is None) != (contract_signing_secret is None):
+            raise ValueError(
+                "contract_envelope and contract_signing_secret must both be "
+                "provided together or both omitted; "
+                "providing one without the other would silently disable the gate"
+            )
         self._sock_path = sock_path
         self._anthropic_key = anthropic_key
         self._mcp_configs = mcp_configs or {}

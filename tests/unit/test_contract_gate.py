@@ -649,3 +649,257 @@ class TestGateViaUds:
             assert resp.status_code == 200
         finally:
             server.stop()
+
+
+# ---------------------------------------------------------------------------
+# 7. Fail-closed: envelope/secret mismatch must deny, not allow
+# ---------------------------------------------------------------------------
+
+
+class TestFailClosed:
+    """The gate must fail CLOSED on any configuration slip, never fail-open."""
+
+    def test_envelope_without_secret_raises_at_construction(self) -> None:
+        """Providing an envelope but no secret → ValueError at AdvocateServer construction."""
+        import pytest
+
+        from advocate.server import AdvocateServer
+
+        cfg = _make_cfg(github_enabled=True)
+        c = derive_contract(cfg, operates_on="org/repo-X")
+        secret = new_invocation_secret()
+        envelope = sign_contract(c, secret)
+
+        with pytest.raises(ValueError, match="both be provided together or both omitted"):
+            AdvocateServer(
+                "/tmp/unused.sock",  # noqa: S108
+                anthropic_key="dummy",
+                github_token="dummy",
+                contract_envelope=envelope,
+                contract_signing_secret=None,  # mismatch → must raise
+            )
+
+    def test_secret_without_envelope_raises_at_construction(self) -> None:
+        """Providing a secret but no envelope → ValueError at AdvocateServer construction."""
+        import pytest
+
+        from advocate.server import AdvocateServer
+
+        with pytest.raises(ValueError, match="both be provided together or both omitted"):
+            AdvocateServer(
+                "/tmp/unused.sock",  # noqa: S108
+                anthropic_key="dummy",
+                github_token="dummy",
+                contract_envelope=None,  # mismatch → must raise
+                contract_signing_secret=new_invocation_secret(),
+            )
+
+    def test_envelope_present_secret_none_check_gate_denies(self) -> None:
+        """If somehow _check_gate is reached with envelope set but secret=None, it must DENY.
+
+        This tests the in-handler defence-in-depth; the constructor guard above is
+        the primary protection, but _check_gate must not allow-all as a fallback.
+        """
+        from advocate.server import _Handler, _UnixServer
+
+        cfg = _make_cfg(github_enabled=True)
+        c = derive_contract(cfg, operates_on="org/repo-X")
+        secret = new_invocation_secret()
+        envelope = sign_contract(c, secret)
+
+        # Bypass the AdvocateServer constructor check by directly constructing
+        # _UnixServer (which does NOT validate the mismatch — only AdvocateServer
+        # does).  This simulates a future code path that might bypass the outer guard.
+        sock_path = _short_sock_path("gate_failclosed.sock")
+        # _UnixServer does not have the same mismatch guard, so we can construct it
+        # with a mismatched pair to exercise _check_gate's own defence.
+        unix_server = _UnixServer(
+            sock_path,
+            _Handler,
+            "dummy-key",
+            github_token="dummy",
+            contract_envelope=envelope,
+            contract_signing_secret=None,  # mismatch — _check_gate should deny
+        )
+
+        # Simulate calling _check_gate directly by creating a minimal _Handler instance.
+        # We reach in via a unit-test shim rather than a live UDS round-trip.
+        handler = _Handler.__new__(_Handler)
+        handler.server = unix_server  # type: ignore[attr-defined]
+
+        denied_responses: list[tuple[int, dict]] = []
+
+        def _fake_respond(status: int, body: dict) -> None:
+            denied_responses.append((status, body))
+
+        handler._respond = _fake_respond  # type: ignore[method-assign]
+
+        result = handler._check_gate("gh.read", "api.github.com/repos/org/repo-X")
+
+        assert result is False, "_check_gate must fail-closed when secret is None but envelope is present"
+        assert len(denied_responses) == 1
+        status, body = denied_responses[0]
+        assert status == 403
+        assert "error" in body
+        unix_server.socket.close()
+
+
+# ---------------------------------------------------------------------------
+# 8. Capability granularity: DELETE and merge ops require elevated capabilities
+# ---------------------------------------------------------------------------
+
+
+class TestGithubCapabilityMapping:
+    """The _github_capability helper must map HTTP methods to the correct capability.
+
+    gh.delete and gh.merge are NOT in the default contract, so they must
+    hard-deny when a GitHub-enabled contract is present.
+    """
+
+    def test_get_maps_to_gh_read(self) -> None:
+        from advocate.server import _github_capability
+
+        assert _github_capability("GET", "/repos/org/repo") == "gh.read"
+
+    def test_delete_maps_to_gh_delete(self) -> None:
+        from advocate.server import _github_capability
+
+        assert _github_capability("DELETE", "/repos/org/repo") == "gh.delete"
+
+    def test_put_to_merge_path_maps_to_gh_merge(self) -> None:
+        from advocate.server import _github_capability
+
+        assert _github_capability("PUT", "/repos/org/repo/pulls/1/merge") == "gh.merge"
+
+    def test_post_to_merges_path_maps_to_gh_merge(self) -> None:
+        from advocate.server import _github_capability
+
+        assert _github_capability("POST", "/repos/org/repo/merges") == "gh.merge"
+
+    def test_post_to_non_merge_path_maps_to_gh_write_branch(self) -> None:
+        from advocate.server import _github_capability
+
+        assert _github_capability("POST", "/repos/org/repo/issues") == "gh.write_branch"
+
+    def test_patch_maps_to_gh_write_branch(self) -> None:
+        from advocate.server import _github_capability
+
+        assert _github_capability("PATCH", "/repos/org/repo/issues/1") == "gh.write_branch"
+
+    def test_delete_via_uds_denied_by_default_contract(self) -> None:
+        """DELETE under the default github contract → 403 (gh.delete not granted)."""
+        from advocate import idempotency
+        from advocate.server import AdvocateServer
+
+        idempotency.clear()
+        sock_path = _short_sock_path("cap_delete.sock")
+        cfg = _make_cfg(github_enabled=True)
+        c = derive_contract(cfg, operates_on="org/repo-X")
+        secret = new_invocation_secret()
+        envelope = sign_contract(c, secret)
+
+        server = AdvocateServer(
+            sock_path,
+            anthropic_key="dummy",
+            github_token="dummy",
+            contract_envelope=envelope,
+            contract_signing_secret=secret,
+        )
+        server.start()
+        try:
+            payload = {
+                "action_id": "cap-delete-1",
+                "method": "DELETE",
+                "path": "/repos/org/repo-X",
+            }
+            with _uds_client(sock_path) as client:
+                resp = client.post(
+                    "http://localhost/v1/github",
+                    json=payload,
+                    headers={"content-type": "application/json"},
+                )
+            assert resp.status_code == 403
+            body = resp.json()
+            assert "error" in body
+            # Denial must not mention internal contract fields or secrets.
+            assert "secret" not in body["error"].lower()
+        finally:
+            server.stop()
+
+    def test_merge_via_uds_denied_by_default_contract(self) -> None:
+        """PUT to a /merge path under the default github contract → 403 (gh.merge not granted)."""
+        from advocate import idempotency
+        from advocate.server import AdvocateServer
+
+        idempotency.clear()
+        sock_path = _short_sock_path("cap_merge.sock")
+        cfg = _make_cfg(github_enabled=True)
+        c = derive_contract(cfg, operates_on="org/repo-X")
+        secret = new_invocation_secret()
+        envelope = sign_contract(c, secret)
+
+        server = AdvocateServer(
+            sock_path,
+            anthropic_key="dummy",
+            github_token="dummy",
+            contract_envelope=envelope,
+            contract_signing_secret=secret,
+        )
+        server.start()
+        try:
+            payload = {
+                "action_id": "cap-merge-1",
+                "method": "PUT",
+                "path": "/repos/org/repo-X/pulls/42/merge",
+            }
+            with _uds_client(sock_path) as client:
+                resp = client.post(
+                    "http://localhost/v1/github",
+                    json=payload,
+                    headers={"content-type": "application/json"},
+                )
+            assert resp.status_code == 403
+            body = resp.json()
+            assert "error" in body
+        finally:
+            server.stop()
+
+    def test_normal_branch_write_allowed_by_default_contract(self) -> None:
+        """A normal POST (branch write) under the default github contract → passes gate."""
+        from advocate import idempotency
+        from advocate.brokers import github_broker
+        from advocate.server import AdvocateServer
+
+        idempotency.clear()
+        sock_path = _short_sock_path("cap_write.sock")
+        cfg = _make_cfg(github_enabled=True)
+        c = derive_contract(cfg, operates_on="org/repo-X")
+        secret = new_invocation_secret()
+        envelope = sign_contract(c, secret)
+
+        server = AdvocateServer(
+            sock_path,
+            anthropic_key="dummy",
+            github_token="dummy",
+            contract_envelope=envelope,
+            contract_signing_secret=secret,
+        )
+        server.start()
+        mock_result = (201, {"ref": "refs/heads/agent/test"})
+        try:
+            with patch.object(github_broker, "_call_github", return_value=mock_result):
+                payload = {
+                    "action_id": "cap-write-1",
+                    "method": "POST",
+                    "path": "/repos/org/repo-X/git/refs",
+                    "body": {"ref": "refs/heads/agent/test", "sha": "abc123"},
+                }
+                with _uds_client(sock_path) as client:
+                    resp = client.post(
+                        "http://localhost/v1/github",
+                        json=payload,
+                        headers={"content-type": "application/json"},
+                    )
+            assert resp.status_code == 201
+        finally:
+            server.stop()
