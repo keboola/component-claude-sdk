@@ -3,15 +3,13 @@ sandbox_probe.py — Phase 0 spike: confirm OS primitives for the in-container s
 
 Run inside a Linux container (python:3.14-slim, as root):
 
-    docker build -f scripts/Dockerfile.probe -t sandbox-probe .
-    docker run --rm --read-only --tmpfs /tmp:exec sandbox-probe
-
-Or without a Dockerfile (quick one-liner):
-
     docker run --rm --read-only --tmpfs /tmp:exec \\
         -v $(pwd)/scripts:/probe:ro \\
         python:3.14-slim \\
         python /probe/sandbox_probe.py
+
+Re-run this probe on any platform/runtime configuration change to re-verify
+ptrace_scope >= 1 and the seccomp floor (spec §12.6 runtime dependency).
 
 Checks performed:
   1. seccomp: self-imposed filter blocks socket(AF_INET/AF_INET6) in a child; AF_UNIX still works.
@@ -25,7 +23,7 @@ Output: a single JSON object to stdout; DEBUG logs go to stderr.
 Architecture note:
   Syscall numbers and BPF arch tags differ between x86_64 and aarch64.
   This probe detects the running arch and uses the appropriate constants.
-  Logic intended for Phase 1's src/advocate/sandbox.py build_seccomp_filter().
+  Logic lifted into src/advocate/sandbox.py build_seccomp_filter() (V1+ stub).
 """
 
 from __future__ import annotations

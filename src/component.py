@@ -32,7 +32,6 @@ from keboola.component.base import ComponentBase, sync_action
 from keboola.component.exceptions import UserException
 from keboola.vcr import DefaultSanitizer
 
-from advocate.runtime_probe import run_probe
 from claude_runner import ClaudeRunner, ClaudeRunResult
 from configuration import Configuration
 from output_writer import OutputWriter
@@ -270,16 +269,7 @@ class Component(ComponentBase):
         loop or output promotion raises, so the per-task work and ``promote()``
         run inside a ``try`` whose ``finally`` always flushes the transcript
         before any exception propagates (output-state durability guarantee).
-
-        TEMPORARY/PROBE: when ``parameters.__advocate_runtime_probe`` is truthy the
-        run short-circuits into the egress-capability probe (Phase 5a-runtime).
-        Remove this gate when Phase 5b is wired.
         """
-        params = self.configuration.parameters
-        if params.get("__advocate_runtime_probe"):
-            self._run_advocate_probe()
-            return
-
         # Step 1: Parse config (reads decrypted secrets into memory).
         config = Configuration(**self.configuration.parameters)
         log.info("Starting Claude SDK run: %s", config.log_safe_summary())
@@ -517,19 +507,6 @@ class Component(ComponentBase):
             details = "; ".join(f"{r.task_id}: {r.error_message or r.subtype}" for r in failed)
             raise UserException(f"{len(failed)} of {len(results)} task(s) failed: {details}")
         log.info("All %d task(s) completed successfully.", len(results))
-
-    def _run_advocate_probe(self) -> None:
-        """TEMPORARY/PROBE — Phase 5a-runtime egress-capability probe.
-
-        Runs all egress checks, writes /data/out/tables/advocate_runtime_probe.csv
-        (with manifest) and logs a compact JSON summary.  Normal runs are never
-        affected: this branch is only entered when ``__advocate_runtime_probe`` is
-        truthy in ``parameters``.
-        """
-        log.info("[advocate-probe] probe mode active — skipping normal agent run")
-        out_tables = self.tables_out_path
-        summary = run_probe(out_tables)
-        log.info("[advocate-probe] probe complete; recommendation=%s", summary.get("recommendation"))
 
     @sync_action("testConnection")
     def test_connection(self):
