@@ -8,6 +8,13 @@
 > Amends: `docs/superpowers/specs/2026-06-14-claude-sdk-design.md` §2.4, §2.9, §6.5, R7
 > Relationship to platform-level work: this is the **plan-v3 Two-Process model collapsed into a
 > single Keboola component container**. It does not require new platform infrastructure.
+>
+> Revision 2026-06-15b (per PR #1 review): the **POC scope is the broker + in-container sandbox +
+> deterministic scope/destination allowlist** — full stop. The earlier "egress bit-budget",
+> "secret-blind LLM advocate", and runtime "provenance-freeze" were overclaimed (esp. calling the
+> bit-budget *information-theoretic* — it is at best a heuristic size cap, and inapplicable to a
+> coding agent whose legitimate output is large). They are demoted to §7.4 as **explicitly out-of-POC,
+> unvalidated experiments** and are not relied on for any security property.
 
 ---
 
@@ -122,8 +129,8 @@ secrets and no network. Against the prompt-injection threat this yields the same
 │   • holds KBC_TOKEN (env)                                                │
 │   • HAS network; performs ALL outbound calls                            │
 │   • runs: Anthropic proxy, MCP servers, GitHub/HTTP tool executor       │
-│   • enforces the Contract gate (§7): deterministic + provenance +       │
-│     bit-budget + restrict-only LLM advocate                             │
+│   • enforces the Contract gate (§7): deterministic scope/destination    │
+│     allowlist (POC). Experimental extras: §7.4                          │
 │   • does Storage I/O: reads /data/in, writes /data/out                   │
 │        │  ONLY channel = AF_UNIX socket (UDS)                            │
 │        ▼                                                                  │
@@ -237,41 +244,54 @@ contract is auto-derived (the user does not hand-write it; see §10), signed, an
   "scope":        { "repos": ["org/repo-X"], "writable_branches": ["agent/*"] },  // from flow
   "capabilities": ["gh.read","gh.write_branch","gh.open_pr","gh.comment","mcp.keboola.read"],
   "destinations": ["api.github.com/org/repo-X", "anthropic(via-proxy)", "<declared MCP endpoints>"],
-  "egress_budget_bits": 4096,          // repo-derived data allowed OUT to non-scope destinations
   "irreversible_gate": ["gh.merge","deploy","delete"],   // default from branch protection
   "expiry": "this_invocation"
 }
 ```
 
-### 7.2 Phase 1 — per-action gate (cheap/deterministic first)
+### 7.2 Phase 1 — per-action gate (POC: deterministic only)
 
-Every RPC from the agent runs the gate in order; the LLM step is last and **restrict-only**:
+Every RPC from the agent is checked against the frozen contract by a **deterministic** rule — no LLM
+in the path:
 
-1. **Deterministic contract check** — capability ∈ contract? destination ∈ contract? scope ok?
-   No → hard deny (no LLM, fast, provable).
-2. **Provenance check** — did this request arrive right after ingesting untrusted content? After
-   contamination the contract is **frozen** (cannot expand destinations/capabilities).
-3. **Advocate LLM (restrict-only, secret-blind)** — only for egress-shaped/sensitive actions; sees
-   the action + provenance summary (never secrets); may only *further* deny, never grant beyond the
-   contract.
-4. **Egress bit-budget** — if the action sends repo-derived data to a non-scope destination, debit;
-   deny when exhausted.
+- **capability ∈ contract?** **destination ∈ contract?** **scope ok?** No → hard deny.
+- This is exactly the "constrain egress to needed endpoints / don't expose what isn't declared"
+  control from the PR #1 review — enforced server-side at the broker, where the agent has no say.
 
 Allowed → the Advocate injects the scoped credential, performs the call itself, logs
-`{action, dest, status, bytes, tokens}`, returns the result. An `action_id` per RPC gives
-idempotency against a dropped-response double-execute.
+`{action, dest, status}`, returns the result. An `action_id` per RPC gives idempotency against a
+dropped-response double-execute.
 
-**Graduated cost:** a narrow dev agent (one repo, repo-scoped token) is fully served by layer 1 —
-layers 3–4 never fire. The LLM advocate + bit-budget engage only for broad-scope agents (multi-repo,
-sensitive MCP). Security scales with risk, not with every agent.
+For a narrow dev agent (one repo, repo-scoped token) this deterministic check is the whole gate. It is
+fast, auditable, and the only part the POC's security relies on.
 
-### 7.3 Phase 2 — session JSONL chaining (preserves the contamination clock)
+### 7.3 Phase 2 — session JSONL chaining
 
 The session JSONL is **secret-free by construction** (no secrets in the agent box), so it is safe to
-pass to the next agent/team. But for the next agent the inherited JSONL is **untrusted input**: agent
-B's contract is derived from B's own task (trusted) and the JSONL is loaded as context **after** B's
-contract is signed. If A was contaminated, its JSONL is treated as tainted by B. Provenance propagates
-along the chain; injection ingested by A cannot grant new authority to B.
+pass to the next agent/team — that is the load-bearing property. For the next agent the inherited JSONL
+is **untrusted input**: agent B's contract is derived from B's own task (trusted), and the JSONL is
+loaded as context **after** B's contract is signed, so a poisoned upstream transcript cannot widen B's
+contract. (No claim beyond that — see §7.4 on why we are *not* leaning on runtime taint-tracking.)
+
+### 7.4 Experimental extras — explicitly OUT of the POC, not relied on
+
+These were in the first draft and are **demoted** per the PR #1 review. They are recorded as possible
+future research, not security guarantees, and the POC ships without them:
+
+- **Egress "bit-budget".** Calling it *information-theoretic* was an overclaim. For a coding agent the
+  legitimate output (a PR full of code) is large and data-dependent, so a "bits of real data allowed
+  out" cap has nothing meaningful to measure; at best it is a heuristic output-size limit, and covert
+  channels (word choice, ordering) defeat the "information-theoretic" framing. **Dropped.**
+- **Secret-blind LLM "advocate" judge.** Once the floor holds (no secrets, no network) plus the
+  deterministic allowlist, an extra LLM judge is gold-plating: fuzzy, gameable, and it adds
+  latency/cost/complexity for little marginal security. **Not in the POC**; revisit only if a concrete
+  within-scope-abuse case shows the deterministic allowlist is insufficient.
+- **Runtime "provenance-freeze".** With a **static** contract derived up front (scope = repo X, never
+  expanded at runtime), there is nothing to "freeze" — the property falls out of the contract being
+  immutable. The dynamic taint-tracking version is unvalidated and **not** part of the POC.
+
+Bottom line: the POC's security = broker (token-out) + in-container sandbox (no net, no secrets) +
+deterministic scope/destination allowlist. Everything above is future work, clearly labelled.
 
 ---
 
@@ -295,18 +315,20 @@ way.)
 
 ## 9. What is provable vs heuristic (honesty)
 
+**What the POC actually relies on:**
+
 | Layer | Strength |
 |---|---|
 | seccomp `AF_INET` deny (network kill) | **provable** (kernel-enforced, guaranteed per kbc-stacks) |
 | UID + `chmod 600` + cleared env (secret-file/env) | **provable** |
 | cross-UID no-ptrace (memory) | **provable** |
 | deterministic contract check (cap/dest/scope) | **provable** |
-| provenance freeze (no expansion post-contamination) | **provable** |
-| egress bit-budget (channel capacity cap) | **provable** (information-theoretic) |
-| Advocate LLM judge | **heuristic** — restrict-only garnish, never the basis |
 
-If the LLM judge is fooled it still cannot exceed the frozen contract (layer 1) or the bit-budget
-(layer 4). The security floor is deterministic + information-theoretic; the LLM is defense-in-depth.
+That is the whole security basis: a hijacked agent has no network and no secrets, and may only call
+destinations the deterministic allowlist already permits. No probabilistic component is load-bearing.
+
+The §7.4 items (bit-budget, LLM judge, runtime provenance) are **not** in this table on purpose — they
+are future research, not guarantees, and nothing depends on them.
 
 ---
 
@@ -370,7 +392,8 @@ The floor (§5.1) needs none of these; they only decide whether we add §5.2 har
   and agent in one process. Time-gating ≠ privilege separation.
 - **LLM judge / "captcha for LLMs" as the gate:** circular if intent is self-declared at request time
   (the hijacked agent controls both action and justification); no capability gap between peer LLMs.
-  Salvaged only as the **restrict-only, provenance-fed, post-frozen-contract** layer (§7.2 step 3).
+  Considered as a restrict-only add-on, then **cut from the POC** as gold-plating (§7.4) — the
+  deterministic allowlist plus the no-secrets/no-net floor is what carries the security.
 - **Capability-grammar / hologram (synthetic-data) / quorum:** strong for "pure planner" workloads but
   over-constrain an autonomous dev agent and raise setup friction — wrong trade for this product.
 - **Separate Advocate service / full plan-v3 now:** the correct *platform* answer, but it abandons the
@@ -388,7 +411,7 @@ The floor (§5.1) needs none of these; they only decide whether we add §5.2 har
 | `src/plugin_manager.py` | Stop `{**os.environ, **env}` subprocess inheritance (secret leak); plugin install moves to the Advocate side or a netless, secret-free path. |
 | new `src/advocate/` | UDS server, Anthropic proxy, MCP/GitHub brokers, the contract gate (§7), sandbox launcher (seccomp/uid/optional-namespaces). |
 | `Dockerfile` | (optional) add `bubblewrap`/`nsjail` for §5.2; ensure parent can run as root and drop UID. |
-| tests | datadir/VCR unchanged for the happy path; add: seccomp-blocks-INET, agent-cannot-read-config, gate denies off-contract dest, provenance-freeze, bit-budget. |
+| tests | datadir/VCR unchanged for the happy path; add: seccomp-blocks-INET, agent-cannot-read-config, agent-env-has-no-secrets, gate denies off-contract dest. |
 
 ---
 

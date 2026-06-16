@@ -74,13 +74,13 @@ remains.
 
 `src/advocate/contract.py`, `src/advocate/gate.py`.
 
-- [ ] Phase 0 contract: derive from `system_prompt + task + flow ctx + declared tools`, sign, freeze.
-      (Auto-derived; no user authoring.)
-- [ ] Gate order: deterministic (cap/dest/scope) → provenance freeze → restrict-only LLM (stub/mock
-      in tests) → egress bit-budget.
-- [ ] Tests: off-contract capability/destination → hard deny; post-contamination request cannot
-      expand scope; bit-budget exhaustion denies; in-scope dev action (repo-scoped) passes on layer 1
-      alone (graduated cost).
+- [ ] Phase 0 contract: derive from `system_prompt + task + flow ctx + declared tools`, sign.
+      (Auto-derived; no user authoring. Static — not expanded at runtime.)
+- [ ] Gate: **deterministic only** — capability/destination/scope ∈ contract? else hard deny. No LLM
+      in the path (per PR #1 review; spec §7.2).
+- [ ] Tests: off-contract capability/destination → hard deny; in-scope dev action (repo-scoped) passes.
+- [ ] **Out of POC (spec §7.4), do not build now:** egress bit-budget, secret-blind LLM judge,
+      runtime provenance-freeze. Demoted to future research; nothing depends on them.
 
 ## Phase 5 — Wire `component.py` (TDD/integration)
 
@@ -93,9 +93,9 @@ remains.
 
 ## Phase 6 — Session JSONL chaining (TDD)
 
-- [ ] Confirm JSONL is secret-free by construction.
+- [ ] Confirm JSONL is secret-free by construction (the load-bearing property).
 - [ ] Next-agent contract derived from its own task; inherited JSONL loaded as **untrusted** context
-      after signing; tainted-provenance propagates.
+      after signing (so a poisoned transcript cannot widen the contract).
 - [ ] Test: a contaminated upstream JSONL cannot grant the downstream agent off-contract authority.
 
 ## Phase 7 (deferred) — Hardening & V2
@@ -114,10 +114,11 @@ remains.
 4. agent cannot read parent memory / ptrace (memory isolation)
 5. model/MCP/GitHub all work for the agent with zero secrets in its box (functionality via broker)
 6. gate denies off-contract destination/capability (deterministic)
-7. gate freezes contract after contamination (provenance)
-8. gate denies on bit-budget exhaustion (information-theoretic)
-9. dropped-response retry does not double-execute (`action_id` idempotency)
-10. contaminated session JSONL cannot expand downstream authority (chaining)
+7. dropped-response retry does not double-execute (`action_id` idempotency)
+8. contaminated session JSONL cannot expand downstream authority (chaining)
+
+(Removed from the original ledger per PR #1 review: provenance-freeze and bit-budget assertions —
+those features are out of POC scope, see spec §7.4.)
 
 ---
 
