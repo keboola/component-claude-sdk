@@ -99,12 +99,23 @@ def _scrub_config_json_impl(kbc_datadir: str) -> None:
     recursively through nested dicts and lists.  All structural config
     (storage settings, non-``#`` parameters) is left intact.
 
+    ASSUMPTION: this relies on the Keboola config schema convention that every
+    encrypted secret is stored under a ``#``-prefixed key.  A secret stored under
+    a plain key (no ``#`` prefix) would NOT be scrubbed by this function.
+
+    The write is atomic: the scrubbed content is written to a temp file in the
+    same directory and then renamed over the original with ``os.replace``.  This
+    prevents a truncated/corrupt config.json if the process crashes mid-write
+    (the keboola.component base class re-reads config.json lazily throughout the
+    run, so a corrupt file would break output promotion).
+
     Non-fatal if the file is absent or unreadable (logs at DEBUG/WARNING).
 
     This is extracted as a module-level function so tests can call it directly
     without standing up a full Component instance.
     """
     import json  # keep this import here (not top-level) to match component style
+    import tempfile
 
     config_path = os.path.join(kbc_datadir, "config.json")
 
@@ -120,8 +131,21 @@ def _scrub_config_json_impl(kbc_datadir: str) -> None:
         with open(config_path, encoding="utf-8") as fh:
             data = json.load(fh)
         scrubbed = _scrub_obj(data)
-        with open(config_path, "w", encoding="utf-8") as fh:
-            json.dump(scrubbed, fh)
+        # Write atomically: temp file in the same dir, then os.replace (POSIX rename).
+        # Keeps the same filesystem so rename is guaranteed atomic; avoids a torn
+        # write leaving keboola.component with a truncated config.json.
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=kbc_datadir, suffix=".tmp")
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                json.dump(scrubbed, fh)
+            os.replace(tmp_path, config_path)
+        except Exception:
+            # Clean up the temp file if anything goes wrong before the rename.
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
         log.debug("Scrubbed %s — decrypted #-secret values removed from disk", config_path)
     except FileNotFoundError:
         log.debug("config.json not found at %s — nothing to scrub", config_path)
@@ -147,6 +171,12 @@ def _perform_env_scrub() -> None:
     when _SCRUB_DONE_ENV is not set.  The re-exec'd process skips this function
     (guard marker is set) and reads KBC_TOKEN from fd 3.
     """
+    # Fast path: if KBC_TOKEN is not in the env there is nothing to scrub and no
+    # need to pay the cost of a full process re-exec.
+    if "KBC_TOKEN" not in os.environ:
+        log.debug("env-scrub: KBC_TOKEN not in env — skipping re-exec")
+        return
+
     token = os.environ.get("KBC_TOKEN", "")
 
     # Build a pipe: read_fd will be inherited across exec, write_fd closed after write.
