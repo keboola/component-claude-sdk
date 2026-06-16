@@ -21,7 +21,7 @@ _UPSTREAM_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0)
 _UPSTREAM_STREAM_TIMEOUT = httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=5.0)
 
 
-def handle_request(payload: dict, anthropic_key: str) -> tuple[int, dict]:
+def handle_request(payload: dict, anthropic_key: str, *, query_string: str = "") -> tuple[int, dict]:
     """Forward a validated non-streaming payload to Anthropic, injecting the API key.
 
     Idempotency: if ``payload['action_id']`` has been seen before **and that
@@ -34,6 +34,8 @@ def handle_request(payload: dict, anthropic_key: str) -> tuple[int, dict]:
             have ``stream=False`` or ``stream`` absent.
         anthropic_key: Real Anthropic API key supplied by the server; never
             sourced from ``payload``.
+        query_string: Query string from the original request path (e.g.
+            ``"beta=true"``), forwarded to the upstream as-is.
 
     Returns:
         ``(status_code, response_body_dict)`` tuple.
@@ -44,7 +46,7 @@ def handle_request(payload: dict, anthropic_key: str) -> tuple[int, dict]:
         return _idempotency_cache[action_id]
 
     try:
-        result = _call_upstream(payload, anthropic_key)
+        result = _call_upstream(payload, anthropic_key, query_string=query_string)
     except Exception:  # noqa: BLE001
         log.warning("_call_upstream raised for action_id=%s", action_id, exc_info=True)
         return 502, {"error": "upstream request failed"}
@@ -55,7 +57,37 @@ def handle_request(payload: dict, anthropic_key: str) -> tuple[int, dict]:
     return result
 
 
-def _call_upstream(payload: dict, anthropic_key: str) -> tuple[int, dict]:
+def handle_request_passthrough(payload: dict, anthropic_key: str, *, query_string: str = "") -> tuple[int, dict]:
+    """Forward a raw (no ``action_id``) Anthropic API payload to the upstream.
+
+    Used for the transparent-proxy path where the Claude Code CLI sends
+    standard Anthropic API requests directly via ``ANTHROPIC_BASE_URL``.
+    No validation, no idempotency cache — the payload is forwarded as-is
+    (``action_id`` absent, all Anthropic fields preserved).
+
+    Security properties maintained:
+    - Upstream URL is hard-pinned to ``UPSTREAM_URL`` (never from payload).
+    - Real API key is injected server-side; the caller never sees it.
+    - Transient errors return a generic 502 with no internal detail.
+
+    Args:
+        payload: Raw Anthropic API request dict.  May contain any Anthropic
+            fields; ``action_id`` is absent.
+        anthropic_key: Real Anthropic API key supplied by the server.
+        query_string: Query string from the original request path (e.g.
+            ``"beta=true"``), forwarded to the upstream as-is.
+
+    Returns:
+        ``(status_code, response_body_dict)`` tuple.
+    """
+    try:
+        return _call_upstream(payload, anthropic_key, query_string=query_string)
+    except Exception:  # noqa: BLE001
+        log.warning("_call_upstream raised in passthrough mode", exc_info=True)
+        return 502, {"error": "upstream request failed"}
+
+
+def _call_upstream(payload: dict, anthropic_key: str, *, query_string: str = "") -> tuple[int, dict]:
     """Make the actual HTTP call to Anthropic (non-streaming).
 
     The upstream URL is the module-level constant ``UPSTREAM_URL`` — it is
@@ -66,8 +98,11 @@ def _call_upstream(payload: dict, anthropic_key: str) -> tuple[int, dict]:
     the agent gets a clean error and no internal detail leaks over the socket.
 
     Args:
-        payload: Validated request dict; ``action_id`` is stripped before sending.
+        payload: Request dict; ``action_id`` is stripped before sending.
         anthropic_key: Real Anthropic API key.
+        query_string: Query string to append to the upstream URL (e.g.
+            ``"beta=true"``).  Never taken from ``payload``; sourced from the
+            original request path parsed server-side.
 
     Returns:
         ``(status_code, response_body_dict)`` tuple.
@@ -77,14 +112,20 @@ def _call_upstream(payload: dict, anthropic_key: str) -> tuple[int, dict]:
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
-    # Explicitly set stream=false for the non-streaming path so upstream always
-    # receives a clear signal regardless of what the validated payload contained.
+    # Strip broker-internal fields before forwarding; set stream=false so
+    # upstream always receives a clear non-streaming signal.
     body = {k: v for k, v in payload.items() if k != "action_id"}
     body["stream"] = False
+
+    # Append the original query string (e.g. ?beta=true) if present.
+    upstream_url = f"{UPSTREAM_URL}/v1/messages"
+    if query_string:
+        upstream_url = f"{upstream_url}?{query_string}"
+
     try:
         with httpx.Client() as client:
             resp = client.post(
-                f"{UPSTREAM_URL}/v1/messages",
+                upstream_url,
                 headers=headers,
                 json=body,
                 timeout=_UPSTREAM_TIMEOUT,
@@ -105,7 +146,7 @@ def _call_upstream(payload: dict, anthropic_key: str) -> tuple[int, dict]:
         return 502, {"error": "upstream request failed"}
 
 
-def _stream_upstream(payload: dict, anthropic_key: str) -> Iterator[bytes]:
+def _stream_upstream(payload: dict, anthropic_key: str, *, query_string: str = "") -> Iterator[bytes]:
     """Yield raw SSE byte chunks from the Anthropic upstream.
 
     The upstream URL is the module-level constant ``UPSTREAM_URL`` — NEVER
@@ -118,8 +159,11 @@ def _stream_upstream(payload: dict, anthropic_key: str) -> Iterator[bytes]:
     iteration so the caller can emit a sanitized SSE error event.
 
     Args:
-        payload: Validated request dict; ``action_id`` is stripped before sending.
+        payload: Request dict; ``action_id`` is stripped before sending.
         anthropic_key: Real Anthropic API key (injected server-side).
+        query_string: Query string to append to the upstream URL (e.g.
+            ``"beta=true"``).  Never taken from ``payload``; sourced from the
+            original request path parsed server-side.
 
     Yields:
         Raw SSE bytes as received from the upstream, chunk by chunk.
@@ -132,10 +176,15 @@ def _stream_upstream(payload: dict, anthropic_key: str) -> Iterator[bytes]:
     }
     body = {k: v for k, v in payload.items() if k != "action_id"}
 
+    # Append the original query string (e.g. ?beta=true) if present.
+    upstream_url = f"{UPSTREAM_URL}/v1/messages"
+    if query_string:
+        upstream_url = f"{upstream_url}?{query_string}"
+
     with httpx.Client() as client:
         with client.stream(
             "POST",
-            f"{UPSTREAM_URL}/v1/messages",
+            upstream_url,
             headers=headers,
             json=body,
             timeout=_UPSTREAM_STREAM_TIMEOUT,

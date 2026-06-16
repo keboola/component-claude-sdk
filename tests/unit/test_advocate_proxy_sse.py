@@ -252,7 +252,7 @@ def test_sse_mid_stream_error_is_sanitized() -> None:
 
     # Generator: yields two real SSE lines then raises with bait embedded in the message.
     # This simulates a genuine mid-iteration network error.
-    def _mid_stream_generator(payload: dict, anthropic_key: str) -> Iterator[bytes]:  # noqa: ARG001
+    def _mid_stream_generator(payload: dict, anthropic_key: str, **_kwargs: object) -> Iterator[bytes]:  # noqa: ARG001
         yield b"event: message_start\n"
         yield b'data: {"type":"message_start"}\n\n'
         # Now raise mid-iteration with bait in the exception message
@@ -308,7 +308,7 @@ def test_sse_setup_error_returns_502() -> None:
     """
     from advocate import anthropic_proxy
 
-    def _raises_at_call(payload: dict, anthropic_key: str) -> Iterator[bytes]:  # noqa: ARG001
+    def _raises_at_call(payload: dict, anthropic_key: str, **_kwargs: object) -> Iterator[bytes]:  # noqa: ARG001
         raise httpx.ConnectError(f"could not connect to {_BAIT_URL} with key={_BAIT_SECRET}")
 
     server = _make_server()
@@ -430,7 +430,7 @@ def test_sse_upstream_url_is_hardcoded() -> None:
     # (covered by existing test_schema_rejects_extra_fields)
     # Here we just verify _stream_upstream always uses UPSTREAM_URL, not a payload field
 
-    def _capturing_stream(payload: dict, anthropic_key: str):  # noqa: ANN202
+    def _capturing_stream(payload: dict, anthropic_key: str, **_kwargs: object):  # noqa: ANN202
         # Verify the function uses the module constant, not payload
         assert "base_url" not in payload
         return iter([])  # empty — we just want to capture the call

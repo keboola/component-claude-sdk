@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import threading
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import TYPE_CHECKING
 
@@ -25,6 +26,7 @@ _MAX_BODY_BYTES = 5_000_000
 _ACTION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 _MODEL_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 
+# Fields that the structured-agent path allows (action_id required).
 _ALLOWED_FIELDS = frozenset({"action_id", "model", "max_tokens", "messages", "stream", "system"})
 
 # Path suffixes that indicate a merge operation (case-insensitive).
@@ -117,13 +119,21 @@ class _Handler(BaseHTTPRequestHandler):
         log.debug(format, *args)
 
     def do_POST(self) -> None:  # noqa: N802
-        """Dispatch POST requests to the appropriate broker handler."""
+        """Dispatch POST requests to the appropriate broker handler.
+
+        The Claude Code CLI appends query parameters to the path
+        (e.g. ``/v1/messages?beta=true``).  We strip the query string for
+        routing only; the query string is forwarded to the upstream unchanged.
+        """
         log.info("broker: POST %s", self.path)
-        if self.path == "/v1/messages":
+        # Strip query string for routing (preserve for upstream forwarding).
+        parsed = urllib.parse.urlparse(self.path)
+        route_path = parsed.path
+        if route_path == "/v1/messages":
             self._handle_anthropic()
-        elif self.path == "/v1/mcp":
+        elif route_path == "/v1/mcp":
             self._handle_mcp()
-        elif self.path == "/v1/github":
+        elif route_path == "/v1/github":
             self._handle_github()
         else:
             log.warning("broker: unhandled path %s — returning 404", self.path)
@@ -162,9 +172,21 @@ class _Handler(BaseHTTPRequestHandler):
     def _handle_anthropic(self) -> None:
         """Handle POST /v1/messages — Anthropic proxy.
 
-        Dispatches to the streaming or non-streaming path based on ``stream``
-        in the validated payload.  Both paths hard-pin the upstream to
-        ``UPSTREAM_URL`` and inject the real API key server-side.
+        Two request modes are supported:
+
+        **Structured-agent mode** (``action_id`` present in body): enforces the
+        strict field allowlist and idempotency semantics.  Used by code that
+        calls the broker directly as a structured RPC (test suite, future SDK
+        integration).
+
+        **Transparent-proxy mode** (no ``action_id``): passes the full payload
+        straight through to the Anthropic upstream.  Used when the Claude Code
+        CLI hits the broker via ``ANTHROPIC_BASE_URL`` — it sends standard
+        Anthropic API payloads with no ``action_id``.  The query string from
+        the original request path (e.g. ``?beta=true``) is forwarded unchanged.
+
+        Both paths hard-pin the upstream to ``UPSTREAM_URL`` and inject the
+        real API key server-side.  The agent never sees or controls the key.
         """
         payload, err_status, err_msg = self._read_json_body()
         if payload is None:
@@ -172,26 +194,53 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond(err_status, {"error": err_msg})
             return
 
-        validated, error = _validate(payload)
-        if error:
-            self._respond(400, {"error": error})
-            return
-        assert validated is not None  # _validate returns (dict, None) or (None, str)
-
         from advocate import anthropic_proxy  # local import to keep modules decoupled  # noqa: PLC0415
 
-        if validated.get("stream"):
-            self._handle_anthropic_stream(validated, anthropic_proxy)
-        else:
-            try:
-                status, body = anthropic_proxy.handle_request(validated, self.server.anthropic_key)
-            except Exception:  # noqa: BLE001
-                log.exception("unexpected error in handle_request")
-                self._respond(500, {"error": "internal server error"})
-                return
-            self._respond(status, body)
+        # Preserve the query string from the original request path so upstream
+        # features that rely on it (e.g. ?beta=true) continue to work.
+        parsed = urllib.parse.urlparse(self.path)
+        query_string = parsed.query  # e.g. "beta=true" or ""
 
-    def _handle_anthropic_stream(self, validated: dict, anthropic_proxy: types.ModuleType) -> None:
+        if "action_id" in payload:
+            # Structured-agent path: enforce strict validation + idempotency.
+            validated, error = _validate(payload)
+            if error:
+                self._respond(400, {"error": error})
+                return
+            assert validated is not None  # _validate returns (dict, None) or (None, str)
+            if validated.get("stream"):
+                self._handle_anthropic_stream(validated, anthropic_proxy, query_string=query_string)
+            else:
+                try:
+                    status, body = anthropic_proxy.handle_request(
+                        validated, self.server.anthropic_key, query_string=query_string
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception("unexpected error in handle_request")
+                    self._respond(500, {"error": "internal server error"})
+                    return
+                self._respond(status, body)
+        else:
+            # Transparent-proxy path: forward full payload to Anthropic as-is.
+            # No action_id → no idempotency cache; safe because model calls are
+            # idempotent from the user's perspective (same input → same cost).
+            log.debug("broker: transparent-proxy request for model=%s", payload.get("model", "?"))
+            if payload.get("stream"):
+                self._handle_anthropic_stream(payload, anthropic_proxy, query_string=query_string)
+            else:
+                try:
+                    status, body = anthropic_proxy.handle_request_passthrough(
+                        payload, self.server.anthropic_key, query_string=query_string
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception("unexpected error in handle_request_passthrough")
+                    self._respond(500, {"error": "internal server error"})
+                    return
+                self._respond(status, body)
+
+    def _handle_anthropic_stream(
+        self, validated: dict, anthropic_proxy: types.ModuleType, *, query_string: str = ""
+    ) -> None:
         """Stream an SSE response from the Anthropic upstream back to the TCP client.
 
         Idempotency note: streamed responses are NOT cached in the action_id
@@ -215,7 +264,9 @@ class _Handler(BaseHTTPRequestHandler):
         POC; revisit if future work adds concurrent agent calls.
         """
         try:
-            chunk_iter = anthropic_proxy._stream_upstream(validated, self.server.anthropic_key)
+            chunk_iter = anthropic_proxy._stream_upstream(
+                validated, self.server.anthropic_key, query_string=query_string
+            )
         except Exception:  # noqa: BLE001
             log.warning("_stream_upstream setup error", exc_info=True)
             self._respond(502, {"error": "upstream request failed"})
