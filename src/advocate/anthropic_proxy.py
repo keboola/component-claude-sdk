@@ -89,6 +89,13 @@ def _call_upstream(payload: dict, anthropic_key: str) -> tuple[int, dict]:
                 json=body,
                 timeout=_UPSTREAM_TIMEOUT,
             )
+        log.info(
+            "upstream response: status=%d model=%s",
+            resp.status_code,
+            body.get("model", "?"),
+        )
+        if resp.status_code >= 400:
+            log.warning("upstream error body: %s", resp.text[:500])
         return resp.status_code, resp.json()
     except httpx.HTTPError as exc:
         log.warning("upstream HTTP error for action_id=%s: %s", payload.get("action_id"), type(exc).__name__)

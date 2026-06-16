@@ -118,6 +118,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         """Dispatch POST requests to the appropriate broker handler."""
+        log.info("broker: POST %s", self.path)
         if self.path == "/v1/messages":
             self._handle_anthropic()
         elif self.path == "/v1/mcp":
@@ -125,6 +126,7 @@ class _Handler(BaseHTTPRequestHandler):
         elif self.path == "/v1/github":
             self._handle_github()
         else:
+            log.warning("broker: unhandled path %s — returning 404", self.path)
             self._respond(404, {"error": "not found"})
 
     def _read_json_body(self) -> tuple[dict | None, int | None, str | None]:
