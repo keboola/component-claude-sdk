@@ -34,9 +34,13 @@
   written atomically (temp+rename) so the keboola.component base class continues
   reading structural config without interruption.
 
-- **Session JSONL chaining** (`src/advocate/server.py`): the Advocate tags every
-  JSONL session with a chain digest so a sequence of sessions can be verified as
-  an unbroken chain (spec §7.3).
+- **Session JSONL chaining — security invariants** (tests only, spec §7.3): the
+  session JSONL is secret-free by construction and is treated as untrusted input
+  by the next agent. The downstream contract is derived and HMAC-signed from the
+  agent's own trusted task BEFORE any inherited JSONL is loaded, so a poisoned
+  upstream transcript cannot widen authority; the deterministic gate hard-denies
+  every off-contract capability/destination regardless of transcript content.
+  Pinned by `tests/unit/test_phase6_jsonl_chaining.py`.
 
 - `scripts/sandbox_probe.py` — standalone Phase 0 diagnostic script to verify
   seccomp/setuid primitives and ptrace_scope on any Linux container. Re-run on
