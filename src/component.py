@@ -77,6 +77,10 @@ class Component(ComponentBase):
         run inside a ``try`` whose ``finally`` always flushes the transcript
         before any exception propagates (output-state durability guarantee).
         """
+        if self.configuration.parameters.get("run_netns_probe"):
+            self._run_netns_probe()
+            return
+
         config = Configuration(**self.configuration.parameters)
         logging.info("Starting Claude SDK run: %s", config.log_safe_summary())
         self._warn_if_memory_intensive(config)
@@ -94,6 +98,32 @@ class Component(ComponentBase):
             transcript.flush()
 
         self._report_outcome(results)
+
+    def _run_netns_probe(self) -> None:
+        """Gate-zero spike (advocate POC): report this job pod's capabilities and whether
+        an empty network namespace can be created (the in-container agent jail depends on
+        CAP_SYS_ADMIN). Flag-gated via ``parameters.run_netns_probe``; default off, never
+        runs in a normal agent job. Output goes to the job log."""
+        import subprocess  # noqa: PLC0415 — local import; only used by this opt-in diagnostic
+
+        logging.warning("=== GATE-ZERO NETNS PROBE (advocate POC) ===")
+        logging.warning("uid=%s euid=%s", os.getuid(), os.geteuid())
+        try:
+            with open("/proc/self/status") as fh:
+                for line in fh:
+                    if line.startswith(("CapEff", "CapBnd", "CapPrm")):
+                        logging.warning(line.strip())
+        except OSError:
+            logging.warning("could not read /proc/self/status")
+        proc = subprocess.run(
+            [sys.executable, "scripts/spike/netns_probe.py"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        for line in (proc.stdout + proc.stderr).splitlines():
+            logging.warning("probe| %s", line)
+        logging.warning("=== probe exit code: %s ===", proc.returncode)
 
     def _ensure_sdk_and_env(self, config: Configuration) -> tuple[str, PluginResult, dict[str, str]]:
         """Step 1a + 2: resolve the SDK version, prepare plugins and the env."""
