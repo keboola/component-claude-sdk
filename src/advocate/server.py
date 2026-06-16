@@ -16,6 +16,10 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# Sentinel: when the server holds no contract envelope, gating is skipped
+# (Phase 3 default behaviour preserved for tests that pre-date Phase 4).
+_NO_CONTRACT = None
+
 # Reject bodies larger than this before reading — prevents a rogue agent from
 # pinning the server thread with a multi-GB payload.
 _MAX_BODY_BYTES = 5_000_000
@@ -225,6 +229,35 @@ class _Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass  # client disconnected; nothing more we can do
 
+    def _check_gate(self, capability: str, destination: str) -> bool:
+        """Run the contract gate for a single RPC.  Return True if allowed.
+
+        When no contract envelope is configured (``_NO_CONTRACT`` sentinel),
+        the gate is a no-op and the call proceeds — this preserves Phase 3
+        default behaviour for test environments that pre-date Phase 4.
+
+        Returns ``True`` if the action passes (or there is no contract to gate
+        against); responds with 403 and returns ``False`` if denied.
+        """
+        envelope = self.server.contract_envelope
+        secret = self.server.contract_signing_secret
+        if envelope is _NO_CONTRACT or secret is None:
+            return True
+
+        from advocate import contract as _contract  # noqa: PLC0415
+        from advocate.gate import GateDenial, check_action  # noqa: PLC0415
+
+        if not _contract.verify_contract(envelope, secret):
+            log.warning("gate: contract signature verification failed — denying request")
+            self._respond(403, {"error": "contract verification failed"})
+            return False
+
+        result = check_action(envelope["contract"], capability=capability, destination=destination)
+        if isinstance(result, GateDenial):
+            self._respond(403, {"error": result.reason})
+            return False
+        return True
+
     def _handle_mcp(self) -> None:
         """Handle POST /v1/mcp — MCP broker."""
         payload, err_status, err_msg = self._read_json_body()
@@ -237,6 +270,22 @@ class _Handler(BaseHTTPRequestHandler):
         validated, error = mcp_broker.validate(payload)
         if error:
             self._respond(400, {"error": error})
+            return
+        assert validated is not None  # mcp_broker.validate returns (dict, None) or (None, str)
+
+        # Gate: derive capability from server_name (mcp.<name>), destination
+        # from the configured server URL (or "mcp-stdio" for local servers).
+        server_name: str = validated.get("server_name", "")
+        cap = f"mcp.{server_name}"
+        cfg = self.server.mcp_configs.get(server_name)
+        if cfg is not None:
+            from configuration import McpRemoteServer  # noqa: PLC0415
+
+            dest = cfg.url if isinstance(cfg, McpRemoteServer) else f"mcp-stdio:{server_name}"
+        else:
+            dest = f"mcp-stdio:{server_name}"
+
+        if not self._check_gate(cap, dest):
             return
 
         try:
@@ -259,6 +308,17 @@ class _Handler(BaseHTTPRequestHandler):
         validated, error = github_broker.validate(payload)
         if error:
             self._respond(400, {"error": error})
+            return
+        assert validated is not None  # github_broker.validate returns (dict, None) or (None, str)
+
+        # Gate: capability = gh.read for GET, gh.write_branch for mutating calls.
+        # Destination is api.github.com + path.
+        method: str = validated.get("method", "GET")
+        path: str = validated.get("path", "")
+        cap = "gh.read" if method == "GET" else "gh.write_branch"
+        dest = f"{github_broker.GITHUB_API_HOST}{path}"
+
+        if not self._check_gate(cap, dest):
             return
 
         try:
@@ -296,13 +356,20 @@ class _UnixServer(HTTPServer):
         mcp_configs: dict[str, McpStdioServer | McpRemoteServer] | None = None,
         github_token: str = "",
         github_allowed_destinations: list[str] | None = None,
+        contract_envelope: dict | None = None,
+        contract_signing_secret: bytes | None = None,
     ) -> None:
         self.anthropic_key = anthropic_key
         self.mcp_configs: dict[str, McpStdioServer | McpRemoteServer] = mcp_configs or {}
         self.github_token = github_token
-        # None = all GitHub API paths allowed (Phase 4 will narrow via contract gate);
-        # empty list = deny all.
+        # None = all GitHub API paths allowed (when no contract is set);
+        # the contract gate narrows this when a contract_envelope is provided.
         self.github_allowed_destinations: list[str] | None = github_allowed_destinations
+        # Phase 4: signed Intent Contract + secret for per-request gating.
+        # _NO_CONTRACT (None) = gate is a no-op (Phase 3 default; preserves
+        # backward compatibility for tests that pre-date Phase 4).
+        self.contract_envelope: dict | None = contract_envelope
+        self.contract_signing_secret: bytes | None = contract_signing_secret
 
         # Call BaseServer.__init__ to set up internal event/flag state (serve_forever needs it).
         # We cannot call HTTPServer.__init__ because that calls server_bind → socket.bind which
@@ -333,6 +400,8 @@ class AdvocateServer:
         mcp_configs: dict[str, McpStdioServer | McpRemoteServer] | None = None,
         github_token: str = "",
         github_allowed_destinations: list[str] | None = None,
+        contract_envelope: dict | None = None,
+        contract_signing_secret: bytes | None = None,
     ) -> None:
         """Initialise the server.
 
@@ -345,12 +414,21 @@ class AdvocateServer:
             github_token: Real GitHub PAT (never written to the socket).
             github_allowed_destinations: Optional list of allowed GitHub API
                 path prefixes.  ``None`` permits any path on ``api.github.com``.
+            contract_envelope: Signed Intent Contract envelope from
+                :func:`~advocate.contract.sign_contract`.  When ``None`` the
+                gate is a no-op (backward-compatible default).
+            contract_signing_secret: The per-invocation HMAC secret used to
+                sign ``contract_envelope``.  Must be provided together with
+                ``contract_envelope``; ignored when ``contract_envelope`` is
+                ``None``.
         """
         self._sock_path = sock_path
         self._anthropic_key = anthropic_key
         self._mcp_configs = mcp_configs or {}
         self._github_token = github_token
         self._github_allowed_destinations = github_allowed_destinations
+        self._contract_envelope = contract_envelope
+        self._contract_signing_secret = contract_signing_secret
         self._server: _UnixServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -363,6 +441,8 @@ class AdvocateServer:
             mcp_configs=self._mcp_configs,
             github_token=self._github_token,
             github_allowed_destinations=self._github_allowed_destinations,
+            contract_envelope=self._contract_envelope,
+            contract_signing_secret=self._contract_signing_secret,
         )
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
