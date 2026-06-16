@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import os
 import socket
-import tempfile
 from unittest.mock import patch
 
 import httpx
@@ -14,7 +12,7 @@ MY_VCR = vcrpy.VCR(
     cassette_library_dir="tests/unit/cassettes",
     record_mode="none",
     match_on=["method", "scheme", "host", "port", "path", "body"],
-    ignore_hosts=["localhost"],
+    ignore_hosts=["127.0.0.1"],
 )
 
 _VALID_PAYLOAD = {
@@ -25,26 +23,15 @@ _VALID_PAYLOAD = {
 }
 
 
-def _short_sock_path(name: str = "adv.sock") -> str:
-    """Return a short socket path under /tmp to stay within AF_UNIX 104-char limit."""
-    d = tempfile.mkdtemp(prefix="adv_", dir="/tmp")  # noqa: S108
-    return os.path.join(d, name)
-
-
-def _make_server(name: str = "adv.sock") -> tuple[AdvocateServer, str]:
-    """Start a server; socket binds synchronously in _UnixServer.__init__ before thread launch."""
-    sock_path = _short_sock_path(name)
-    server = AdvocateServer(sock_path, anthropic_key="dummy-key-for-test")
+def _make_server() -> AdvocateServer:
+    """Start a server on 127.0.0.1:0; port is available via server.port after start()."""
+    server = AdvocateServer(anthropic_key="dummy-key-for-test")
     server.start()
-    # No sleep needed: _UnixServer.__init__ calls socket.bind() + chmod before the
-    # daemon thread is started, so the socket file exists and is ready by the time
-    # start() returns.
-    return server, sock_path
+    return server
 
 
-def _uds_client(sock_path: str) -> httpx.Client:
-    transport = httpx.HTTPTransport(uds=sock_path)
-    return httpx.Client(transport=transport)
+def _tcp_client(port: int) -> httpx.Client:
+    return httpx.Client(base_url=f"http://127.0.0.1:{port}")
 
 
 # ---------------------------------------------------------------------------
@@ -54,13 +41,13 @@ def _uds_client(sock_path: str) -> httpx.Client:
 
 def test_schema_rejects_extra_fields() -> None:
     """Server returns 400 for any unexpected top-level key."""
-    server, sock_path = _make_server("t1.sock")
+    server = _make_server()
     try:
         payload = dict(_VALID_PAYLOAD)
         payload["upstream_override"] = "https://evil.example.com"
-        with _uds_client(sock_path) as client:
+        with _tcp_client(server.port) as client:
             resp = client.post(
-                "http://localhost/v1/messages",
+                "/v1/messages",
                 json=payload,
                 headers={"content-type": "application/json"},
             )
@@ -77,14 +64,14 @@ def test_schema_rejects_extra_fields() -> None:
 
 def test_schema_rejects_upstream_override() -> None:
     """Sending a 'base_url' or 'upstream' field is rejected with 400."""
-    server, sock_path = _make_server("t2.sock")
+    server = _make_server()
     try:
         for evil_field in ("base_url", "upstream", "api_base"):
             payload = dict(_VALID_PAYLOAD)
             payload[evil_field] = "https://evil.example.com"
-            with _uds_client(sock_path) as client:
+            with _tcp_client(server.port) as client:
                 resp = client.post(
-                    "http://localhost/v1/messages",
+                    "/v1/messages",
                     json=payload,
                     headers={"content-type": "application/json"},
                 )
@@ -94,26 +81,24 @@ def test_schema_rejects_upstream_override() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 3: Proxy turn completes via UDS with no real key (VCR replay)
+# Test 3: Proxy turn completes via TCP with no real key (VCR replay)
 # ---------------------------------------------------------------------------
 
 
 @MY_VCR.use_cassette("anthropic_proxy_turn.json")
-def test_proxy_completes_turn_via_uds() -> None:
-    """A Python UDS client (no real key) completes a model turn through the proxy."""
+def test_proxy_completes_turn_via_tcp() -> None:
+    """A Python TCP client (no real key) completes a model turn through the proxy."""
     from advocate import anthropic_proxy
 
     anthropic_proxy._idempotency_cache.clear()
 
-    sock_path = _short_sock_path("vcr.sock")
-    server = AdvocateServer(sock_path, anthropic_key="dummy-key-for-test")
+    server = AdvocateServer(anthropic_key="dummy-key-for-test")
     server.start()
     try:
         payload = dict(_VALID_PAYLOAD)
-        transport = httpx.HTTPTransport(uds=sock_path)
-        with httpx.Client(transport=transport) as client:
+        with httpx.Client(base_url=f"http://127.0.0.1:{server.port}") as client:
             resp = client.post(
-                "http://localhost/v1/messages",
+                "/v1/messages",
                 json=payload,
                 headers={"content-type": "application/json"},
             )
@@ -138,37 +123,18 @@ def test_action_id_idempotency_no_double_upstream_call() -> None:
 
     mock_result = (200, {"id": "msg_mock", "role": "assistant", "content": [{"type": "text", "text": "Hi"}]})
 
-    server, sock_path = _make_server("t4.sock")
+    server = _make_server()
     try:
         with patch.object(anthropic_proxy, "_call_upstream", return_value=mock_result) as mock_call:
             for _ in range(2):
-                with _uds_client(sock_path) as client:
+                with _tcp_client(server.port) as client:
                     resp = client.post(
-                        "http://localhost/v1/messages",
+                        "/v1/messages",
                         json=_VALID_PAYLOAD,
                         headers={"content-type": "application/json"},
                     )
                 assert resp.status_code == 200
             assert mock_call.call_count == 1, f"expected 1 upstream call, got {mock_call.call_count}"
-    finally:
-        server.stop()
-
-
-# ---------------------------------------------------------------------------
-# Test 5: Server does chmod 0o777 after bind
-# ---------------------------------------------------------------------------
-
-
-def test_server_socket_chmod_777() -> None:
-    """AdvocateServer sets socket permissions to 0o777 after binding."""
-    import stat
-
-    sock_path = _short_sock_path("perm.sock")
-    server = AdvocateServer(sock_path, anthropic_key="dummy")
-    server.start()
-    try:
-        mode = oct(stat.S_IMODE(os.stat(sock_path).st_mode))
-        assert mode == oct(0o777), f"expected 0o777, got {mode}"
     finally:
         server.stop()
 
@@ -184,16 +150,16 @@ def test_upstream_httpx_error_returns_sanitized_502() -> None:
 
     anthropic_proxy._idempotency_cache.clear()
 
-    server, sock_path = _make_server("t6.sock")
+    server = _make_server()
     try:
         with patch.object(
             anthropic_proxy,
             "_call_upstream",
             side_effect=httpx.ConnectError("connection refused to internal.example.com"),
         ):
-            with _uds_client(sock_path) as client:
+            with _tcp_client(server.port) as client:
                 resp = client.post(
-                    "http://localhost/v1/messages",
+                    "/v1/messages",
                     json=_VALID_PAYLOAD,
                     headers={"content-type": "application/json"},
                 )
@@ -221,12 +187,12 @@ def test_upstream_non_json_body_returns_sanitized_502() -> None:
     def _bad_json(payload: dict, key: str) -> tuple[int, dict]:  # noqa: ARG001
         raise ValueError("No JSON object could be decoded")
 
-    server, sock_path = _make_server("t7.sock")
+    server = _make_server()
     try:
         with patch.object(anthropic_proxy, "_call_upstream", side_effect=_bad_json):
-            with _uds_client(sock_path) as client:
+            with _tcp_client(server.port) as client:
                 resp = client.post(
-                    "http://localhost/v1/messages",
+                    "/v1/messages",
                     json=_VALID_PAYLOAD,
                     headers={"content-type": "application/json"},
                 )
@@ -251,7 +217,7 @@ def test_error_result_not_cached_retry_calls_upstream_again() -> None:
     error_result = (502, {"error": "upstream request failed"})
     success_result = (200, {"id": "msg_ok", "role": "assistant", "content": [{"type": "text", "text": "Hi"}]})
 
-    server, sock_path = _make_server("t8.sock")
+    server = _make_server()
     try:
         # First call: upstream returns 502
         # Second call (same action_id): upstream returns 200 — proves the error wasn't pinned
@@ -260,17 +226,17 @@ def test_error_result_not_cached_retry_calls_upstream_again() -> None:
             "_call_upstream",
             side_effect=[error_result, success_result],
         ) as mock_call:
-            with _uds_client(sock_path) as client:
+            with _tcp_client(server.port) as client:
                 resp1 = client.post(
-                    "http://localhost/v1/messages",
+                    "/v1/messages",
                     json=_VALID_PAYLOAD,
                     headers={"content-type": "application/json"},
                 )
             assert resp1.status_code == 502
 
-            with _uds_client(sock_path) as client:
+            with _tcp_client(server.port) as client:
                 resp2 = client.post(
-                    "http://localhost/v1/messages",
+                    "/v1/messages",
                     json=_VALID_PAYLOAD,
                     headers={"content-type": "application/json"},
                 )
@@ -289,7 +255,7 @@ def test_error_result_not_cached_retry_calls_upstream_again() -> None:
 
 def test_oversized_content_length_returns_413() -> None:
     """A Content-Length over the cap is rejected 413 before the body is read."""
-    server, sock_path = _make_server("t9.sock")
+    server = _make_server()
     try:
         # Send a real request but with an inflated Content-Length header.
         # Use raw socket so we control the header precisely.
@@ -297,14 +263,14 @@ def test_oversized_content_length_returns_413() -> None:
         oversized = 5_000_001
         raw = (
             f"POST /v1/messages HTTP/1.1\r\n"
-            f"Host: localhost\r\n"
+            f"Host: 127.0.0.1\r\n"
             f"Content-Type: application/json\r\n"
             f"Content-Length: {oversized}\r\n"
             f"\r\n"
         ).encode() + body  # actual body is tiny; server should reject on header alone
 
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.connect(sock_path)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.connect(("127.0.0.1", server.port))
             sock.sendall(raw)
             response = b""
             while True:
@@ -328,18 +294,18 @@ def test_oversized_content_length_returns_413() -> None:
 
 def test_malformed_content_length_returns_400() -> None:
     """A non-integer Content-Length header returns 400, not a ValueError crash."""
-    server, sock_path = _make_server("t10.sock")
+    server = _make_server()
     try:
         raw = (
             b"POST /v1/messages HTTP/1.1\r\n"
-            b"Host: localhost\r\n"
+            b"Host: 127.0.0.1\r\n"
             b"Content-Type: application/json\r\n"
             b"Content-Length: not-a-number\r\n"
             b"\r\n"
         )
 
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.connect(sock_path)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.connect(("127.0.0.1", server.port))
             sock.sendall(raw)
             response = b""
             while True:

@@ -1,7 +1,7 @@
 """Phase 3b: SSE streaming tests for the Anthropic proxy.
 
 Strategy: A tiny fake upstream HTTP server (threading.Thread + http.server) emits
-canned text/event-stream SSE chunks.  The UDS server under test connects to that
+canned text/event-stream SSE chunks.  The TCP server under test connects to that
 fake upstream instead of api.anthropic.com via monkeypatching UPSTREAM_URL.
 
 All tests use a dummy anthropic_key — the real key never appears in fixtures.
@@ -9,8 +9,6 @@ All tests use a dummy anthropic_key — the real key never appears in fixtures.
 
 from __future__ import annotations
 
-import os
-import tempfile
 import threading
 import time
 from collections.abc import Iterator
@@ -23,27 +21,19 @@ import httpx
 from advocate.server import AdvocateServer
 
 # ---------------------------------------------------------------------------
-# Helpers — short socket paths + UDS client
+# Helpers — TCP client
 # ---------------------------------------------------------------------------
 
 
-def _short_sock_path(name: str = "sse.sock") -> str:
-    """Return a short socket path under /tmp."""
-    d = tempfile.mkdtemp(prefix="sse_", dir="/tmp")  # noqa: S108
-    return os.path.join(d, name)
-
-
-def _make_server(name: str = "sse.sock") -> tuple[AdvocateServer, str]:
-    """Start an AdvocateServer on a UDS socket; socket is ready on return."""
-    sock_path = _short_sock_path(name)
-    server = AdvocateServer(sock_path, anthropic_key="dummy-sse-key-not-real")
+def _make_server() -> AdvocateServer:
+    """Start an AdvocateServer on 127.0.0.1:0; port is available via server.port."""
+    server = AdvocateServer(anthropic_key="dummy-sse-key-not-real")
     server.start()
-    return server, sock_path
+    return server
 
 
-def _uds_client(sock_path: str) -> httpx.Client:
-    transport = httpx.HTTPTransport(uds=sock_path)
-    return httpx.Client(transport=transport)
+def _tcp_client(port: int) -> httpx.Client:
+    return httpx.Client(base_url=f"http://127.0.0.1:{port}")
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +143,7 @@ def test_sse_streaming_delivers_chunks_incrementally() -> None:
     incrementally rather than buffered into one blob.
     """
     per_chunk_delay = 0.05  # 50 ms between upstream writes
-    server, sock_path = _make_server("t11.sock")
+    server = _make_server()
     try:
         with _fake_upstream(chunk_delay=per_chunk_delay) as upstream_url:
             with patch("advocate.anthropic_proxy.UPSTREAM_URL", upstream_url):
@@ -164,11 +154,10 @@ def test_sse_streaming_delivers_chunks_incrementally() -> None:
                     "messages": [{"role": "user", "content": "Say hello"}],
                     "stream": True,
                 }
-                transport = httpx.HTTPTransport(uds=sock_path)
-                with httpx.Client(transport=transport, timeout=30.0) as client:
+                with httpx.Client(base_url=f"http://127.0.0.1:{server.port}", timeout=30.0) as client:
                     with client.stream(
                         "POST",
-                        "http://localhost/v1/messages",
+                        "/v1/messages",
                         json=payload,
                         headers={"content-type": "application/json"},
                     ) as resp:
@@ -204,11 +193,11 @@ def test_sse_streaming_delivers_chunks_incrementally() -> None:
 
 
 def test_sse_key_injected_server_side_not_by_agent() -> None:
-    """The UDS client sends no Authorization/x-api-key; the server injects it; no key leaks to client."""
+    """The TCP client sends no Authorization/x-api-key; the server injects it; no key leaks to client."""
     _SseUpstreamHandler.last_auth_header = None
     _SseUpstreamHandler.last_api_key_header = None
 
-    server, sock_path = _make_server("t12.sock")
+    server = _make_server()
     try:
         with _fake_upstream() as upstream_url:
             with patch("advocate.anthropic_proxy.UPSTREAM_URL", upstream_url):
@@ -219,12 +208,11 @@ def test_sse_key_injected_server_side_not_by_agent() -> None:
                     "messages": [{"role": "user", "content": "Hi"}],
                     "stream": True,
                 }
-                transport = httpx.HTTPTransport(uds=sock_path)
-                with httpx.Client(transport=transport) as client:
+                with _tcp_client(server.port) as client:
                     # Agent sends NO auth headers
                     with client.stream(
                         "POST",
-                        "http://localhost/v1/messages",
+                        "/v1/messages",
                         json=payload,
                         headers={"content-type": "application/json"},
                     ) as resp:
@@ -270,7 +258,7 @@ def test_sse_mid_stream_error_is_sanitized() -> None:
         # Now raise mid-iteration with bait in the exception message
         raise httpx.ReadTimeout(f"{_BAIT_MSG} from {_BAIT_URL} with key={_BAIT_SECRET}")
 
-    server, sock_path = _make_server("t13.sock")
+    server = _make_server()
     try:
         with patch.object(anthropic_proxy, "_stream_upstream", side_effect=_mid_stream_generator):
             payload = {
@@ -280,11 +268,10 @@ def test_sse_mid_stream_error_is_sanitized() -> None:
                 "messages": [{"role": "user", "content": "Hi"}],
                 "stream": True,
             }
-            transport = httpx.HTTPTransport(uds=sock_path)
-            with httpx.Client(transport=transport) as client:
+            with _tcp_client(server.port) as client:
                 with client.stream(
                     "POST",
-                    "http://localhost/v1/messages",
+                    "/v1/messages",
                     json=payload,
                     headers={"content-type": "application/json"},
                 ) as resp:
@@ -324,7 +311,7 @@ def test_sse_setup_error_returns_502() -> None:
     def _raises_at_call(payload: dict, anthropic_key: str) -> Iterator[bytes]:  # noqa: ARG001
         raise httpx.ConnectError(f"could not connect to {_BAIT_URL} with key={_BAIT_SECRET}")
 
-    server, sock_path = _make_server("t13b.sock")
+    server = _make_server()
     try:
         with patch.object(anthropic_proxy, "_stream_upstream", side_effect=_raises_at_call):
             payload = {
@@ -334,10 +321,9 @@ def test_sse_setup_error_returns_502() -> None:
                 "messages": [{"role": "user", "content": "Hi"}],
                 "stream": True,
             }
-            transport = httpx.HTTPTransport(uds=sock_path)
-            with httpx.Client(transport=transport) as client:
+            with _tcp_client(server.port) as client:
                 resp = client.post(
-                    "http://localhost/v1/messages",
+                    "/v1/messages",
                     json=payload,
                     headers={"content-type": "application/json"},
                 )
@@ -365,7 +351,7 @@ def test_non_streaming_path_unaffected_by_phase3b() -> None:
 
     mock_result = (200, {"id": "msg_noss", "role": "assistant", "content": [{"type": "text", "text": "Hi"}]})
 
-    server, sock_path = _make_server("t14.sock")
+    server = _make_server()
     try:
         with patch.object(anthropic_proxy, "_call_upstream", return_value=mock_result) as mock_call:
             payload = {
@@ -375,11 +361,10 @@ def test_non_streaming_path_unaffected_by_phase3b() -> None:
                 "messages": [{"role": "user", "content": "Hi"}],
                 # stream omitted → defaults to False
             }
-            transport = httpx.HTTPTransport(uds=sock_path)
             for _ in range(2):
-                with httpx.Client(transport=transport) as client:
+                with _tcp_client(server.port) as client:
                     resp = client.post(
-                        "http://localhost/v1/messages",
+                        "/v1/messages",
                         json=payload,
                         headers={"content-type": "application/json"},
                     )
@@ -398,7 +383,7 @@ def test_non_streaming_path_unaffected_by_phase3b() -> None:
 
 def test_sse_streaming_does_not_use_idempotency_cache() -> None:
     """Repeated stream=true calls with same action_id each hit upstream (no cache)."""
-    server, sock_path = _make_server("t15.sock")
+    server = _make_server()
     try:
         call_count = 0
 
@@ -411,12 +396,11 @@ def test_sse_streaming_does_not_use_idempotency_cache() -> None:
                     "messages": [{"role": "user", "content": "Hi"}],
                     "stream": True,
                 }
-                transport = httpx.HTTPTransport(uds=sock_path)
                 for _ in range(2):
-                    with httpx.Client(transport=transport) as client:
+                    with _tcp_client(server.port) as client:
                         with client.stream(
                             "POST",
-                            "http://localhost/v1/messages",
+                            "/v1/messages",
                             json=payload,
                             headers={"content-type": "application/json"},
                         ) as resp:
@@ -451,7 +435,7 @@ def test_sse_upstream_url_is_hardcoded() -> None:
         assert "base_url" not in payload
         return iter([])  # empty — we just want to capture the call
 
-    server, sock_path = _make_server("t16.sock")
+    server = _make_server()
     try:
         with patch.object(anthropic_proxy, "_stream_upstream", side_effect=_capturing_stream):
             payload = {
@@ -461,11 +445,10 @@ def test_sse_upstream_url_is_hardcoded() -> None:
                 "messages": [{"role": "user", "content": "Hi"}],
                 "stream": True,
             }
-            transport = httpx.HTTPTransport(uds=sock_path)
-            with httpx.Client(transport=transport) as client:
+            with _tcp_client(server.port) as client:
                 with client.stream(
                     "POST",
-                    "http://localhost/v1/messages",
+                    "/v1/messages",
                     json=payload,
                     headers={"content-type": "application/json"},
                 ) as resp:

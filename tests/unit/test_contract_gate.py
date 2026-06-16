@@ -7,13 +7,11 @@ Security load-bearing assertions (spec §7, must stay green):
 4. Contract tamper (modify a field, signature no longer verifies) → rejected.
 5. Denial is a clean error, not a crash, and does not leak secrets/internal detail.
 6. Derivation is deterministic (same inputs → same contract/signature).
-7. Gate via UDS — contract-gated server rejects off-contract GitHub/MCP calls as 403.
+7. Gate via TCP — contract-gated server rejects off-contract GitHub/MCP calls as 403.
 """
 
 from __future__ import annotations
 
-import os
-import tempfile
 from unittest.mock import patch
 
 import httpx
@@ -89,14 +87,8 @@ def _make_stdio_server(name: str) -> object:
     return McpStdioServer(name=name, command="cat", args=[], env={})
 
 
-def _short_sock_path(name: str = "gate.sock") -> str:
-    d = tempfile.mkdtemp(prefix="gatetest_", dir="/tmp")  # noqa: S108
-    return os.path.join(d, name)
-
-
-def _uds_client(sock_path: str) -> httpx.Client:
-    transport = httpx.HTTPTransport(uds=sock_path)
-    return httpx.Client(transport=transport)
+def _tcp_client(port: int) -> httpx.Client:
+    return httpx.Client(base_url=f"http://127.0.0.1:{port}")
 
 
 # ---------------------------------------------------------------------------
@@ -458,7 +450,7 @@ class TestIsIrreversible:
 
 
 # ---------------------------------------------------------------------------
-# 6. Gate wired into AdvocateServer via UDS (end-to-end)
+# 6. Gate wired into AdvocateServer via TCP (end-to-end)
 # ---------------------------------------------------------------------------
 
 
@@ -466,7 +458,7 @@ class TestGateViaUds:
     """The AdvocateServer must gate GitHub and MCP calls against the contract
     when a signed contract envelope is configured."""
 
-    def _make_server_with_contract(self, sock_path: str) -> tuple:
+    def _make_server_with_contract(self) -> tuple:
         """Return (server, secret, envelope) for a server gated to ``org/repo-X``."""
         from advocate.server import AdvocateServer
 
@@ -476,12 +468,12 @@ class TestGateViaUds:
         envelope = sign_contract(c, secret)
 
         server = AdvocateServer(
-            sock_path,
             anthropic_key="dummy",
             github_token="dummy-gh-token",
             contract_envelope=envelope,
             contract_signing_secret=secret,
         )
+        server.start()
         return server, secret, envelope
 
     def test_in_scope_github_get_passes_gate(self) -> None:
@@ -490,9 +482,7 @@ class TestGateViaUds:
         from advocate.brokers import github_broker
 
         idempotency.clear()
-        sock_path = _short_sock_path("gate_allow.sock")
-        server, _secret, _env = self._make_server_with_contract(sock_path)
-        server.start()
+        server, _secret, _env = self._make_server_with_contract()
 
         mock_result = (200, {"id": 1, "full_name": "org/repo-X"})
         try:
@@ -502,9 +492,9 @@ class TestGateViaUds:
                     "method": "GET",
                     "path": "/repos/org/repo-X",
                 }
-                with _uds_client(sock_path) as client:
+                with _tcp_client(server.port) as client:
                     resp = client.post(
-                        "http://localhost/v1/github",
+                        "/v1/github",
                         json=payload,
                         headers={"content-type": "application/json"},
                     )
@@ -520,14 +510,12 @@ class TestGateViaUds:
         """
         from advocate.server import AdvocateServer
 
-        sock_path = _short_sock_path("gate_deny_cap.sock")
         cfg = _make_cfg(github_enabled=False)  # no GH caps
         c = derive_contract(cfg)
         secret = new_invocation_secret()
         envelope = sign_contract(c, secret)
 
         server = AdvocateServer(
-            sock_path,
             anthropic_key="dummy",
             github_token="dummy",
             contract_envelope=envelope,
@@ -541,9 +529,9 @@ class TestGateViaUds:
                 "path": "/repos/org/repo-X/git/refs",
                 "body": {"ref": "refs/heads/agent/test", "sha": "abc123"},
             }
-            with _uds_client(sock_path) as client:
+            with _tcp_client(server.port) as client:
                 resp = client.post(
-                    "http://localhost/v1/github",
+                    "/v1/github",
                     json=payload,
                     headers={"content-type": "application/json"},
                 )
@@ -560,18 +548,16 @@ class TestGateViaUds:
         from advocate import idempotency
 
         idempotency.clear()
-        sock_path = _short_sock_path("gate_deny_dest.sock")
-        server, _s, _e = self._make_server_with_contract(sock_path)
-        server.start()
+        server, _s, _e = self._make_server_with_contract()
         try:
             payload = {
                 "action_id": "gate-deny-dest-1",
                 "method": "GET",
                 "path": "/repos/org/repo-X-evil/contents",
             }
-            with _uds_client(sock_path) as client:
+            with _tcp_client(server.port) as client:
                 resp = client.post(
-                    "http://localhost/v1/github",
+                    "/v1/github",
                     json=payload,
                     headers={"content-type": "application/json"},
                 )
@@ -585,7 +571,6 @@ class TestGateViaUds:
         """A server configured with a tampered contract envelope must deny all calls."""
         from advocate.server import AdvocateServer
 
-        sock_path = _short_sock_path("gate_tamper.sock")
         cfg = _make_cfg(github_enabled=True)
         c = derive_contract(cfg, operates_on="org/repo-X")
         secret = new_invocation_secret()
@@ -595,7 +580,6 @@ class TestGateViaUds:
         envelope["contract"]["capabilities"].append("gh.merge")
 
         server = AdvocateServer(
-            sock_path,
             anthropic_key="dummy",
             github_token="dummy",
             contract_envelope=envelope,
@@ -608,9 +592,9 @@ class TestGateViaUds:
                 "method": "GET",
                 "path": "/repos/org/repo-X",
             }
-            with _uds_client(sock_path) as client:
+            with _tcp_client(server.port) as client:
                 resp = client.post(
-                    "http://localhost/v1/github",
+                    "/v1/github",
                     json=payload,
                     headers={"content-type": "application/json"},
                 )
@@ -627,9 +611,8 @@ class TestGateViaUds:
         from advocate.server import AdvocateServer
 
         idempotency.clear()
-        sock_path = _short_sock_path("gate_compat.sock")
         # No contract_envelope / secret → gate is a no-op.
-        server = AdvocateServer(sock_path, anthropic_key="dummy", github_token="dummy")
+        server = AdvocateServer(anthropic_key="dummy", github_token="dummy")
         server.start()
 
         mock_result = (200, {"id": 99})
@@ -640,9 +623,9 @@ class TestGateViaUds:
                     "method": "GET",
                     "path": "/repos/any/repo",
                 }
-                with _uds_client(sock_path) as client:
+                with _tcp_client(server.port) as client:
                     resp = client.post(
-                        "http://localhost/v1/github",
+                        "/v1/github",
                         json=payload,
                         headers={"content-type": "application/json"},
                     )
@@ -672,7 +655,6 @@ class TestFailClosed:
 
         with pytest.raises(ValueError, match="both be provided together or both omitted"):
             AdvocateServer(
-                "/tmp/unused.sock",  # noqa: S108
                 anthropic_key="dummy",
                 github_token="dummy",
                 contract_envelope=envelope,
@@ -687,7 +669,6 @@ class TestFailClosed:
 
         with pytest.raises(ValueError, match="both be provided together or both omitted"):
             AdvocateServer(
-                "/tmp/unused.sock",  # noqa: S108
                 anthropic_key="dummy",
                 github_token="dummy",
                 contract_envelope=None,  # mismatch → must raise
@@ -700,7 +681,7 @@ class TestFailClosed:
         This tests the in-handler defence-in-depth; the constructor guard above is
         the primary protection, but _check_gate must not allow-all as a fallback.
         """
-        from advocate.server import _Handler, _UnixServer
+        from advocate.server import _Handler, _TcpServer
 
         cfg = _make_cfg(github_enabled=True)
         c = derive_contract(cfg, operates_on="org/repo-X")
@@ -708,13 +689,10 @@ class TestFailClosed:
         envelope = sign_contract(c, secret)
 
         # Bypass the AdvocateServer constructor check by directly constructing
-        # _UnixServer (which does NOT validate the mismatch — only AdvocateServer
+        # _TcpServer (which does NOT validate the mismatch — only AdvocateServer
         # does).  This simulates a future code path that might bypass the outer guard.
-        sock_path = _short_sock_path("gate_failclosed.sock")
-        # _UnixServer does not have the same mismatch guard, so we can construct it
-        # with a mismatched pair to exercise _check_gate's own defence.
-        unix_server = _UnixServer(
-            sock_path,
+        tcp_server = _TcpServer(
+            ("127.0.0.1", 0),
             _Handler,
             "dummy-key",
             github_token="dummy",
@@ -723,9 +701,9 @@ class TestFailClosed:
         )
 
         # Simulate calling _check_gate directly by creating a minimal _Handler instance.
-        # We reach in via a unit-test shim rather than a live UDS round-trip.
+        # We reach in via a unit-test shim rather than a live TCP round-trip.
         handler = _Handler.__new__(_Handler)
-        handler.server = unix_server  # type: ignore[attr-defined]
+        handler.server = tcp_server  # type: ignore[attr-defined]
 
         denied_responses: list[tuple[int, dict]] = []
 
@@ -741,7 +719,7 @@ class TestFailClosed:
         status, body = denied_responses[0]
         assert status == 403
         assert "error" in body
-        unix_server.socket.close()
+        tcp_server.socket.close()
 
 
 # ---------------------------------------------------------------------------
@@ -792,14 +770,12 @@ class TestGithubCapabilityMapping:
         from advocate.server import AdvocateServer
 
         idempotency.clear()
-        sock_path = _short_sock_path("cap_delete.sock")
         cfg = _make_cfg(github_enabled=True)
         c = derive_contract(cfg, operates_on="org/repo-X")
         secret = new_invocation_secret()
         envelope = sign_contract(c, secret)
 
         server = AdvocateServer(
-            sock_path,
             anthropic_key="dummy",
             github_token="dummy",
             contract_envelope=envelope,
@@ -812,9 +788,9 @@ class TestGithubCapabilityMapping:
                 "method": "DELETE",
                 "path": "/repos/org/repo-X",
             }
-            with _uds_client(sock_path) as client:
+            with _tcp_client(server.port) as client:
                 resp = client.post(
-                    "http://localhost/v1/github",
+                    "/v1/github",
                     json=payload,
                     headers={"content-type": "application/json"},
                 )
@@ -832,14 +808,12 @@ class TestGithubCapabilityMapping:
         from advocate.server import AdvocateServer
 
         idempotency.clear()
-        sock_path = _short_sock_path("cap_merge.sock")
         cfg = _make_cfg(github_enabled=True)
         c = derive_contract(cfg, operates_on="org/repo-X")
         secret = new_invocation_secret()
         envelope = sign_contract(c, secret)
 
         server = AdvocateServer(
-            sock_path,
             anthropic_key="dummy",
             github_token="dummy",
             contract_envelope=envelope,
@@ -852,9 +826,9 @@ class TestGithubCapabilityMapping:
                 "method": "PUT",
                 "path": "/repos/org/repo-X/pulls/42/merge",
             }
-            with _uds_client(sock_path) as client:
+            with _tcp_client(server.port) as client:
                 resp = client.post(
-                    "http://localhost/v1/github",
+                    "/v1/github",
                     json=payload,
                     headers={"content-type": "application/json"},
                 )
@@ -871,14 +845,12 @@ class TestGithubCapabilityMapping:
         from advocate.server import AdvocateServer
 
         idempotency.clear()
-        sock_path = _short_sock_path("cap_write.sock")
         cfg = _make_cfg(github_enabled=True)
         c = derive_contract(cfg, operates_on="org/repo-X")
         secret = new_invocation_secret()
         envelope = sign_contract(c, secret)
 
         server = AdvocateServer(
-            sock_path,
             anthropic_key="dummy",
             github_token="dummy",
             contract_envelope=envelope,
@@ -894,9 +866,9 @@ class TestGithubCapabilityMapping:
                     "path": "/repos/org/repo-X/git/refs",
                     "body": {"ref": "refs/heads/agent/test", "sha": "abc123"},
                 }
-                with _uds_client(sock_path) as client:
+                with _tcp_client(server.port) as client:
                     resp = client.post(
-                        "http://localhost/v1/github",
+                        "/v1/github",
                         json=payload,
                         headers={"content-type": "application/json"},
                     )

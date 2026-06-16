@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
-import socket
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import TYPE_CHECKING
@@ -111,9 +109,9 @@ def _validate(raw: dict) -> tuple[dict | None, str | None]:
 
 
 class _Handler(BaseHTTPRequestHandler):
-    """HTTP request handler for the UDS Advocate server."""
+    """HTTP request handler for the TCP Advocate server."""
 
-    server: _UnixServer  # type: ignore[assignment]
+    server: _TcpServer  # type: ignore[assignment]
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: ANN002  # type: ignore[override]
         log.debug(format, *args)
@@ -192,7 +190,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond(status, body)
 
     def _handle_anthropic_stream(self, validated: dict, anthropic_proxy: types.ModuleType) -> None:
-        """Stream an SSE response from the Anthropic upstream back to the UDS client.
+        """Stream an SSE response from the Anthropic upstream back to the TCP client.
 
         Idempotency note: streamed responses are NOT cached in the action_id
         idempotency store.  A model call has no external side-effect beyond cost
@@ -397,14 +395,15 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
 
-class _UnixServer(HTTPServer):
-    """HTTPServer bound to a Unix domain socket."""
+class _TcpServer(HTTPServer):
+    """HTTPServer bound to loopback TCP — never 0.0.0.0; no external exposure."""
 
+    # Bind to loopback only — never 0.0.0.0; no external exposure.
     allow_reuse_address = True
 
     def __init__(
         self,
-        sock_path: str,
+        server_address: tuple[str, int],
         handler: type,
         anthropic_key: str,
         *,
@@ -426,30 +425,14 @@ class _UnixServer(HTTPServer):
         self.contract_envelope: dict | None = contract_envelope
         self.contract_signing_secret: bytes | None = contract_signing_secret
 
-        # Call BaseServer.__init__ to set up internal event/flag state (serve_forever needs it).
-        # We cannot call HTTPServer.__init__ because that calls server_bind → socket.bind which
-        # we want to do ourselves with AF_UNIX.
-        from socketserver import BaseServer  # noqa: PLC0415
-
-        BaseServer.__init__(self, sock_path, handler)
-        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.socket.bind(sock_path)
-        os.chmod(sock_path, 0o777)  # noqa: S103 — intentional world-writable socket for container-internal IPC
-        self.server_activate()
-
-    def server_bind(self) -> None:
-        """No-op: socket is bound in __init__."""
-
-    def server_close(self) -> None:
-        self.socket.close()
+        HTTPServer.__init__(self, server_address, handler)
 
 
 class AdvocateServer:
-    """UDS HTTP server for the Advocate Broker."""
+    """Loopback TCP HTTP server for the Advocate Broker."""
 
     def __init__(
         self,
-        sock_path: str,
         anthropic_key: str,
         *,
         mcp_configs: dict[str, McpStdioServer | McpRemoteServer] | None = None,
@@ -461,7 +444,6 @@ class AdvocateServer:
         """Initialise the server.
 
         Args:
-            sock_path: Path for the Unix domain socket.
             anthropic_key: Real Anthropic API key (never written to the socket).
             mcp_configs: Mapping of server name → MCP server config.  The
                 configs hold secrets (``env``/``headers``) that are injected
@@ -486,20 +468,19 @@ class AdvocateServer:
                 "provided together or both omitted; "
                 "providing one without the other would silently disable the gate"
             )
-        self._sock_path = sock_path
         self._anthropic_key = anthropic_key
         self._mcp_configs = mcp_configs or {}
         self._github_token = github_token
         self._github_allowed_destinations = github_allowed_destinations
         self._contract_envelope = contract_envelope
         self._contract_signing_secret = contract_signing_secret
-        self._server: _UnixServer | None = None
+        self._server: _TcpServer | None = None
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        """Bind the Unix domain socket, chmod 0o777, then start serving in a daemon thread."""
-        self._server = _UnixServer(
-            self._sock_path,
+        """Bind to 127.0.0.1:0 (OS-assigned port), then start serving in a daemon thread."""
+        self._server = _TcpServer(
+            ("127.0.0.1", 0),
             _Handler,
             self._anthropic_key,
             mcp_configs=self._mcp_configs,
@@ -510,7 +491,14 @@ class AdvocateServer:
         )
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
-        log.info("AdvocateServer started on %s", self._sock_path)
+        log.info("AdvocateServer started on 127.0.0.1:%d", self.port)
+
+    @property
+    def port(self) -> int:
+        """Return the bound TCP port (available after start() is called)."""
+        if self._server is None:
+            raise RuntimeError("server not started")
+        return self._server.server_address[1]
 
     def stop(self) -> None:
         """Shut down the server, background thread, and all MCP subprocesses."""

@@ -1,9 +1,9 @@
-"""Phase 3 broker tests — MCP and GitHub/HTTP over UDS.
+"""Phase 3 broker tests — MCP and GitHub/HTTP over TCP.
 
 Security load-bearing assertions (must stay green):
-(a) MCP RPC via UDS with no secret in the client env succeeds (broker injects
+(a) MCP RPC via TCP with no secret in the client env succeeds (broker injects
     secret server-side).
-(b) GitHub REST via UDS with no token in the client env succeeds (token injected
+(b) GitHub REST via TCP with no token in the client env succeeds (token injected
     server-side).
 (c) Off-config / off-allowlist destination is hard-denied (no SSRF) — the
     denial is a clean tool error, not a crash.
@@ -15,7 +15,6 @@ Security load-bearing assertions (must stay green):
 from __future__ import annotations
 
 import os
-import tempfile
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -30,7 +29,7 @@ MY_VCR = vcrpy.VCR(
     cassette_library_dir="tests/unit/cassettes",
     record_mode="none",
     match_on=["method", "scheme", "host", "port", "path"],
-    ignore_hosts=["localhost"],
+    ignore_hosts=["127.0.0.1"],
 )
 
 
@@ -39,14 +38,15 @@ MY_VCR = vcrpy.VCR(
 # ---------------------------------------------------------------------------
 
 
-def _short_sock_path(name: str = "broker.sock") -> str:
-    d = tempfile.mkdtemp(prefix="brk_", dir="/tmp")  # noqa: S108
-    return os.path.join(d, name)
+def _make_server(**kwargs) -> AdvocateServer:  # noqa: ANN003
+    """Start an AdvocateServer on 127.0.0.1:0; port is available via server.port."""
+    server = AdvocateServer(**kwargs)
+    server.start()
+    return server
 
 
-def _uds_client(sock_path: str) -> httpx.Client:
-    transport = httpx.HTTPTransport(uds=sock_path)
-    return httpx.Client(transport=transport)
+def _tcp_client(port: int) -> httpx.Client:
+    return httpx.Client(base_url=f"http://127.0.0.1:{port}")
 
 
 def _make_mcp_config(name: str = "my-mcp", secret_env_key: str = "MCP_SECRET") -> MagicMock:
@@ -530,16 +530,10 @@ class TestMcpViaUds:
         )
         mcp_configs = {"my-mcp": real_cfg}
 
-        sock_path = _short_sock_path("mcp_e2e.sock")
-        server = AdvocateServer(
-            sock_path,
-            anthropic_key="dummy",
-            mcp_configs=mcp_configs,
-        )
-        server.start()
+        server = _make_server(anthropic_key="dummy", mcp_configs=mcp_configs)
 
         # Patch mcp_broker.handle_request to return a mock result (we're testing
-        # the UDS dispatch, not the subprocess I/O).
+        # the TCP dispatch, not the subprocess I/O).
         mock_response = (200, {"jsonrpc": "2.0", "id": 1, "result": {"tools": []}})
 
         try:
@@ -553,9 +547,9 @@ class TestMcpViaUds:
                     "server_name": "my-mcp",
                     "method": "tools/list",
                 }
-                with _uds_client(sock_path) as client:
+                with _tcp_client(server.port) as client:
                     resp = client.post(
-                        "http://localhost/v1/mcp",
+                        "/v1/mcp",
                         json=payload,
                         headers={"content-type": "application/json"},
                     )
@@ -569,9 +563,7 @@ class TestMcpViaUds:
     def test_mcp_uds_rejects_extra_field(self) -> None:
         """UDS /v1/mcp returns 400 for unexpected fields (hijack attempt)."""
         idempotency.clear()
-        sock_path = _short_sock_path("mcp_extra.sock")
-        server = AdvocateServer(sock_path, anthropic_key="dummy")
-        server.start()
+        server = _make_server(anthropic_key="dummy")
         try:
             payload = {
                 "action_id": "x1",
@@ -579,9 +571,9 @@ class TestMcpViaUds:
                 "method": "tools/list",
                 "INJECT": "evil",
             }
-            with _uds_client(sock_path) as client:
+            with _tcp_client(server.port) as client:
                 resp = client.post(
-                    "http://localhost/v1/mcp",
+                    "/v1/mcp",
                     json=payload,
                     headers={"content-type": "application/json"},
                 )
@@ -603,14 +595,11 @@ class TestGithubViaUds:
         """
         idempotency.clear()
 
-        sock_path = _short_sock_path("gh_e2e.sock")
-        server = AdvocateServer(
-            sock_path,
+        server = _make_server(
             anthropic_key="dummy",
             github_token="server-side-github-token",
             github_allowed_destinations=None,
         )
-        server.start()
 
         mock_response = (200, {"id": 123, "name": "repo-x", "full_name": "org/repo-x"})
 
@@ -626,9 +615,9 @@ class TestGithubViaUds:
                     "method": "GET",
                     "path": "/repos/org/repo-x",
                 }
-                with _uds_client(sock_path) as client:
+                with _tcp_client(server.port) as client:
                     resp = client.post(
-                        "http://localhost/v1/github",
+                        "/v1/github",
                         json=payload,
                         headers={"content-type": "application/json"},
                     )
@@ -643,14 +632,11 @@ class TestGithubViaUds:
         """Off-allowlist GitHub destination via UDS returns 403 (no SSRF)."""
         idempotency.clear()
 
-        sock_path = _short_sock_path("gh_ssrf.sock")
-        server = AdvocateServer(
-            sock_path,
+        server = _make_server(
             anthropic_key="dummy",
             github_token="server-side-token",
             github_allowed_destinations=["/repos/org/allowed-repo"],
         )
-        server.start()
 
         try:
             payload = {
@@ -658,9 +644,9 @@ class TestGithubViaUds:
                 "method": "GET",
                 "path": "/repos/evil/stolen-data",
             }
-            with _uds_client(sock_path) as client:
+            with _tcp_client(server.port) as client:
                 resp = client.post(
-                    "http://localhost/v1/github",
+                    "/v1/github",
                     json=payload,
                     headers={"content-type": "application/json"},
                 )
@@ -675,9 +661,7 @@ class TestGithubViaUds:
     def test_github_uds_rejects_extra_field(self) -> None:
         """UDS /v1/github returns 400 for unexpected fields (hijack attempt)."""
         idempotency.clear()
-        sock_path = _short_sock_path("gh_extra.sock")
-        server = AdvocateServer(sock_path, anthropic_key="dummy", github_token="dummy")
-        server.start()
+        server = _make_server(anthropic_key="dummy", github_token="dummy")
         try:
             payload = {
                 "action_id": "g_x1",
@@ -685,9 +669,9 @@ class TestGithubViaUds:
                 "path": "/repos/org/repo",
                 "upstream_override": "https://evil.com",
             }
-            with _uds_client(sock_path) as client:
+            with _tcp_client(server.port) as client:
                 resp = client.post(
-                    "http://localhost/v1/github",
+                    "/v1/github",
                     json=payload,
                     headers={"content-type": "application/json"},
                 )
@@ -909,9 +893,7 @@ class TestAdvocateServerShutdownWiring:
         mcp_broker._procs["wired-mcp"] = mock_proc
         mcp_broker._proc_locks["wired-mcp"] = threading.Lock()
 
-        sock_path = _short_sock_path("shutdown_wiring.sock")
-        server = AdvocateServer(sock_path, anthropic_key="dummy")
-        server.start()
+        server = _make_server(anthropic_key="dummy")
 
         server.stop()
 
