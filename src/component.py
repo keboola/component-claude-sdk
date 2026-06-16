@@ -4,6 +4,20 @@ A highly configurable Claude Agent SDK runner inside Keboola. ``run()`` is a thi
 orchestrator (spec §6.1) delegating to private methods; the SDK boundary lives in
 ``ClaudeRunner`` and the runtime SDK overlay (``SdkVersionManager``) runs first so
 any overlay is on ``sys.path`` before a single ``claude_agent_sdk`` symbol is used.
+
+Boot sequence (Broker V0, spec §6):
+
+1.  Read config.json → Configuration.
+2.  Unlink /data/config.json — agent cannot read decrypted secrets.
+3.  Env-scrub re-exec — KBC_TOKEN removed from Advocate exec-time environ so
+    /proc/<advocate>/environ does not expose it; KBC_TOKEN passed back in via an
+    inherited fd (pipe) so the Advocate retains it in memory.
+4.  Derive + sign the Intent Contract (Phase 0).
+5.  Start AdvocateServer on loopback TCP 127.0.0.1:<port>.
+6.  Build CLEARED agent env: ANTHROPIC_BASE_URL=loopback, dummy ANTHROPIC_API_KEY,
+    writable /tmp caches — NO real key, NO KBC_TOKEN, NO github_token.
+7.  Run tasks via ClaudeRunner (SDK spawns the CLI with the cleared env).
+8.  Parent promotes outputs, tears down server (always, via finally).
 """
 
 from __future__ import annotations
@@ -59,6 +73,145 @@ UV_CACHE_DIR = "/tmp/uv-cache"  # noqa: S108
 NPM_CONFIG_CACHE = "/tmp/npm-cache"  # noqa: S108
 XDG_CACHE_HOME = "/tmp/xdg-cache"  # noqa: S108
 
+# Dummy API key placed in the CLEARED agent env.  The agent never sees the real
+# key; the AdvocateServer proxy strips this and injects the real key server-side.
+_DUMMY_ANTHROPIC_KEY = "dummy-advocate-key"  # noqa: S105 — intentionally fake/not a real credential
+
+# Guard env-var used by the env-scrub re-exec path to avoid an infinite loop.
+# When present (= "1"), the entry-point knows a scrub has already happened and
+# skips re-execing again.
+_SCRUB_DONE_ENV = "_ADVOCATE_ENV_SCRUB_DONE"
+
+# Pipe fd number reserved for passing KBC_TOKEN back after env-scrub.
+# We always use fd 3 (first non-standard fd above stderr=2).
+_KBC_TOKEN_PIPE_FD = 3
+
+
+log = logging.getLogger(__name__)
+
+
+def _scrub_config_json_impl(kbc_datadir: str) -> None:
+    """Overwrite ``<kbc_datadir>/config.json`` with a secrets-scrubbed copy.
+
+    Any key whose name starts with ``#`` has its value replaced with ``""``
+    (preserving the key so downstream validation that checks for its presence
+    still passes, but removing the decrypted value from disk).  Applied
+    recursively through nested dicts and lists.  All structural config
+    (storage settings, non-``#`` parameters) is left intact.
+
+    Non-fatal if the file is absent or unreadable (logs at DEBUG/WARNING).
+
+    This is extracted as a module-level function so tests can call it directly
+    without standing up a full Component instance.
+    """
+    import json  # keep this import here (not top-level) to match component style
+
+    config_path = os.path.join(kbc_datadir, "config.json")
+
+    def _scrub_obj(obj: object) -> object:
+        """Recursively replace #-key values with empty strings."""
+        if isinstance(obj, dict):
+            return {k: ("" if isinstance(k, str) and k.startswith("#") else _scrub_obj(v)) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_scrub_obj(item) for item in obj]
+        return obj
+
+    try:
+        with open(config_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        scrubbed = _scrub_obj(data)
+        with open(config_path, "w", encoding="utf-8") as fh:
+            json.dump(scrubbed, fh)
+        log.debug("Scrubbed %s — decrypted #-secret values removed from disk", config_path)
+    except FileNotFoundError:
+        log.debug("config.json not found at %s — nothing to scrub", config_path)
+    except OSError as exc:
+        log.warning("Could not scrub config.json at %s: %s", config_path, exc)
+
+
+def _perform_env_scrub() -> None:
+    """Re-exec the current process with KBC_TOKEN stripped from the environment.
+
+    /proc/<advocate>/environ is readable by the same-uid agent (ptrace_scope=1
+    does not gate /proc/<pid>/environ — confirmed on-platform, spec §5.1 pt3).
+    If KBC_TOKEN stays in the exec-time env it leaks to the agent.
+
+    Mitigation:
+    1. Open a pipe; write KBC_TOKEN to the write end.
+    2. Re-exec sys.argv with a scrubbed env (KBC_TOKEN removed, _SCRUB_DONE_ENV=1)
+       but with the pipe's READ fd inherited (fd 3).
+    3. After re-exec the caller reads KBC_TOKEN back from fd 3 and holds it
+       in memory only (never in /proc/<advocate>/environ again).
+
+    This function should be called ONCE at process start, before anything else,
+    when _SCRUB_DONE_ENV is not set.  The re-exec'd process skips this function
+    (guard marker is set) and reads KBC_TOKEN from fd 3.
+    """
+    token = os.environ.get("KBC_TOKEN", "")
+
+    # Build a pipe: read_fd will be inherited across exec, write_fd closed after write.
+    read_fd, write_fd = os.pipe()
+
+    # Write the token to the pipe (non-blocking; token is small).
+    try:
+        os.write(write_fd, token.encode("utf-8"))
+    finally:
+        os.close(write_fd)
+
+    # Build scrubbed environment: remove KBC_TOKEN, mark scrub done.
+    scrubbed_env = {k: v for k, v in os.environ.items() if k != "KBC_TOKEN"}
+    scrubbed_env[_SCRUB_DONE_ENV] = "1"
+
+    # Ensure read_fd is at fd position _KBC_TOKEN_PIPE_FD (3).
+    # dup2 reassigns without closing the target; close original if different.
+    if read_fd != _KBC_TOKEN_PIPE_FD:
+        os.dup2(read_fd, _KBC_TOKEN_PIPE_FD)
+        os.close(read_fd)
+    # else: already at fd 3; no dup needed
+
+    # Prevent fd 3 from being auto-closed on exec (no CLOEXEC).
+    # os.pipe() sets O_CLOEXEC on Linux by default; clear it so it survives exec.
+    import fcntl
+
+    flags = fcntl.fcntl(_KBC_TOKEN_PIPE_FD, fcntl.F_GETFD)
+    fcntl.fcntl(_KBC_TOKEN_PIPE_FD, fcntl.F_SETFD, flags & ~fcntl.FD_CLOEXEC)
+
+    # Re-exec this process with the scrubbed env.  execv replaces the process image;
+    # if it succeeds this line is never reached.  If it fails (exec error), we fall
+    # through and continue without the scrub (graceful degradation).
+    log.info("env-scrub: re-execing with KBC_TOKEN stripped from exec-time env")
+    try:
+        os.execve(sys.executable, [sys.executable] + sys.argv, scrubbed_env)
+    except OSError as exc:
+        # execve failed (rare: missing interpreter, permissions).  Clean up the pipe
+        # fd and continue without scrub — the Advocate still runs but KBC_TOKEN
+        # remains in /proc/self/environ.  Log loudly so this is not silent.
+        os.close(_KBC_TOKEN_PIPE_FD)
+        log.warning(
+            "env-scrub: re-exec failed (%s); KBC_TOKEN remains in /proc/self/environ — "
+            "pair with a least-privilege Storage token as interim mitigation (spec §5.1 pt3)",
+            exc,
+        )
+
+
+def _read_kbc_token_from_pipe() -> str:
+    """After a successful env-scrub re-exec, read KBC_TOKEN back from the inherited pipe.
+
+    The re-exec'ing process wrote the token to the write end of the pipe and then
+    closed it; after exec the write end is gone (was closed before exec) so a single
+    os.read returns the full token (EOF follows immediately).
+
+    Returns the token string, or "" if the fd is not open / empty.
+    """
+    try:
+        data = os.read(_KBC_TOKEN_PIPE_FD, 4096)
+        os.close(_KBC_TOKEN_PIPE_FD)
+        return data.decode("utf-8")
+    except OSError:
+        # fd not open — either env-scrub was skipped or this is not the re-exec'd
+        # process; fall back gracefully.
+        return ""
+
 
 class Component(ComponentBase):
     """Orchestrates a configured Claude agent run over Keboola data."""
@@ -71,7 +224,17 @@ class Component(ComponentBase):
         self._runner = ClaudeRunner(workspace_dir=WORKSPACE_DIR)
 
     def run(self) -> None:
-        """Orchestrate the run: ensure SDK, prepare env, run tasks, finalize.
+        """Orchestrate the Broker V0 boot sequence, task loop, and output promotion.
+
+        Boot sequence (spec §6):
+        1.  Read config.json → Configuration (secrets loaded into memory).
+        2.  Unlink /data/config.json — same-uid agent cannot read it.
+        3.  (Env-scrub handled at process entry — see module-level boot code.)
+        4.  Derive + sign the Intent Contract (Phase 0, clean).
+        5.  Start AdvocateServer on loopback TCP 127.0.0.1:<port>.
+        6.  Build CLEARED agent env (no secrets; loopback routing).
+        7.  Run tasks via ClaudeRunner.  Outputs promoted by parent (step 11).
+        8.  Tear down server (always, via finally).
 
         The ``write_always`` transcript tables MUST be flushed even when a task
         loop or output promotion raises, so the per-task work and ``promote()``
@@ -87,38 +250,90 @@ class Component(ComponentBase):
             self._run_advocate_probe()
             return
 
+        # Step 1: Parse config (reads decrypted secrets into memory).
         config = Configuration(**self.configuration.parameters)
-        logging.info("Starting Claude SDK run: %s", config.log_safe_summary())
+        log.info("Starting Claude SDK run: %s", config.log_safe_summary())
         self._warn_if_memory_intensive(config)
 
-        sdk_version, plugin_result, env = self._ensure_sdk_and_env(config)
+        # Step 2: Scrub /data/config.json — remove decrypted #-secret values.
+        # The keboola.component base class re-reads config.json lazily throughout
+        # the run (for output manifests etc.), so we CANNOT safely unlink it.
+        # Instead we OVERWRITE it with a secrets-scrubbed copy that retains all
+        # structural config (storage, tables, etc.) but replaces #-key values with
+        # empty strings.  The agent is spawned later with the scrubbed file on disk;
+        # the real values are held only in the ``config`` Python object (spec §5.1 pt1).
+        self._scrub_config_json()
+
+        # Steps 4–8 are handled by the main orchestration path.
+        self._run_with_broker(config)
+
+    def _run_with_broker(self, config: Configuration) -> None:
+        """Run the full Broker V0 boot sequence: contract, server, tasks, teardown.
+
+        Separated from ``run()`` so tests can call it directly with a config
+        object (bypassing the config.json read/unlink), and to keep each step
+        clearly delineated for review.
+        """
+        from advocate.contract import derive_contract, new_invocation_secret, sign_contract
+        from advocate.server import AdvocateServer
+
+        # Step 4: Derive + sign the Intent Contract (Phase 0 — clean data only).
+        secret = new_invocation_secret()
+        contract = derive_contract(config, operates_on=config.operates_on)
+        envelope = sign_contract(contract, secret)
+
+        # Step 5: Build the MCP configs dict for the server.
+        mcp_configs = {server.name: server for server in config.mcp_servers}
+
+        # Start the loopback-TCP AdvocateServer.
+        server = AdvocateServer(
+            config.anthropic_key,
+            mcp_configs=mcp_configs,
+            github_token=config.github_token,
+            github_allowed_destinations=None,  # no per-repo restriction when operates_on is None
+            contract_envelope=envelope,
+            contract_signing_secret=secret,
+        )
+        server.start()
+        port = server.port
+        log.info("AdvocateServer running on 127.0.0.1:%d", port)
+
+        sdk_version, plugin_result, cleared_env = self._ensure_sdk_and_env(config, port)
         transcript = self._build_transcript(config, sdk_version, plugin_result.resolved)
         tasks = TaskSource(config).load(self.get_input_tables_definitions())
 
         results: list[ClaudeRunResult] = []
         try:
             for task in tasks:
-                results.append(self._run_one_task(task, config, plugin_result.sdk_plugins, env, transcript))
+                results.append(self._run_one_task(task, config, plugin_result.sdk_plugins, cleared_env, transcript))
             self._output_writer.promote(default_incremental=config.output.default_incremental)
         finally:
             transcript.flush()
+            server.stop()
 
         self._report_outcome(results)
 
-    def _ensure_sdk_and_env(self, config: Configuration) -> tuple[str, PluginResult, dict[str, str]]:
-        """Step 1a + 2: resolve the SDK version, prepare plugins and the env."""
+    def _ensure_sdk_and_env(self, config: Configuration, proxy_port: int) -> tuple[str, PluginResult, dict[str, str]]:
+        """Resolve SDK version, install plugins (Advocate side), build cleared env.
+
+        Plugin install happens HERE — on the Advocate side — while secrets are
+        still available (github_token for private plugins).  The cleared env passed
+        to the agent carries ONLY routing values, no raw secrets (spec §14).
+        """
         sdk_version = self._sdk_manager.ensure(config.sdk_version, config.sdk_version_on_failure.value)
-        env = self._build_env(config)
+        cleared_env = self._build_cleared_env(config, proxy_port)
         for cache_dir in (AGENT_HOME, UV_CACHE_DIR, NPM_CONFIG_CACHE, XDG_CACHE_HOME):
             os.makedirs(cache_dir, exist_ok=True)
+        # Plugin install env has access to github_token (private plugin auth)
+        # but is built from the minimal _plugin_install_env helper (§14 fix).
         plugin_result = self._plugin_manager.prepare(
-            config.plugins, env, github_token=config.github_token, secret_values=self._secret_values(config)
+            config.plugins, cleared_env, github_token=config.github_token, secret_values=self._secret_values(config)
         )
         os.makedirs(WORKSPACE_DIR, exist_ok=True)
         self._output_writer.ensure_dir()
         if config.workspace_input_files:
             self._stage_input_files()
-        return sdk_version, plugin_result, env
+        return sdk_version, plugin_result, cleared_env
 
     @staticmethod
     def _warn_if_memory_intensive(config: Configuration) -> None:
@@ -163,19 +378,59 @@ class Component(ComponentBase):
             shutil.copy2(src, os.path.join(WORKSPACE_DIR, name))
             staged += 1
         if staged:
-            logging.info("Staged %d input file(s) into the agent workspace.", staged)
+            log.info("Staged %d input file(s) into the agent workspace.", staged)
 
     @staticmethod
-    def _build_env(config: Configuration) -> dict[str, str]:
-        """Build the subprocess env (secrets injected; never logged).
+    def _scrub_config_json() -> None:
+        """Overwrite /data/config.json with a secrets-scrubbed copy.
 
-        Besides the Anthropic/GitHub secrets, this redirects the agent-runtime
-        launchers' caches and HOME to the writable ``/tmp`` (the image root is
-        read-only at runtime). Without this, ``uvx``/``npx`` MCP servers fail to
-        initialise their cache and never launch (Finding 5).
+        The Keboola platform decrypts ``#``-prefixed secret fields into
+        config.json before the container starts.  We MUST remove the plaintext
+        secret values before spawning the agent subprocess, so the same-uid agent
+        cannot read them from disk.
+
+        We CANNOT simply unlink the file because the ``keboola.component`` base
+        class (``ComponentBase.configuration``) re-reads config.json lazily
+        throughout the run — for output manifests, state writes, etc. — and will
+        raise ``FileNotFoundError`` if the file is gone.
+
+        Instead we OVERWRITE with a scrubbed copy: any key whose name starts with
+        ``#`` has its value replaced with an empty string (preserving the key
+        presence so validation that checks for the key's existence still passes,
+        but removing the decrypted value from disk).  All structural config
+        (storage, tables, parameters without ``#``) is preserved unchanged.
+
+        The real secret values remain only in the ``Configuration`` Python object
+        held in the Advocate process memory (spec §5.1 pt1 / §6 step 3).
+        """
+        kbc_datadir = os.environ.get("KBC_DATADIR", "/data")
+        _scrub_config_json_impl(kbc_datadir)
+
+    @staticmethod
+    def _build_cleared_env(config: Configuration, proxy_port: int) -> dict[str, str]:
+        """Build the CLEARED agent subprocess env (spec §6 step 7).
+
+        The agent env carries ONLY:
+        - ANTHROPIC_BASE_URL pointing at the loopback proxy (not the real API).
+        - A DUMMY ANTHROPIC_API_KEY — the real key is injected server-side.
+        - Writable /tmp caches for uvx/npx MCP launchers (Finding 5).
+        - CLAUDE_CODE_DISABLE_AUTO_MEMORY=1.
+        - Best-effort MCP proxy env (TODO: confirmed routing TBD on-platform §8).
+
+        What is EXPLICITLY absent:
+        - KBC_TOKEN (env-scrubbed from Advocate; never in agent env)
+        - Real #anthropic_key (held by AdvocateServer; agent uses dummy)
+        - GITHUB_TOKEN / GH_TOKEN (brokered server-side; never in agent env)
+        - Any MCP server secret env values (injected server-side)
+
+        NOTE: MCP/GitHub CLI wiring via MCP_PROXY_URL / HTTPS_PROXY is MARKED for
+        on-platform confirmation (spec §8).  The Anthropic path is the confirmed
+        working channel for V0.
         """
         env: dict[str, str] = {
-            "ANTHROPIC_API_KEY": config.anthropic_key,
+            # Loopback proxy — agent model calls land here; real key injected server-side.
+            "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{proxy_port}",
+            "ANTHROPIC_API_KEY": _DUMMY_ANTHROPIC_KEY,
             "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
             # Writable HOME + caches for the read-only image (Finding 5).
             "HOME": AGENT_HOME,
@@ -183,9 +438,17 @@ class Component(ComponentBase):
             "NPM_CONFIG_CACHE": NPM_CONFIG_CACHE,
             "XDG_CACHE_HOME": XDG_CACHE_HOME,
         }
-        if config.github_token:
-            env["GITHUB_TOKEN"] = config.github_token
-            env["GH_TOKEN"] = config.github_token
+        # MCP proxy wiring — best-effort; mechanism confirmed via binary probe but
+        # end-to-end validation pending on-platform (spec §8 NOTE).
+        # TODO: confirm MCP_PROXY_URL routing on-platform before GA.
+        if config.mcp_servers:
+            env["MCP_PROXY_URL"] = f"http://127.0.0.1:{proxy_port}/v1/mcp"
+
+        # GitHub: no GITHUB_TOKEN / GH_TOKEN in the agent env.
+        # GitHub API calls are brokered via /v1/github on the loopback server.
+        # The github-shim / HTTPS_PROXY path (spec §8) needs on-platform validation.
+        # TODO: confirm GitHub CLI routing on-platform.
+
         return env
 
     def _build_transcript(
@@ -208,7 +471,7 @@ class Component(ComponentBase):
         transcript: TranscriptWriter,
     ) -> ClaudeRunResult:
         """Run one task inside its own event loop, teeing messages to the transcript."""
-        logging.info("Running task '%s'.", task.task_id)
+        log.info("Running task '%s'.", task.task_id)
         options = self._runner.build_options(task, config, plugin_paths, env)
         transcript.begin_task(task.task_id)
         result = asyncio.run(self._runner.run_task(task, options, on_message=transcript.on_message))
@@ -223,7 +486,7 @@ class Component(ComponentBase):
         if failed:
             details = "; ".join(f"{r.task_id}: {r.error_message or r.subtype}" for r in failed)
             raise UserException(f"{len(failed)} of {len(results)} task(s) failed: {details}")
-        logging.info("All %d task(s) completed successfully.", len(results))
+        log.info("All %d task(s) completed successfully.", len(results))
 
     def _run_advocate_probe(self) -> None:
         """TEMPORARY/PROBE — Phase 5a-runtime egress-capability probe.
@@ -233,10 +496,10 @@ class Component(ComponentBase):
         affected: this branch is only entered when ``__advocate_runtime_probe`` is
         truthy in ``parameters``.
         """
-        logging.info("[advocate-probe] probe mode active — skipping normal agent run")
+        log.info("[advocate-probe] probe mode active — skipping normal agent run")
         out_tables = self.tables_out_path
         summary = run_probe(out_tables)
-        logging.info("[advocate-probe] probe complete; recommendation=%s", summary.get("recommendation"))
+        log.info("[advocate-probe] probe complete; recommendation=%s", summary.get("recommendation"))
 
     @sync_action("testConnection")
     def test_connection(self):
@@ -245,7 +508,37 @@ class Component(ComponentBase):
         return check_anthropic_connection(config.anthropic_key)
 
 
+# ---------------------------------------------------------------------------
+# Broker V0 entry-point boot: env-scrub guard
+# ---------------------------------------------------------------------------
+# This runs when the module is imported as __main__ (i.e. the component entry
+# point).  It must run BEFORE any Keboola component infrastructure reads config
+# or spawns anything.
+#
+# The guard ensures env-scrub happens exactly once:
+# - First exec (no _SCRUB_DONE_ENV): _perform_env_scrub() re-execs the process
+#   with KBC_TOKEN stripped.  execve() replaces the process image; the code
+#   below the call never runs in the first instance.
+# - Second exec (_SCRUB_DONE_ENV=1): _read_kbc_token_from_pipe() recovers the
+#   token from the inherited fd.  Normal startup continues.
+#
+# KBC_TOKEN is not used directly by the component code (Storage I/O is handled
+# by the keboola.component base class which reads it from os.environ).  After
+# env-scrub the token is NOT in os.environ, so we re-inject it here so the
+# base class can still find it.
 if __name__ == "__main__":
+    if os.environ.get(_SCRUB_DONE_ENV) != "1":
+        # First exec: perform the env-scrub re-exec.
+        # _perform_env_scrub() calls os.execve() and never returns on success.
+        # On failure it logs a warning and falls through to normal startup.
+        _perform_env_scrub()
+        # If we reach here execve failed — start normally without scrub.
+    else:
+        # Re-exec'd process: read KBC_TOKEN back from the inherited pipe fd.
+        kbc_token = _read_kbc_token_from_pipe()
+        if kbc_token:
+            os.environ["KBC_TOKEN"] = kbc_token
+
     try:
         comp = Component()
         comp.execute_action()

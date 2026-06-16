@@ -277,10 +277,15 @@ class PluginManager:
         source: str,
         check: bool = True,
     ) -> subprocess.CompletedProcess:
-        """Run a ``claude`` CLI command, logging scrubbed output."""
+        """Run a ``claude`` CLI command, logging scrubbed output.
+
+        Uses ``_plugin_install_env`` (§14 fix) so the subprocess receives only
+        a minimal, explicit env — never the full ``os.environ`` which contains
+        KBC_TOKEN and other platform-injected secrets.
+        """
         cmd = [_resolve_claude_cli(), *args]
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, **env})
+            proc = subprocess.run(cmd, capture_output=True, text=True, env=self._plugin_install_env(env))
         except OSError as exc:
             # FileNotFoundError / PermissionError on launch — surface as a clean
             # UserException (exit 1) instead of an unhandled crash (exit 2).
@@ -295,6 +300,29 @@ class PluginManager:
                 f"Plugin command 'claude {' '.join(args)}' failed for source '{source}': {scrubbed_err.strip()}"
             )
         return proc
+
+    @staticmethod
+    def _plugin_install_env(agent_env: dict[str, str]) -> dict[str, str]:
+        """Build a minimal env for the plugin install subprocess.
+
+        Plugin install runs on the Advocate side (trusted, has network) but must
+        not inherit the full os.environ into the subprocess — that would leak
+        KBC_TOKEN and other platform-injected secrets into the CLI child process
+        where they may appear in /proc/<pid>/environ or error dumps.
+
+        We pass only:
+        - The plugin-specific vars already in agent_env (CLAUDE_CONFIG_DIR etc.)
+        - PATH so the CLI can find git/system tools
+        - GITHUB_TOKEN/GH_TOKEN from agent_env (already there for private plugins)
+
+        This is the §14 fix: stop {**os.environ, **env} subprocess inheritance.
+        """
+        install_env = dict(agent_env)
+        # Always include PATH so the CLI can find git, node, etc.
+        path = os.environ.get("PATH", "")
+        if path:
+            install_env.setdefault("PATH", path)
+        return install_env
 
     def _scrub(self, text: str | None) -> str:
         """Redact every known secret value from text destined for a log/message."""

@@ -227,6 +227,12 @@ class Configuration(BaseModel):
     task_id_filter: str | list[str] | None = None
     task: TaskConfig = Field(default_factory=TaskConfig)
 
+    # --- intent contract scope (spec §10) ---
+    operates_on: str | None = None
+    """Optional ``org/repo`` target the agent operates on; used by the Advocate to narrow
+    the contract destination to a specific GitHub repo. When None, the contract scope is
+    broad (api.github.com with no repo restriction). See spec §10."""
+
     def __init__(self, **data):
         try:
             super().__init__(**data)
