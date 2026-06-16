@@ -19,6 +19,8 @@ SECRETS_FILE = REPO_ROOT / "secrets.json"
 
 def _load_anthropic_key() -> str:
     """Load the real Anthropic API key from secrets.json (loaded at runtime, never echoed)."""
+    if not SECRETS_FILE.exists():
+        pytest.skip("secrets.json not present — skipping live integration test")
     with open(SECRETS_FILE, encoding="utf-8") as fh:
         secrets = json.load(fh)
     key = secrets.get("parameters", {}).get("#anthropic_key", "")
