@@ -500,6 +500,61 @@ The floor (§5.1) needs none of these; they only decide whether we add §5.2 har
 4. **Precedent** — does any existing component already do nested in-container sandboxing we should
    follow instead of reinventing?
 
+### 12.5 Phase 0 findings — local Docker probe (2026-06-16)
+
+> Environment: `python:3.14-slim`, run as root, `--read-only --tmpfs /tmp:exec`.
+> Machine: `aarch64` (Docker Desktop / macOS host). Script: `scripts/sandbox_probe.py`.
+> This is the LOCAL DOCKER result — the platform (kbc-stacks) run is separate.
+
+**Floor verdict: HOLDS. Proceed to Phase 1.**
+
+| Check | Result | Notes |
+|---|---|---|
+| `seccomp` blocks `socket(AF_INET)` | **PASS** | Child gets EACCES (errno 13) |
+| `AF_UNIX` works under seccomp | **PASS** | Full socketpair roundtrip succeeds |
+| seccomp inherited across `exec` | **PASS** | Grandchild python -c sees the block |
+| root → `setuid(65534)` drop | **PASS** | euid=65534 confirmed in child |
+| unpriv child cannot read root-owned 600 file | **PASS** | PermissionError as expected |
+
+**§5.2 namespace probes (optional hardening):**
+
+| Namespace | Available | Notes |
+|---|---|---|
+| `CLONE_NEWNET` | No (EPERM) | Docker Desktop default seccomp profile blocks `unshare` |
+| `CLONE_NEWNS` | No (EPERM) | Same |
+| `CLONE_NEWPID` | No (EPERM) | Same |
+
+Namespace unavailability is expected for Docker Desktop on macOS; the production `kbc-stacks` runtime
+(runc on Linux) is the relevant environment — probe must be rerun there (cf. open question 1 above).
+The floor does **not** depend on namespaces.
+
+**seccomp implementation choice:**
+
+`pyseccomp` did not install with `libseccomp2` alone (no prebuilt wheel for Python 3.14 on aarch64);
+`pip install pyseccomp` fails without a C toolchain. **Decision: use `ctypes`-based raw BPF builder**
+(zero runtime dependency, no system packages, no image size impact). The probe's
+`_build_bpf_program()` + `install_seccomp_filter()` are the prototype for Phase 1's
+`src/advocate/sandbox.py::build_seccomp_filter()`.
+
+Raw probe output:
+
+```json
+{
+  "machine": "aarch64",
+  "euid": 0,
+  "seccomp_impl": "ctypes-bpf",
+  "pyseccomp_probe": {"available": false, "conclusion": "no prebuilt wheel; ctypes-bpf is the right choice"},
+  "seccomp_inet_blocked":     {"pass": true},
+  "af_unix_ok":               {"pass": true},
+  "seccomp_exec_inherited":   {"pass": true},
+  "setuid_drop_ok":           {"pass": true},
+  "unpriv_cannot_read_config":{"pass": true},
+  "unshare": {"net": {"available": false}, "mount": {"available": false}, "pid": {"available": false}},
+  "floor_holds": true,
+  "floor_summary": "PASS"
+}
+```
+
 ---
 
 ## 13. Discarded alternatives (and why)

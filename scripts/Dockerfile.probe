@@ -1,0 +1,26 @@
+# Throwaway image for the Phase 0 sandbox probe.
+# Mirrors the production base exactly (python:3.14-slim, root, read-only fs).
+#
+# Build & run:
+#   docker build -f scripts/Dockerfile.probe -t sandbox-probe .
+#   docker run --rm --read-only --tmpfs /tmp:exec sandbox-probe
+#
+# Expected output: a JSON findings report to stdout; DEBUG logs to stderr.
+FROM python:3.14-slim
+
+# Probe pyseccomp availability while we have the network.
+# We deliberately attempt to pip-install it WITHOUT a C toolchain first —
+# if only the runtime lib (libseccomp2) is needed, it succeeds.
+# If it needs gcc/libseccomp-dev, it will fail loudly here, confirming we must
+# fall back to the ctypes-BPF impl (which has no deps).
+#
+# Result is captured in the probe's pyseccomp_probe.available field; either way
+# the probe runs (it always uses ctypes-BPF for the actual filter).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libseccomp2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --quiet pyseccomp 2>&1 | tail -5 || true
+
+COPY scripts/sandbox_probe.py /probe/sandbox_probe.py
+
+CMD ["python", "-u", "/probe/sandbox_probe.py"]
