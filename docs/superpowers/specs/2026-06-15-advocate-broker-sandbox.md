@@ -15,6 +15,15 @@
 > bit-budget *information-theoretic* — it is at best a heuristic size cap, and inapplicable to a
 > coding agent whose legitimate output is large). They are demoted to §7.4 as **explicitly out-of-POC,
 > unvalidated experiments** and are not relied on for any security property.
+>
+> Revision 2026-06-16c (PR #1 discussion): reframed around **what the broker actually protects**. The
+> broker is a bounded, high-value mechanism, not a general "secrets are safe" guarantee — it cleanly
+> covers exactly **three** credential paths (Anthropic, Keboola Storage, GitHub **PAT**). GitHub **App**
+> install tokens are only protected if the Advocate owns the token exchange; everything else (arbitrary
+> third-party APIs, other MCP secrets, user-pasted secrets) is **explicitly unprotected** in the POC.
+> Added the two structural limits that bound it (per-service plumbing; credential-returning auth flows)
+> and elevated **controlled egress** as the general answer for everything the broker can't cover. The
+> single most useful framing of this whole spec now lives in **§8.1–8.3** — read that first.
 
 ---
 
@@ -310,6 +319,67 @@ Consequence: even if `claude-sdk`'s `permission_mode`/`allowed_tools`/`settings_
 buggy, there is nothing in the agent box to steal and nowhere to send it. `claude-sdk` is reduced to a
 loop engine. (This also makes the Advocate engine-agnostic — a non-Claude runner plugs in the same
 way.)
+
+---
+
+## 8.1 What the broker actually protects (POC scope — read this first)
+
+The broker is **not** a general "secrets are safe" mechanism, and overselling it that way is what makes
+it feel like a lot of machinery for little gain. Stated honestly it is a **cheap, bounded, high-value**
+control: it cleanly protects a credential only when **three** properties all hold —
+
+1. **platform-injected** — the agent never legitimately needs to *read* the value (it just needs the
+   *effect* of a call made with it);
+2. **pinnable upstream** — the secret targets one known host the Advocate can hard-code;
+3. **static or Advocate-owned lifecycle** — the secret is never *returned* to the agent in a response
+   (see §8.2.2).
+
+Exactly three credentials in this component satisfy all three, so **the POC builds these three brokers
+and nothing else.** For each, a hijacked agent — even with a shell and full internet — leaks at most a
+dummy header plus data, never a reusable credential.
+
+| Credential | Mechanism | Protected? | Caveat |
+|---|---|---|---|
+| Anthropic `#anthropic_key` | UDS proxy injects the key; the agent holds a **dummy** key; upstream pinned to `api.anthropic.com` | **Yes** — static, never in the box | the proxy MUST pin its own upstream and never forward to an agent-supplied host, or the real key leaks |
+| Keboola `KBC_TOKEN` | parent does all Storage I/O (`/data/in`→`/data/out`); Keboola MCP brokered to the stack `connection.*` host | **Yes** — the agent does not need it by default | highest blast radius (whole project) → pair with a **least-privilege Storage token** |
+| GitHub **PAT** | token injected server-side; upstream pinned to `api.github.com` | **Yes** — static | use a **fine-grained, repo-scoped** PAT |
+| GitHub **App** install token | `POST /app/installations/{id}/access_tokens` **returns the token in the response body** | **Only if** the Advocate performs the exchange itself and never forwards the token | if the agent is allowed to trigger the exchange, the install token lands in its context → **unprotected** |
+| Everything else — Salesforce & arbitrary third-party APIs, other MCP server secrets, **secrets a user pastes into the prompt** | — | **No** (POC) | covered only by §8.3 (controlled egress) |
+
+### 8.2 Two limits that bound the broker (why it is only three paths)
+
+1. **Per-service plumbing does not scale.** "Inject the secret safely" requires pinning the upstream
+   *and* understanding the call shape — inherently per-service. A generic inject-by-host proxy stops
+   *theft* but not *authority abuse* (a hijacked agent driving the legitimate token against
+   attacker-chosen operations), and still needs a host→secret map per service. So brokering is viable
+   only for a small, known set — not for "an agent that can call anything."
+2. **Credential-returning auth flows break outbound injection.** The broker assumes secrets flow
+   *outbound only*. Refresh / login / STS / `AssumeRole` / Salesforce-`login()` / GitHub-App-token
+   endpoints **return a live credential in the response**. If the Advocate forwards that response, the
+   new token lands in the agent's context — the broker protected the old secret and handed over the new
+   one. The only fix that preserves "no secret in the box" is for the Advocate to **own the entire auth
+   lifecycle** for that service (perform the refresh/login itself, keep the result, inject it on the
+   agent's subsequent calls, never forward a raw token) — which is more per-service intelligence, i.e.
+   limit 1 again.
+
+### 8.3 The general answer for everything the broker can't cover: controlled egress
+
+Credential-hiding (the broker) is the wrong primitive for arbitrary services, returned credentials, and
+user-pasted secrets. The mechanism that covers **all** of them uniformly is **controlled egress**: let
+the agent hold whatever secret it needs, but enforce — *outside* the agent, via a VM + egress allowlist
+(the E2B/V2 path, §11) or a forced forward-proxy it cannot bypass — that it can reach only an
+allowlisted set of hosts (`api.salesforce.com` and nothing else). This protects the **send**, not the
+**holding**, so it does not care what the secret is or where it came from — including refreshed tokens
+and secrets a user pasted into the prompt — at the cost of a coarse per-config host allowlist instead of
+per-service broker code. For a *general* runner this is the honest boundary; the broker is the right
+tool only for the narrow, known three above.
+
+**Rejected — prompt-based protection.** Injecting a secret into the agent's context wrapped in a strong
+"never reveal or transmit this" instruction is **not** a security boundary: a prompt instruction is
+overridden by prompt injection by definition, and the agent can still leak via encoding or any allowed
+tool. It is recorded here only to be explicitly ruled out. The orthogonal damage-cap that *is* always
+worth applying — independent of mechanism — is **least-privilege, short-TTL / scoped tokens**: it caps
+blast radius if a secret is exposed, but does not prevent the exposure.
 
 ---
 
