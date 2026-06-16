@@ -10,6 +10,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    import types
+
     from configuration import McpRemoteServer, McpStdioServer
 
 log = logging.getLogger(__name__)
@@ -71,8 +73,8 @@ def _validate(raw: dict) -> tuple[dict | None, str | None]:
         return None, "stream: must be bool"
 
     validated = dict(raw)
-    validated["stream"] = False  # Phase 2: non-streaming only; Phase 3 lifts this for SSE
-    log.debug("stream forced to False (Phase 2); Phase 3 will enable SSE streaming")
+    # Phase 3b: stream=True is now honoured for SSE passthrough.
+    # Absent/false → non-streaming JSON path with idempotency cache.
     return validated, None
 
 
@@ -126,7 +128,12 @@ class _Handler(BaseHTTPRequestHandler):
         return payload, None, None
 
     def _handle_anthropic(self) -> None:
-        """Handle POST /v1/messages — Anthropic proxy."""
+        """Handle POST /v1/messages — Anthropic proxy.
+
+        Dispatches to the streaming or non-streaming path based on ``stream``
+        in the validated payload.  Both paths hard-pin the upstream to
+        ``UPSTREAM_URL`` and inject the real API key server-side.
+        """
         payload, err_status, err_msg = self._read_json_body()
         if payload is None:
             self._respond(err_status, {"error": err_msg})
@@ -136,16 +143,82 @@ class _Handler(BaseHTTPRequestHandler):
         if error:
             self._respond(400, {"error": error})
             return
+        assert validated is not None  # _validate returns (dict, None) or (None, str)
 
         from advocate import anthropic_proxy  # local import to keep modules decoupled  # noqa: PLC0415
 
+        if validated.get("stream"):
+            self._handle_anthropic_stream(validated, anthropic_proxy)
+        else:
+            try:
+                status, body = anthropic_proxy.handle_request(validated, self.server.anthropic_key)
+            except Exception:  # noqa: BLE001
+                log.exception("unexpected error in handle_request")
+                self._respond(500, {"error": "internal server error"})
+                return
+            self._respond(status, body)
+
+    def _handle_anthropic_stream(self, validated: dict, anthropic_proxy: types.ModuleType) -> None:
+        """Stream an SSE response from the Anthropic upstream back to the UDS client.
+
+        Idempotency note: streamed responses are NOT cached in the action_id
+        idempotency store.  A model call has no external side-effect beyond cost
+        (unlike a GitHub write), so re-sending the same stream on retry is
+        acceptable.  Caching a live SSE stream for replay would require buffering
+        the entire response, negating the latency benefit of streaming — the
+        trade-off clearly favours skip-cache here.
+
+        Security properties preserved on the streaming path:
+        - Upstream is hard-pinned to ``UPSTREAM_URL`` (never agent-supplied).
+        - Real API key injected server-side by ``_stream_upstream``; agent never
+          holds or sees it.
+        - Mid-stream errors are caught and surfaced as a sanitized SSE error event;
+          no upstream body, exception text, or secrets leak to the agent.
+        - Timeout (``_UPSTREAM_STREAM_TIMEOUT``) governs inter-chunk gaps.
+        """
         try:
-            status, body = anthropic_proxy.handle_request(validated, self.server.anthropic_key)
+            chunk_iter = anthropic_proxy._stream_upstream(validated, self.server.anthropic_key)
         except Exception:  # noqa: BLE001
-            log.exception("unexpected error in handle_request")
-            self._respond(500, {"error": "internal server error"})
+            log.warning("_stream_upstream setup error", exc_info=True)
+            self._respond(502, {"error": "upstream request failed"})
             return
-        self._respond(status, body)
+
+        # Send SSE response headers.  Transfer-Encoding: chunked requires us to
+        # write each chunk in HTTP/1.1 chunked format: <hex-size>\r\n<data>\r\n,
+        # terminated by 0\r\n\r\n — this lets the client receive data incrementally
+        # without a known Content-Length.
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+
+        def _write_chunk(data: bytes) -> None:
+            """Write one HTTP/1.1 chunked transfer-encoding chunk."""
+            self.wfile.write(f"{len(data):x}\r\n".encode())
+            self.wfile.write(data)
+            self.wfile.write(b"\r\n")
+            self.wfile.flush()
+
+        try:
+            for chunk in chunk_iter:
+                if chunk:
+                    _write_chunk(chunk)
+            # Terminate the chunked stream
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except Exception:  # noqa: BLE001
+            # Mid-stream error: emit a sanitized SSE error event so the agent
+            # gets a structured signal rather than a truncated stream or silence.
+            # No exception text, upstream URL, or key is included.
+            log.warning("mid-stream error from upstream", exc_info=True)
+            try:
+                error_event = b'event: error\ndata: {"error": "upstream stream interrupted"}\n\n'
+                _write_chunk(error_event)
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except OSError:
+                pass  # client disconnected; nothing more we can do
 
     def _handle_mcp(self) -> None:
         """Handle POST /v1/mcp — MCP broker."""
@@ -230,6 +303,7 @@ class _UnixServer(HTTPServer):
         # We cannot call HTTPServer.__init__ because that calls server_bind → socket.bind which
         # we want to do ourselves with AF_UNIX.
         from socketserver import BaseServer  # noqa: PLC0415
+
         BaseServer.__init__(self, sock_path, handler)
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.socket.bind(sock_path)
@@ -297,5 +371,6 @@ class AdvocateServer:
         if self._thread:
             self._thread.join(timeout=5)
         from advocate.brokers import mcp_broker  # noqa: PLC0415
+
         mcp_broker.shutdown_all()
         log.info("AdvocateServer stopped")
