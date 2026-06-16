@@ -54,7 +54,7 @@ if _MACHINE == "x86_64":
     NR_SECCOMP: int = 317
     NR_SOCKET: int = 41
     AUDIT_ARCH: int = 0xC000003E  # AUDIT_ARCH_X86_64
-elif _MACHINE == "aarch64":
+elif _MACHINE in ("aarch64", "arm64"):  # arm64 = Apple Silicon alias for aarch64
     NR_SECCOMP = 277
     NR_SOCKET = 198
     AUDIT_ARCH = 0xC00000B7  # AUDIT_ARCH_AARCH64
@@ -211,6 +211,10 @@ def install_seccomp_filter() -> None:
         ]
 
     filter_buf = (ctypes.c_uint8 * len(prog))(*prog)
+    # IMPORTANT: filter_buf MUST remain referenced until after the syscall returns.
+    # fprog holds only the raw address (ctypes.addressof), not a ctypes reference,
+    # so GC is free to collect filter_buf the moment this scope ends.  Do NOT
+    # extract this into a helper that returns fprog alone — that is a use-after-free.
     fprog = SockFprog(n_insns, ctypes.addressof(filter_buf))
 
     rc = libc.syscall(NR_SECCOMP, SECCOMP_SET_MODE_FILTER, 0, ctypes.byref(fprog))
@@ -271,7 +275,10 @@ def spawn_sandboxed(
         argv:        Command + arguments for the child process.
         uid:         UID to drop to before exec (e.g. AGENT_UID = 65534).
         cleared_env: Environment dict for the child.  Must contain no secrets.
-        workspace:   Working directory for the child (e.g. /tmp/agent).
+        workspace:   Reserved / forward-looking — the launcher does not chdir.
+                     Callers are expected to pass /tmp/agent or similar so Phase 5
+                     can wire it into the cleared_env and Phase 7 can use it for
+                     mount-namespace staging.
         uds_path:    Path to the unix-domain socket the child may connect to.
                      Currently unused by the launcher itself — passed so callers
                      can wire ORCHESTRATOR_UDS into cleared_env before calling.

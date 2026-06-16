@@ -179,7 +179,7 @@ class TestArchConstants:
         if machine == "x86_64":
             assert AUDIT_ARCH == 0xC000003E
             assert NR_SOCKET == 41
-        elif machine == "aarch64":
+        elif machine in ("aarch64", "arm64"):  # arm64 = Apple Silicon alias
             assert AUDIT_ARCH == 0xC00000B7
             assert NR_SOCKET == 198
         else:
