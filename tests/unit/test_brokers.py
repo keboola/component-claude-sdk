@@ -340,6 +340,83 @@ class TestGithubDestinationAllowlist:
 
 
 # ---------------------------------------------------------------------------
+# 3b. GitHub allowlist — segment-boundary enforcement (regression for naive startswith)
+# ---------------------------------------------------------------------------
+
+
+class TestGithubAllowlistSegmentBoundary:
+    """Regression tests for the path-prefix boundary bug.
+
+    The naive ``path.startswith(dest)`` allowed ``/repos/org/repo-evil`` and
+    ``/repos/org/repository-private`` when the allowlist contained only
+    ``/repos/org/repo``.  The fix requires an exact match OR a ``/``-segment
+    boundary.
+    """
+
+    _ALLOWLIST = ["/repos/org/repo"]
+
+    def _deny(self, action_id: str, path: str) -> None:
+        idempotency.clear()
+        payload = {"action_id": action_id, "method": "GET", "path": path}
+        with patch.object(github_broker, "_call_github") as mock_call:
+            status, body = github_broker.handle_request(
+                payload,
+                github_token="dummy-token",
+                allowed_destinations=self._ALLOWLIST,
+            )
+        assert status == 403, f"expected 403 for {path!r}, got {status}"
+        assert "allowlist" in body["error"]
+        mock_call.assert_not_called()
+
+    def _allow(self, action_id: str, path: str) -> None:
+        idempotency.clear()
+        payload = {"action_id": action_id, "method": "GET", "path": path}
+        mock_result = (200, {"ok": True})
+        with patch.object(github_broker, "_call_github", return_value=mock_result) as mock_call:
+            status, _ = github_broker.handle_request(
+                payload,
+                github_token="dummy-token",
+                allowed_destinations=self._ALLOWLIST,
+            )
+        assert status == 200, f"expected 200 for {path!r}, got {status}"
+        mock_call.assert_called_once()
+
+    def test_prefix_leak_repo_evil_is_denied(self) -> None:
+        """``/repos/org/repo-evil/contents`` must be denied — not a sub-path of ``/repos/org/repo``."""
+        self._deny("seg-b1", "/repos/org/repo-evil/contents")
+
+    def test_prefix_leak_repository_private_is_denied(self) -> None:
+        """``/repos/org/repository-private`` must be denied — sharing a prefix is not enough."""
+        self._deny("seg-b2", "/repos/org/repository-private")
+
+    def test_exact_match_is_allowed(self) -> None:
+        """``/repos/org/repo`` (exact) must be allowed."""
+        self._allow("seg-b3", "/repos/org/repo")
+
+    def test_child_path_is_allowed(self) -> None:
+        """``/repos/org/repo/contents`` must be allowed — it is a genuine sub-path."""
+        self._allow("seg-b4", "/repos/org/repo/contents")
+
+    def test_leading_slash_normalization_path_without_slash(self) -> None:
+        """A path without a leading slash is normalized and still matched correctly."""
+        # ``repos/org/repo`` (no leading slash) should behave identically to ``/repos/org/repo``.
+        idempotency.clear()
+        from advocate.brokers.github_broker import _path_allowed  # noqa: PLC0415
+
+        assert _path_allowed("repos/org/repo", ["/repos/org/repo"]) is True
+        assert _path_allowed("repos/org/repo/contents", ["/repos/org/repo"]) is True
+        assert _path_allowed("repos/org/repo-evil", ["/repos/org/repo"]) is False
+
+    def test_leading_slash_normalization_dest_without_slash(self) -> None:
+        """A destination without a leading slash is normalized and still matches correctly."""
+        from advocate.brokers.github_broker import _path_allowed  # noqa: PLC0415
+
+        assert _path_allowed("/repos/org/repo", ["repos/org/repo"]) is True
+        assert _path_allowed("/repos/org/repo/contents", ["repos/org/repo"]) is True
+        assert _path_allowed("/repos/org/repo-evil", ["repos/org/repo"]) is False
+
+
+# ---------------------------------------------------------------------------
 # 4. Idempotency — no cross-broker collision
 # ---------------------------------------------------------------------------
 

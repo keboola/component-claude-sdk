@@ -137,12 +137,42 @@ def handle_request(
     return result
 
 
+def _normalize_path(p: str) -> str:
+    """Return ``p`` with exactly one leading slash and no trailing slash.
+
+    Consistent normalization prevents bypass via double slashes or missing
+    leading slash on either the path or a configured destination.
+    """
+    p = "/" + p.lstrip("/")
+    return p.rstrip("/") or "/"
+
+
 def _path_allowed(path: str, allowed_destinations: list[str]) -> bool:
-    """Return True if ``path`` starts with at least one entry in ``allowed_destinations``.
+    """Return True if ``path`` is at or under at least one entry in ``allowed_destinations``.
+
+    Matching requires an exact match or a path-segment boundary so that
+    ``/repos/org/repo`` does NOT grant access to ``/repos/org/repo-evil`` or
+    ``/repos/org/repository-private``.
+
+    Both ``path`` and each destination are normalized (single leading slash,
+    no trailing slash) before comparison, so the check is consistent regardless
+    of whether the caller omits or includes a leading slash.
 
     An empty list denies everything.
+
+    Examples::
+
+        _path_allowed("/repos/org/repo", ["/repos/org/repo"])          # True  (exact)
+        _path_allowed("/repos/org/repo/contents", ["/repos/org/repo"]) # True  (child)
+        _path_allowed("/repos/org/repo-evil", ["/repos/org/repo"])     # False (prefix leak)
+        _path_allowed("/repos/org/repository", ["/repos/org/repo"])    # False (prefix leak)
     """
-    return any(path.startswith(dest) for dest in allowed_destinations)
+    norm_path = _normalize_path(path)
+    for dest in allowed_destinations:
+        norm_dest = _normalize_path(dest)
+        if norm_path == norm_dest or norm_path.startswith(norm_dest + "/"):
+            return True
+    return False
 
 
 def _call_github(payload: dict, github_token: str) -> tuple[int, dict[str, Any]]:
