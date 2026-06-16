@@ -146,10 +146,16 @@ def _fake_upstream(port: int = 0, chunk_delay: float = 0.0) -> Iterator[str]:
 
 
 def test_sse_streaming_delivers_chunks_incrementally() -> None:
-    """A stream=true request gets text/event-stream chunks, completing the turn."""
+    """A stream=true request gets text/event-stream chunks delivered incrementally.
+
+    Uses chunk_delay to spread out writes, then asserts that timestamps of
+    received chunks span at least that delay — proving data is flushed
+    incrementally rather than buffered into one blob.
+    """
+    per_chunk_delay = 0.05  # 50 ms between upstream writes
     server, sock_path = _make_server("t11.sock")
     try:
-        with _fake_upstream() as upstream_url:
+        with _fake_upstream(chunk_delay=per_chunk_delay) as upstream_url:
             with patch("advocate.anthropic_proxy.UPSTREAM_URL", upstream_url):
                 payload = {
                     "action_id": "sse-001",
@@ -159,7 +165,7 @@ def test_sse_streaming_delivers_chunks_incrementally() -> None:
                     "stream": True,
                 }
                 transport = httpx.HTTPTransport(uds=sock_path)
-                with httpx.Client(transport=transport) as client:
+                with httpx.Client(transport=transport, timeout=30.0) as client:
                     with client.stream(
                         "POST",
                         "http://localhost/v1/messages",
@@ -168,12 +174,20 @@ def test_sse_streaming_delivers_chunks_incrementally() -> None:
                     ) as resp:
                         assert resp.status_code == 200
                         assert "text/event-stream" in resp.headers.get("content-type", "")
+                        arrival_times: list[float] = []
                         raw_chunks: list[bytes] = []
                         for chunk in resp.iter_bytes():
                             if chunk:
+                                arrival_times.append(time.monotonic())
                                 raw_chunks.append(chunk)
-                # More than one chunk delivered (not buffered into one blob)
-                assert len(raw_chunks) >= 1
+
+                # Must have received content at distinct points in time — not one buffered blob.
+                assert len(arrival_times) >= 2, "expected multiple distinct chunk arrivals"
+                spread = arrival_times[-1] - arrival_times[0]
+                assert spread >= per_chunk_delay, (
+                    f"chunk spread {spread:.3f}s < per_chunk_delay {per_chunk_delay}s — "
+                    "response may be buffered rather than streamed incrementally"
+                )
                 full_body = b"".join(raw_chunks)
                 # Must contain core SSE event types from the canned body
                 assert b"message_start" in full_body
@@ -230,18 +244,35 @@ def test_sse_key_injected_server_side_not_by_agent() -> None:
 # Test 13: Mid-stream error → sanitized SSE error event, no secret/exception detail
 # ---------------------------------------------------------------------------
 
+# Bait strings that must NEVER appear in what the agent receives
+_BAIT_SECRET = "sk-secret"
+_BAIT_URL = "api.anthropic.com"
+_BAIT_MSG = "timed out reading chunk"
+
 
 def test_sse_mid_stream_error_is_sanitized() -> None:
-    """When the upstream errors mid-stream the client gets a sanitized error event, no internals."""
+    """A generator that yields real chunks then raises mid-iteration triggers the sanitized
+    SSE error path (server.py lines 210-221), NOT the setup-502 path.
+
+    Verifies:
+    - Response is 200 + text/event-stream (headers already sent before the error)
+    - Early chunks arrive before the error
+    - A sanitized ``event: error`` event is appended
+    - Bait strings (secret key, upstream URL, exception text) are absent from everything received
+    """
     from advocate import anthropic_proxy
 
-    # Monkeypatch _stream_upstream to simulate a mid-stream error
-    def _bad_stream(payload: dict, anthropic_key: str):  # noqa: ANN202, ARG001
-        raise httpx.ReadTimeout("upstream timed out reading chunk from api.anthropic.com with key=sk-secret")
+    # Generator: yields two real SSE lines then raises with bait embedded in the message.
+    # This simulates a genuine mid-iteration network error.
+    def _mid_stream_generator(payload: dict, anthropic_key: str) -> Iterator[bytes]:  # noqa: ARG001
+        yield b"event: message_start\n"
+        yield b'data: {"type":"message_start"}\n\n'
+        # Now raise mid-iteration with bait in the exception message
+        raise httpx.ReadTimeout(f"{_BAIT_MSG} from {_BAIT_URL} with key={_BAIT_SECRET}")
 
     server, sock_path = _make_server("t13.sock")
     try:
-        with patch.object(anthropic_proxy, "_stream_upstream", side_effect=_bad_stream):
+        with patch.object(anthropic_proxy, "_stream_upstream", side_effect=_mid_stream_generator):
             payload = {
                 "action_id": "sse-003",
                 "model": "claude-haiku-4-5",
@@ -251,27 +282,72 @@ def test_sse_mid_stream_error_is_sanitized() -> None:
             }
             transport = httpx.HTTPTransport(uds=sock_path)
             with httpx.Client(transport=transport) as client:
-                # Pre-stream errors should return a non-200 JSON response (502)
-                # Mid-stream errors get a sanitized SSE error event
-                # Either way no internal detail must leak
                 with client.stream(
                     "POST",
                     "http://localhost/v1/messages",
                     json=payload,
                     headers={"content-type": "application/json"},
                 ) as resp:
+                    # Headers are sent before iteration begins — must be 200 + SSE
+                    assert resp.status_code == 200
+                    assert "text/event-stream" in resp.headers.get("content-type", "")
                     body = resp.read()
 
-        # No secret/exception message leaked
-        assert b"sk-secret" not in body
-        assert b"api.anthropic.com" not in body
-        assert b"timed out" not in body
-        # Either a 502 JSON error or an SSE error event is fine
-        is_502 = resp.status_code == 502
-        is_sse_error = b"event: error" in body or b'"error"' in body
-        assert is_502 or is_sse_error, (
-            f"Expected sanitized error response, got status={resp.status_code} body={body[:200]}"
-        )
+        # Bait strings must not appear anywhere the agent can see
+        assert _BAIT_SECRET.encode() not in body, "secret key leaked to agent"
+        assert _BAIT_URL.encode() not in body, "upstream URL leaked to agent"
+        assert _BAIT_MSG.encode() not in body, "exception text leaked to agent"
+
+        # Early chunks must be present (proves generator ran before the error)
+        assert b"message_start" in body, "early SSE chunk missing — generator may not have run"
+
+        # Sanitized error event must be present
+        assert b"event: error" in body, "sanitized SSE error event missing after mid-stream failure"
+        assert b"upstream stream interrupted" in body
+    finally:
+        server.stop()
+
+
+# ---------------------------------------------------------------------------
+# Test 13b: Setup-time error (call raises before first yield) → 502 JSON
+# ---------------------------------------------------------------------------
+
+
+def test_sse_setup_error_returns_502() -> None:
+    """When _stream_upstream raises immediately (before yielding), the server
+    returns a clean 502 JSON response via the setup ``except`` block — not SSE.
+
+    This covers the distinct code path at server.py:179-184.
+    """
+    from advocate import anthropic_proxy
+
+    def _raises_at_call(payload: dict, anthropic_key: str) -> Iterator[bytes]:  # noqa: ARG001
+        raise httpx.ConnectError(f"could not connect to {_BAIT_URL} with key={_BAIT_SECRET}")
+
+    server, sock_path = _make_server("t13b.sock")
+    try:
+        with patch.object(anthropic_proxy, "_stream_upstream", side_effect=_raises_at_call):
+            payload = {
+                "action_id": "sse-003b",
+                "model": "claude-haiku-4-5",
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": True,
+            }
+            transport = httpx.HTTPTransport(uds=sock_path)
+            with httpx.Client(transport=transport) as client:
+                resp = client.post(
+                    "http://localhost/v1/messages",
+                    json=payload,
+                    headers={"content-type": "application/json"},
+                )
+
+        assert resp.status_code == 502
+        body = resp.content
+        assert resp.json()["error"] == "upstream request failed"
+        # Bait must not appear
+        assert _BAIT_SECRET.encode() not in body, "secret key leaked in 502 response"
+        assert _BAIT_URL.encode() not in body, "upstream URL leaked in 502 response"
     finally:
         server.stop()
 

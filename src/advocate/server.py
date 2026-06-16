@@ -175,6 +175,11 @@ class _Handler(BaseHTTPRequestHandler):
         - Mid-stream errors are caught and surfaced as a sanitized SSE error event;
           no upstream body, exception text, or secrets leak to the agent.
         - Timeout (``_UPSTREAM_STREAM_TIMEOUT``) governs inter-chunk gaps.
+
+        Concurrency note: HTTPServer has no ThreadingMixIn, so this method runs
+        in the single server thread.  A long stream therefore serializes all other
+        broker requests for its duration.  Acceptable for the single-job/single-agent
+        POC; revisit if future work adds concurrent agent calls.
         """
         try:
             chunk_iter = anthropic_proxy._stream_upstream(validated, self.server.anthropic_key)
