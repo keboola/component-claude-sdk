@@ -7,6 +7,10 @@ import re
 import socket
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from configuration import McpRemoteServer, McpStdioServer
 
 log = logging.getLogger(__name__)
 
@@ -81,35 +85,51 @@ class _Handler(BaseHTTPRequestHandler):
         log.debug(fmt, *args)
 
     def do_POST(self) -> None:  # noqa: N802
-        """Handle POST /v1/messages."""
-        if self.path != "/v1/messages":
+        """Dispatch POST requests to the appropriate broker handler."""
+        if self.path == "/v1/messages":
+            self._handle_anthropic()
+        elif self.path == "/v1/mcp":
+            self._handle_mcp()
+        elif self.path == "/v1/github":
+            self._handle_github()
+        else:
             self._respond(404, {"error": "not found"})
-            return
 
+    def _read_json_body(self) -> tuple[dict | None, int | None, str | None]:
+        """Read, size-check, and parse the request body as JSON.
+
+        Returns ``(payload, None, None)`` on success, or
+        ``(None, status_code, error_message)`` on failure.
+        """
         ct = self.headers.get("Content-Type", "")
         if not ct.startswith("application/json"):
-            self._respond(400, {"error": "Content-Type must be application/json"})
-            return
+            return None, 400, "Content-Type must be application/json"
 
         raw_length = self.headers.get("Content-Length", "0")
         try:
             length = int(raw_length)
         except ValueError:
-            self._respond(400, {"error": "Content-Length must be an integer"})
-            return
+            return None, 400, "Content-Length must be an integer"
+
         if length > _MAX_BODY_BYTES:
-            self._respond(413, {"error": "request body too large"})
-            return
+            return None, 413, "request body too large"
 
         raw_body = self.rfile.read(length)
         try:
             payload = json.loads(raw_body)
         except json.JSONDecodeError as exc:
-            self._respond(400, {"error": f"invalid JSON: {exc}"})
-            return
+            return None, 400, f"invalid JSON: {exc}"
 
         if not isinstance(payload, dict):
-            self._respond(400, {"error": "body must be a JSON object"})
+            return None, 400, "body must be a JSON object"
+
+        return payload, None, None
+
+    def _handle_anthropic(self) -> None:
+        """Handle POST /v1/messages — Anthropic proxy."""
+        payload, err_status, err_msg = self._read_json_body()
+        if payload is None:
+            self._respond(err_status, {"error": err_msg})
             return
 
         validated, error = _validate(payload)
@@ -117,12 +137,60 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond(400, {"error": error})
             return
 
-        from advocate import anthropic_proxy  # local import to keep modules decoupled
+        from advocate import anthropic_proxy  # local import to keep modules decoupled  # noqa: PLC0415
 
         try:
             status, body = anthropic_proxy.handle_request(validated, self.server.anthropic_key)
         except Exception:  # noqa: BLE001
             log.exception("unexpected error in handle_request")
+            self._respond(500, {"error": "internal server error"})
+            return
+        self._respond(status, body)
+
+    def _handle_mcp(self) -> None:
+        """Handle POST /v1/mcp — MCP broker."""
+        payload, err_status, err_msg = self._read_json_body()
+        if payload is None:
+            self._respond(err_status, {"error": err_msg})
+            return
+
+        from advocate.brokers import mcp_broker  # noqa: PLC0415
+
+        validated, error = mcp_broker.validate(payload)
+        if error:
+            self._respond(400, {"error": error})
+            return
+
+        try:
+            status, body = mcp_broker.handle_request(validated, self.server.mcp_configs)
+        except Exception:  # noqa: BLE001
+            log.exception("unexpected error in mcp handle_request")
+            self._respond(500, {"error": "internal server error"})
+            return
+        self._respond(status, body)
+
+    def _handle_github(self) -> None:
+        """Handle POST /v1/github — GitHub/HTTP broker."""
+        payload, err_status, err_msg = self._read_json_body()
+        if payload is None:
+            self._respond(err_status, {"error": err_msg})
+            return
+
+        from advocate.brokers import github_broker  # noqa: PLC0415
+
+        validated, error = github_broker.validate(payload)
+        if error:
+            self._respond(400, {"error": error})
+            return
+
+        try:
+            status, body = github_broker.handle_request(
+                validated,
+                self.server.github_token,
+                allowed_destinations=self.server.github_allowed_destinations,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("unexpected error in github handle_request")
             self._respond(500, {"error": "internal server error"})
             return
         self._respond(status, body)
@@ -141,8 +209,23 @@ class _UnixServer(HTTPServer):
 
     allow_reuse_address = True
 
-    def __init__(self, sock_path: str, handler: type, anthropic_key: str) -> None:
+    def __init__(
+        self,
+        sock_path: str,
+        handler: type,
+        anthropic_key: str,
+        *,
+        mcp_configs: dict[str, McpStdioServer | McpRemoteServer] | None = None,
+        github_token: str = "",
+        github_allowed_destinations: list[str] | None = None,
+    ) -> None:
         self.anthropic_key = anthropic_key
+        self.mcp_configs: dict[str, McpStdioServer | McpRemoteServer] = mcp_configs or {}
+        self.github_token = github_token
+        # None = all GitHub API paths allowed (Phase 4 will narrow via contract gate);
+        # empty list = deny all.
+        self.github_allowed_destinations: list[str] | None = github_allowed_destinations
+
         # Call BaseServer.__init__ to set up internal event/flag state (serve_forever needs it).
         # We cannot call HTTPServer.__init__ because that calls server_bind → socket.bind which
         # we want to do ourselves with AF_UNIX.
@@ -163,21 +246,45 @@ class _UnixServer(HTTPServer):
 class AdvocateServer:
     """UDS HTTP server for the Advocate Broker."""
 
-    def __init__(self, sock_path: str, anthropic_key: str) -> None:
+    def __init__(
+        self,
+        sock_path: str,
+        anthropic_key: str,
+        *,
+        mcp_configs: dict[str, McpStdioServer | McpRemoteServer] | None = None,
+        github_token: str = "",
+        github_allowed_destinations: list[str] | None = None,
+    ) -> None:
         """Initialise the server.
 
         Args:
             sock_path: Path for the Unix domain socket.
             anthropic_key: Real Anthropic API key (never written to the socket).
+            mcp_configs: Mapping of server name → MCP server config.  The
+                configs hold secrets (``env``/``headers``) that are injected
+                into the real MCP subprocess/request server-side.
+            github_token: Real GitHub PAT (never written to the socket).
+            github_allowed_destinations: Optional list of allowed GitHub API
+                path prefixes.  ``None`` permits any path on ``api.github.com``.
         """
         self._sock_path = sock_path
         self._anthropic_key = anthropic_key
+        self._mcp_configs = mcp_configs or {}
+        self._github_token = github_token
+        self._github_allowed_destinations = github_allowed_destinations
         self._server: _UnixServer | None = None
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
         """Bind the Unix domain socket, chmod 0o777, then start serving in a daemon thread."""
-        self._server = _UnixServer(self._sock_path, _Handler, self._anthropic_key)
+        self._server = _UnixServer(
+            self._sock_path,
+            _Handler,
+            self._anthropic_key,
+            mcp_configs=self._mcp_configs,
+            github_token=self._github_token,
+            github_allowed_destinations=self._github_allowed_destinations,
+        )
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         log.info("AdvocateServer started on %s", self._sock_path)
