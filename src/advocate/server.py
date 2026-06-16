@@ -7,12 +7,12 @@ import re
 import socket
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    pass
 
 log = logging.getLogger(__name__)
+
+# Reject bodies larger than this before reading — prevents a rogue agent from
+# pinning the server thread with a multi-GB payload.
+_MAX_BODY_BYTES = 5_000_000
 
 _ACTION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 _MODEL_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
@@ -67,7 +67,8 @@ def _validate(raw: dict) -> tuple[dict | None, str | None]:
         return None, "stream: must be bool"
 
     validated = dict(raw)
-    validated["stream"] = False  # Phase 2: non-streaming only
+    validated["stream"] = False  # Phase 2: non-streaming only; Phase 3 lifts this for SSE
+    log.debug("stream forced to False (Phase 2); Phase 3 will enable SSE streaming")
     return validated, None
 
 
@@ -90,7 +91,16 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond(400, {"error": "Content-Type must be application/json"})
             return
 
-        length = int(self.headers.get("Content-Length", 0))
+        raw_length = self.headers.get("Content-Length", "0")
+        try:
+            length = int(raw_length)
+        except ValueError:
+            self._respond(400, {"error": "Content-Length must be an integer"})
+            return
+        if length > _MAX_BODY_BYTES:
+            self._respond(413, {"error": "request body too large"})
+            return
+
         raw_body = self.rfile.read(length)
         try:
             payload = json.loads(raw_body)
@@ -109,7 +119,12 @@ class _Handler(BaseHTTPRequestHandler):
 
         from advocate import anthropic_proxy  # local import to keep modules decoupled
 
-        status, body = anthropic_proxy.handle_request(validated, self.server.anthropic_key)
+        try:
+            status, body = anthropic_proxy.handle_request(validated, self.server.anthropic_key)
+        except Exception:  # noqa: BLE001
+            log.exception("unexpected error in handle_request")
+            self._respond(500, {"error": "internal server error"})
+            return
         self._respond(status, body)
 
     def _respond(self, status: int, body: dict) -> None:

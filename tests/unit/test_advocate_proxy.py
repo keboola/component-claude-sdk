@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import os
+import socket
 import tempfile
-import time
 from unittest.mock import patch
 
 import httpx
-import pytest
 import vcr as vcrpy
 
 from advocate.server import AdvocateServer
@@ -32,11 +31,14 @@ def _short_sock_path(name: str = "adv.sock") -> str:
     return os.path.join(d, name)
 
 
-def _make_server(tmp_path: pytest.TempPathFactory) -> tuple[AdvocateServer, str]:  # noqa: ARG001
-    sock_path = _short_sock_path()
+def _make_server(name: str = "adv.sock") -> tuple[AdvocateServer, str]:
+    """Start a server; socket binds synchronously in _UnixServer.__init__ before thread launch."""
+    sock_path = _short_sock_path(name)
     server = AdvocateServer(sock_path, anthropic_key="dummy-key-for-test")
     server.start()
-    time.sleep(0.05)  # let the server thread bind
+    # No sleep needed: _UnixServer.__init__ calls socket.bind() + chmod before the
+    # daemon thread is started, so the socket file exists and is ready by the time
+    # start() returns.
     return server, sock_path
 
 
@@ -49,9 +51,10 @@ def _uds_client(sock_path: str) -> httpx.Client:
 # Test 1: Schema validation — rejects unexpected fields
 # ---------------------------------------------------------------------------
 
-def test_schema_rejects_extra_fields(tmp_path: pytest.TempPathFactory) -> None:
+
+def test_schema_rejects_extra_fields() -> None:
     """Server returns 400 for any unexpected top-level key."""
-    server, sock_path = _make_server(tmp_path)
+    server, sock_path = _make_server("t1.sock")
     try:
         payload = dict(_VALID_PAYLOAD)
         payload["upstream_override"] = "https://evil.example.com"
@@ -71,9 +74,10 @@ def test_schema_rejects_extra_fields(tmp_path: pytest.TempPathFactory) -> None:
 # Test 2: Rejects agent-supplied upstream override (security critical)
 # ---------------------------------------------------------------------------
 
-def test_schema_rejects_upstream_override(tmp_path: pytest.TempPathFactory) -> None:
+
+def test_schema_rejects_upstream_override() -> None:
     """Sending a 'base_url' or 'upstream' field is rejected with 400."""
-    server, sock_path = _make_server(tmp_path)
+    server, sock_path = _make_server("t2.sock")
     try:
         for evil_field in ("base_url", "upstream", "api_base"):
             payload = dict(_VALID_PAYLOAD)
@@ -93,17 +97,17 @@ def test_schema_rejects_upstream_override(tmp_path: pytest.TempPathFactory) -> N
 # Test 3: Proxy turn completes via UDS with no real key (VCR replay)
 # ---------------------------------------------------------------------------
 
+
 @MY_VCR.use_cassette("anthropic_proxy_turn.json")
-def test_proxy_completes_turn_via_uds(tmp_path: pytest.TempPathFactory) -> None:  # noqa: ARG001
+def test_proxy_completes_turn_via_uds() -> None:
     """A Python UDS client (no real key) completes a model turn through the proxy."""
-    # Clear idempotency cache so VCR cassette is used fresh
     from advocate import anthropic_proxy
+
     anthropic_proxy._idempotency_cache.clear()
 
     sock_path = _short_sock_path("vcr.sock")
     server = AdvocateServer(sock_path, anthropic_key="dummy-key-for-test")
     server.start()
-    time.sleep(0.05)
     try:
         payload = dict(_VALID_PAYLOAD)
         transport = httpx.HTTPTransport(uds=sock_path)
@@ -122,17 +126,19 @@ def test_proxy_completes_turn_via_uds(tmp_path: pytest.TempPathFactory) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 4: action_id idempotency — no double upstream call
+# Test 4: action_id idempotency — no double upstream call on success
 # ---------------------------------------------------------------------------
 
-def test_action_id_idempotency_no_double_upstream_call(tmp_path: pytest.TempPathFactory) -> None:
+
+def test_action_id_idempotency_no_double_upstream_call() -> None:
     """Replaying the same action_id returns cached result; upstream called exactly once."""
     from advocate import anthropic_proxy
+
     anthropic_proxy._idempotency_cache.clear()
 
     mock_result = (200, {"id": "msg_mock", "role": "assistant", "content": [{"type": "text", "text": "Hi"}]})
 
-    server, sock_path = _make_server(tmp_path)
+    server, sock_path = _make_server("t4.sock")
     try:
         with patch.object(anthropic_proxy, "_call_upstream", return_value=mock_result) as mock_call:
             for _ in range(2):
@@ -152,16 +158,196 @@ def test_action_id_idempotency_no_double_upstream_call(tmp_path: pytest.TempPath
 # Test 5: Server does chmod 0o777 after bind
 # ---------------------------------------------------------------------------
 
-def test_server_socket_chmod_777(tmp_path: pytest.TempPathFactory) -> None:  # noqa: ARG001
+
+def test_server_socket_chmod_777() -> None:
     """AdvocateServer sets socket permissions to 0o777 after binding."""
     import stat
 
     sock_path = _short_sock_path("perm.sock")
     server = AdvocateServer(sock_path, anthropic_key="dummy")
     server.start()
-    time.sleep(0.05)
     try:
         mode = oct(stat.S_IMODE(os.stat(sock_path).st_mode))
         assert mode == oct(0o777), f"expected 0o777, got {mode}"
+    finally:
+        server.stop()
+
+
+# ---------------------------------------------------------------------------
+# Test 6 (new): upstream httpx failure → sanitized 502, no internal detail leaked
+# ---------------------------------------------------------------------------
+
+
+def test_upstream_httpx_error_returns_sanitized_502() -> None:
+    """An httpx network error from _call_upstream becomes a clean 502 with no detail."""
+    from advocate import anthropic_proxy
+
+    anthropic_proxy._idempotency_cache.clear()
+
+    server, sock_path = _make_server("t6.sock")
+    try:
+        with patch.object(
+            anthropic_proxy,
+            "_call_upstream",
+            side_effect=httpx.ConnectError("connection refused to internal.example.com"),
+        ):
+            with _uds_client(sock_path) as client:
+                resp = client.post(
+                    "http://localhost/v1/messages",
+                    json=_VALID_PAYLOAD,
+                    headers={"content-type": "application/json"},
+                )
+        assert resp.status_code == 502
+        body = resp.json()
+        # Generic message only — no internal host/exception details exposed to agent
+        assert body["error"] == "upstream request failed"
+        assert "internal.example.com" not in resp.text
+    finally:
+        server.stop()
+
+
+# ---------------------------------------------------------------------------
+# Test 7 (new): non-JSON upstream body → sanitized 502
+# ---------------------------------------------------------------------------
+
+
+def test_upstream_non_json_body_returns_sanitized_502() -> None:
+    """A non-JSON upstream response (e.g. 5xx HTML) becomes a clean 502."""
+    from advocate import anthropic_proxy
+
+    anthropic_proxy._idempotency_cache.clear()
+
+    # Simulate resp.json() raising ValueError (JSONDecodeError) from _call_upstream
+    def _bad_json(payload: dict, key: str) -> tuple[int, dict]:  # noqa: ARG001
+        raise ValueError("No JSON object could be decoded")
+
+    server, sock_path = _make_server("t7.sock")
+    try:
+        with patch.object(anthropic_proxy, "_call_upstream", side_effect=_bad_json):
+            with _uds_client(sock_path) as client:
+                resp = client.post(
+                    "http://localhost/v1/messages",
+                    json=_VALID_PAYLOAD,
+                    headers={"content-type": "application/json"},
+                )
+        # handle_request catches _call_upstream exceptions and returns (502, sanitized)
+        assert resp.status_code == 502
+        assert resp.json()["error"] == "upstream request failed"
+    finally:
+        server.stop()
+
+
+# ---------------------------------------------------------------------------
+# Test 8 (new): errored action_id is NOT cached — retry re-attempts upstream
+# ---------------------------------------------------------------------------
+
+
+def test_error_result_not_cached_retry_calls_upstream_again() -> None:
+    """A 502 from upstream is NOT stored in the idempotency cache; retry hits upstream again."""
+    from advocate import anthropic_proxy
+
+    anthropic_proxy._idempotency_cache.clear()
+
+    error_result = (502, {"error": "upstream request failed"})
+    success_result = (200, {"id": "msg_ok", "role": "assistant", "content": [{"type": "text", "text": "Hi"}]})
+
+    server, sock_path = _make_server("t8.sock")
+    try:
+        # First call: upstream returns 502
+        # Second call (same action_id): upstream returns 200 — proves the error wasn't pinned
+        with patch.object(
+            anthropic_proxy,
+            "_call_upstream",
+            side_effect=[error_result, success_result],
+        ) as mock_call:
+            with _uds_client(sock_path) as client:
+                resp1 = client.post(
+                    "http://localhost/v1/messages",
+                    json=_VALID_PAYLOAD,
+                    headers={"content-type": "application/json"},
+                )
+            assert resp1.status_code == 502
+
+            with _uds_client(sock_path) as client:
+                resp2 = client.post(
+                    "http://localhost/v1/messages",
+                    json=_VALID_PAYLOAD,
+                    headers={"content-type": "application/json"},
+                )
+            assert resp2.status_code == 200
+            assert mock_call.call_count == 2, f"expected 2 upstream calls (error not cached), got {mock_call.call_count}"
+    finally:
+        server.stop()
+
+
+# ---------------------------------------------------------------------------
+# Test 9 (new): oversized Content-Length → 413 without reading the body
+# ---------------------------------------------------------------------------
+
+
+def test_oversized_content_length_returns_413() -> None:
+    """A Content-Length over the cap is rejected 413 before the body is read."""
+    server, sock_path = _make_server("t9.sock")
+    try:
+        # Send a real request but with an inflated Content-Length header.
+        # Use raw socket so we control the header precisely.
+        body = b'{"action_id": "x", "model": "m", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}'
+        oversized = 5_000_001
+        raw = (
+            f"POST /v1/messages HTTP/1.1\r\n"
+            f"Host: localhost\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {oversized}\r\n"
+            f"\r\n"
+        ).encode() + body  # actual body is tiny; server should reject on header alone
+
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(sock_path)
+            sock.sendall(raw)
+            response = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+                if b"\r\n\r\n" in response:
+                    # Read enough to get the status line + body
+                    break
+
+        assert b"413" in response, f"expected 413 in response, got: {response[:200]}"
+    finally:
+        server.stop()
+
+
+# ---------------------------------------------------------------------------
+# Test 10 (new): malformed Content-Length → 400
+# ---------------------------------------------------------------------------
+
+
+def test_malformed_content_length_returns_400() -> None:
+    """A non-integer Content-Length header returns 400, not a ValueError crash."""
+    server, sock_path = _make_server("t10.sock")
+    try:
+        raw = (
+            b"POST /v1/messages HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: not-a-number\r\n"
+            b"\r\n"
+        )
+
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(sock_path)
+            sock.sendall(raw)
+            response = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+                if b"\r\n\r\n" in response:
+                    break
+
+        assert b"400" in response, f"expected 400 in response, got: {response[:200]}"
     finally:
         server.stop()
