@@ -91,7 +91,7 @@ class _SseUpstreamHandler(BaseHTTPRequestHandler):
     # optional: slow emit to verify incremental delivery
     chunk_delay: float = 0.0
 
-    def log_message(self, fmt: str, *args: object) -> None:  # noqa: ANN002
+    def log_message(self, format: str, *args: object) -> None:  # noqa: ANN002  # type: ignore[override]
         pass  # suppress noise in test output
 
     def do_POST(self) -> None:  # noqa: N802

@@ -115,8 +115,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     server: _UnixServer  # type: ignore[assignment]
 
-    def log_message(self, fmt: str, *args: object) -> None:  # noqa: ANN002
-        log.debug(fmt, *args)
+    def log_message(self, format: str, *args: object) -> None:  # noqa: ANN002  # type: ignore[override]
+        log.debug(format, *args)
 
     def do_POST(self) -> None:  # noqa: N802
         """Dispatch POST requests to the appropriate broker handler."""
@@ -168,6 +168,7 @@ class _Handler(BaseHTTPRequestHandler):
         """
         payload, err_status, err_msg = self._read_json_body()
         if payload is None:
+            assert err_status is not None  # _read_json_body guarantees: payload None ↔ status set
             self._respond(err_status, {"error": err_msg})
             return
 
@@ -306,6 +307,7 @@ class _Handler(BaseHTTPRequestHandler):
         """Handle POST /v1/mcp — MCP broker."""
         payload, err_status, err_msg = self._read_json_body()
         if payload is None:
+            assert err_status is not None  # _read_json_body guarantees: payload None ↔ status set
             self._respond(err_status, {"error": err_msg})
             return
 
@@ -344,6 +346,7 @@ class _Handler(BaseHTTPRequestHandler):
         """Handle POST /v1/github — GitHub/HTTP broker."""
         payload, err_status, err_msg = self._read_json_body()
         if payload is None:
+            assert err_status is not None  # _read_json_body guarantees: payload None ↔ status set
             self._respond(err_status, {"error": err_msg})
             return
 

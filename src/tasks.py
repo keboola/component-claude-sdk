@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from keboola.component.dao import TableDefinition
@@ -105,7 +106,7 @@ class TaskSource:
         return tasks
 
     @staticmethod
-    def _validate_columns(fieldnames: list[str] | None, table_name: str) -> None:
+    def _validate_columns(fieldnames: list[str] | None | Sequence[str], table_name: str) -> None:
         present = set(fieldnames or [])
         missing = [c for c in REQUIRED_TASK_COLUMNS if c not in present]
         if missing:
