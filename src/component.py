@@ -173,7 +173,6 @@ def _perform_env_scrub() -> None:
     # Fast path: if KBC_TOKEN is not in the env there is nothing to scrub and no
     # need to pay the cost of a full process re-exec.
     if "KBC_TOKEN" not in os.environ:
-        log.debug("env-scrub: KBC_TOKEN not in env — skipping re-exec")
         return
 
     token = os.environ.get("KBC_TOKEN", "")
