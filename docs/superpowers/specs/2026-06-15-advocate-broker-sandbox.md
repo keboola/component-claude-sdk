@@ -26,6 +26,23 @@
 > including an **opt-in, default-open egress allowlist** (§8.4) that bounds where the agent can send
 > without the config-hell of a fail-closed contract. The single most useful framing of this whole spec
 > now lives in **§8.1–8.4** — read that first.
+>
+> **Revision 2026-06-16d (on-platform probe findings — PIVOTS the security model):** On-platform probes
+> (cf-dev jobs 47975338 / 47976834 / 47978513, branch images advocate-broker-21/22/23) DISPROVED the
+> §5.1 floor as previously written. Key findings:
+> (1) the job-queue runner forces **euid=1000, cap_eff=0** even with `USER root` in the Dockerfile —
+> `setuid` fails, there is no root→agent UID-drop;
+> (2) `unshare(CLONE_NEWNET)` and `iptables` (CAP_NET_ADMIN) are both unavailable — no in-container
+> hard network egress control;
+> (3) seccomp AF_INET deny breaks the loopback TCP connection the bundled `claude` CLI uses for
+> `ANTHROPIC_BASE_URL` — a net-kill seccomp is not usable;
+> (4) `ptrace_scope=1` confirmed — same-uid descendant CANNOT ptrace/read `/proc/<parent>/mem`
+> of the Advocate (verified EPERM), but `/proc/<parent>/environ` IS readable (not Yama-gated);
+> (5) E2B/VM backend deprioritised by the user.
+>
+> The design therefore pivots to **Broker V0: single-UID credential broker (non-root)** — see §4, §5,
+> §6, §9, §11 below. The boundary is no longer a UID drop + network kill; it is cleared agent env +
+> unlinked config + ptrace-scope memory protection + env-scrub + loopback-TCP credential injection.
 
 ---
 
@@ -48,9 +65,11 @@ problem:
   sends it anywhere; scrubbing never sees it.
 
 This spec replaces "the container is the sandbox" with a **real intra-container privilege boundary**:
-a trusted parent ("Advocate") holds all secrets and does all network I/O; the LLM loop runs in a
-nested sandbox with **no secrets and no network**, reaching the world only through the Advocate over a
-unix-domain socket. Security stops depending on `claude-sdk` behaving.
+a trusted parent ("Advocate") holds all secrets and injects them into every upstream call; the LLM
+loop runs in a child process with **no secrets**, reaching the Advocate's credential brokers over
+loopback TCP. (The original design used a unix-domain socket + seccomp network kill; on-platform
+probes in 2026-06-16d revised this to loopback TCP + soft egress — see §4, §5, §12.6.)
+Security stops depending on `claude-sdk` behaving for credential safety.
 
 This is the conclusion of a design exploration (see §13 for the discarded alternatives and why).
 
@@ -78,9 +97,14 @@ in the Advocate (§8) — so even the Anthropic credential need not be the real 
 environment.
 
 **Key delta vs. the review's "more defensible shape":** Jordan's shape still relies on `claude-sdk`
-discipline (tight `allowed_tools`, no shell when secrets are present). The in-container sandbox
-(§5.1) makes the boundary **independent of `claude-sdk`** — even with a shell and
-`bypassPermissions`, the agent has nothing to steal and nowhere to send it.
+discipline (tight `allowed_tools`, no shell when secrets are present). The Broker V0 architecture
+(§5.1) makes the boundary **independent of `claude-sdk`** for credential theft — even with a shell,
+the agent holds no reusable credentials and cannot read the config file.
+
+> **Note (2026-06-16d):** The table above reflects the original design intent. The on-platform probe
+> (§12.6) changed the implementation: the channel is loopback TCP (not UDS), and seccomp AF_INET
+> deny is NOT used in V0 (it breaks the loopback TCP transport). "Constrain egress" is therefore
+> advisory/soft in V0 — the hard network kill requires a VM backend (§11).
 
 ---
 
@@ -133,108 +157,164 @@ secrets and no network. Against the prompt-injection threat this yields the same
 
 ## 4. Architecture
 
+**Broker V0 — single UID, loopback-TCP channel**
+
+Both the Advocate (parent) and the agent (child) run as the platform-assigned euid 1000. There is no
+UID-drop boundary. The boundary is: cleared agent env + unlinked config file + ptrace-scope memory
+protection + loopback-TCP credential injection.
+
 ```
-┌─ ONE component container (ephemeral batch job) ─────────────────────────┐
+┌─ ONE component container (ephemeral batch job, euid=1000 throughout) ───┐
 │  ADVOCATE  — parent process, TRUSTED (Keboola-authored)                 │
 │   • reads /data/config.json (#anthropic_key, #github_token, MCP #secrets)│
-│   • holds KBC_TOKEN (env)                                                │
+│   • IMMEDIATELY unlinks /data/config.json after reading                 │
+│   • holds KBC_TOKEN (passed via inherited fd after env-scrub re-exec)   │
 │   • HAS network; performs ALL outbound calls                            │
-│   • runs: Anthropic proxy, MCP servers, GitHub/HTTP tool executor       │
+│   • runs: Anthropic proxy, MCP proxy, GitHub/HTTP tool executor         │
 │   • enforces the Contract gate (§7): deterministic scope/destination    │
 │     allowlist (POC). Experimental extras: §7.4                          │
 │   • does Storage I/O: reads /data/in, writes /data/out                   │
-│        │  ONLY channel = AF_UNIX socket (UDS)                            │
+│        │  ONLY channel = loopback TCP 127.0.0.1:<port>                   │
 │        ▼                                                                  │
-│  ┌─ SANDBOXED AGENT — child, ZERO-TRUST ───────────────────────────┐    │
+│  ┌─ AGENT — child, ZERO-TRUST ─────────────────────────────────────┐    │
 │  │   • claude-sdk = pure agent loop engine                          │    │
-│  │   • unprivileged UID (dropped from parent)                       │    │
-│  │   • seccomp: socket(AF_INET/AF_INET6) denied → NO network        │    │
-│  │   • cannot read /data/config.json (uid + chmod 600)              │    │
-│  │   • cleared env (no KBC_TOKEN, no secrets)                        │    │
-│  │   • cannot ptrace / read parent memory (cross-uid)              │    │
-│  │   • workspace = /tmp/agent + mounted /skills (read-only)         │    │
-│  │   • reaches Anthropic / MCP / GitHub ONLY via the UDS → Advocate │    │
+│  │   • same euid 1000 as parent (no UID-drop — platform prevents it)│    │
+│  │   • cleared env: no KBC_TOKEN, no #secrets, only routing values  │    │
+│  │     (ANTHROPIC_BASE_URL, MCP_PROXY_URL, workspace paths)         │    │
+│  │   • cannot read /data/config.json (unlinked before agent spawned) │    │
+│  │   • cannot ptrace / read parent memory (ptrace_scope=1, verified) │    │
+│  │   • NOTE: /proc/<advocate>/environ IS readable — see §5 env-scrub │    │
+│  │   • workspace = /tmp/agent + /skills (read-only)                  │    │
+│  │   • reaches Anthropic / MCP / GitHub ONLY via loopback-TCP proxy  │    │
+│  │   • full container network retained (no hard egress kill in V0)   │    │
 │  └──────────────────────────────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────────────────────────────┘
-         outbound (only the Advocate) ──▶ Anthropic API / GitHub / MCP
+         outbound (Advocate + agent) ──▶ Anthropic API / GitHub / MCP
+         (agent bypassing proxy not prevented in V0 — soft boundary)
 ```
 
-Two processes, one container. The Advocate is the only thing with secrets and network; the agent is a
-brain with no hands of its own — every hand is a request to the Advocate, which the Advocate may
-refuse, scope, meter, and log.
+Two processes, one container, one UID. The Advocate holds all reusable credentials and injects them
+server-side over loopback TCP. The agent holds only dummy values; it reaches upstreams only through
+the proxy. The network is NOT hard-killed — see §9 for what is and is not provable.
 
 ---
 
 ## 5. Isolation mechanisms
 
-### 5.1 Guaranteed floor (build on this — works regardless of the infra unknowns)
+### 5.1 Broker V0 boundary — what actually holds on the platform (revised 2026-06-16d)
 
-Confirmed against `kbc-stacks`: job pods have **no `securityContext`** (component runs as the image's
-UID, potentially root, no enforced `runAsNonRoot`), **no `seccompProfile`/AppArmor/SELinux** set, and
-**self-imposed seccomp (`prctl(PR_SET_NO_NEW_PRIVS)` + `seccomp(SECCOMP_SET_MODE_FILTER)`) always
-works.** NetworkPolicy exists only for the sandbox namespace (Jupyter/RStudio), **not** for
-job-queue-jobs — so platform egress control is not available to us and we must enforce it ourselves.
+The on-platform probes (§12.6) proved that the root+UID-drop+seccomp-net-kill model does NOT work
+on kbc-stacks: the runner forces euid=1000 with zero capabilities regardless of the image's `USER`
+directive, so setuid fails, unshare fails, and seccomp AF_INET deny breaks the loopback TCP the
+`claude` CLI requires. The V0 boundary is therefore different from the §12.5 local-Docker result.
 
-The floor uses only primitives that are guaranteed by those facts:
+**What V0 relies on (confirmed on-platform):**
 
-1. **Network kill — self-imposed seccomp.** Before exec'ing the agent, install a seccomp filter that
-   returns `EACCES`/`EPERM` for `socket(AF_INET, …)` and `socket(AF_INET6, …)` while allowing
-   `AF_UNIX`. The filter is inherited across fork/exec under `NO_NEW_PRIVS`, so every child the agent
-   spawns (node, uvx, bash) is equally netless. DNS dies with it (also a socket) — the agent does not
-   need it. **Deterministic, guaranteed.**
-2. **Secret-file isolation — UID + perms.** The parent runs as root, reads `/data/config.json`, then
-   drops the agent to an unprivileged UID. `config.json` is root-owned `chmod 600`; the agent's UID
-   cannot read it. The agent is exec'd with a **cleared environment** (no `KBC_TOKEN`, no secrets) —
-   only `ORCHESTRATOR_UDS`, workspace paths, and `ANTHROPIC_BASE_URL` (see §8).
-3. **Memory isolation — cross-UID, no extra primitive needed.** An unprivileged child cannot
-   `ptrace` a root parent nor read `/proc/<parent>/mem` (root-owned). Secrets held in the Advocate's
-   memory are therefore unreachable even without a PID namespace.
-4. **Single channel — AF_UNIX only.** A unix-domain socket bind-mounted/visible to the agent is its
-   sole egress. The Advocate listens on it.
+1. **Config-file isolation — unlink after read.** The Advocate reads `/data/config.json` (decrypted
+   secrets) and immediately unlinks it. When the agent process starts, the file does not exist; the
+   agent cannot read it regardless of permissions. The agent is spawned with a **cleared environment**
+   (no `KBC_TOKEN`, no `#anthropic_key`, no `#github_token`, no MCP secrets) — only routing values
+   (`ANTHROPIC_BASE_URL`, `MCP_PROXY_URL`, workspace paths, a dummy Anthropic key).
+2. **Memory isolation — ptrace_scope=1 (verified on-platform).** With `ptrace_scope=1`, a descendant
+   process at the same UID cannot `PTRACE_ATTACH` or read `/proc/<parent>/mem` of the Advocate
+   (confirmed EPERM on probe jobs). Reusable secrets held in the Advocate's heap are therefore
+   unreachable by the agent even without a UID boundary.
+3. **KBC_TOKEN env-scrub (required — do not skip).** `/proc/<advocate>/environ` IS readable by the
+   same-uid agent (read mode is not Yama-gated). If `KBC_TOKEN` remains in the Advocate's exec-time
+   environment, the agent can read it. Mitigation: before spawning the agent, the Advocate re-execs
+   itself with a scrubbed environment, passing `KBC_TOKEN` back via an inherited file descriptor (not
+   env), so `/proc/<advocate>/environ` no longer exposes it. **Fallback**: if env-scrub is not yet
+   implemented, pair with a least-privilege Storage token so that exposure of `KBC_TOKEN` has bounded
+   blast radius. The env-scrub is a required step for V0; the fallback is an interim arrangement.
+4. **Server-side credential injection — loopback TCP.** Reusable credentials (`#anthropic_key`,
+   `#github_token`, MCP `#secrets`) are held only in the Advocate process. The agent's env holds a
+   dummy Anthropic key and routing env vars. All upstream calls are made by the Advocate, which
+   injects the real credential at the proxy layer — the agent never sees the value.
+5. **Deterministic contract gate.** Every brokered action is checked against the frozen contract
+   (§7.2) by a deterministic rule before execution. Capability, destination, and scope must all match;
+   no LLM in the path.
 
-This floor alone delivers the two properties that matter against prompt injection: **agent has no
-network and no secrets.**
+**What V0 does NOT provide (be explicit):**
 
-### 5.2 Optional hardening (add if the infra unknowns allow — defense-in-depth, not required)
+- **Hard network kill.** The agent retains the container's full network. There is no seccomp
+  AF_INET deny (breaks the loopback TCP the CLI uses), no network namespace (unshare unavailable),
+  no iptables (CAP_NET_ADMIN unavailable). The agent can open arbitrary TCP connections. Controlled
+  egress (§8.4) is **advisory/soft** in V0 — the agent could bypass the proxy and reach arbitrary
+  hosts directly. Data exfiltration to an arbitrary host is NOT prevented.
+- **UID-based secret-file isolation.** There is no UID drop; file-system isolation is by unlinking
+  the config file before the agent starts, not by a permission boundary between UIDs.
+- **KBC_TOKEN environ protection without env-scrub.** If env-scrub is not implemented, the agent
+  can read `KBC_TOKEN` from `/proc/<advocate>/environ`. Do not ship without env-scrub or a
+  least-privilege token.
+- **ptrace_scope guarantee.** V0 depends on the runtime maintaining `ptrace_scope >= 1`. If a
+  future platform change sets it to 0, the memory isolation breaks. This is documented as a runtime
+  dependency; escalate if it changes.
 
-| Primitive | Adds | Gated on (infra repo, unknown) |
+### 5.2 Optional hardening (V1+ — blocked on platform capabilities)
+
+These are NOT available on the current kbc-stacks runtime (euid=1000, cap_eff=0) and are deferred:
+
+| Primitive | Adds | Blocked by |
 |---|---|---|
-| `unshare(CLONE_NEWNET)` (net namespace, no interfaces) | belt-and-suspenders egress kill on top of seccomp | container runtime + `unprivileged_userns_clone` / running as root |
-| `unshare(CLONE_NEWNS)` mount ns | agent sees only `/skills` + `/tmp`; not even a path to `/data` | same |
-| `unshare(CLONE_NEWPID)` PID ns | agent cannot enumerate parent process / cmdline | same |
-| `bubblewrap` / `nsjail` | packages the above cleanly | needs the syscalls above + image tooling approval |
+| `unshare(CLONE_NEWNET)` (net namespace) | hard egress kill | needs CAP_SYS_ADMIN or user-ns clone; unavailable |
+| `unshare(CLONE_NEWNS)` mount ns | agent sees only workspace, not /data | same |
+| `unshare(CLONE_NEWPID)` PID ns | agent cannot enumerate parent cmdline | same |
+| `setuid` UID-drop | file-system secret isolation by UID | euid=1000 forced; setuid fails |
+| seccomp AF_INET deny | hard network kill | breaks loopback TCP used by `claude` CLI |
+| `bubblewrap` / `nsjail` | packages the above | requires the above primitives |
+| VM/E2B backend | full hard boundary | deprioritised by user; theoretical V2 only |
 
-These are layered on the floor; if the runtime blocks them, the floor still stands.
+The V0 boundary does not depend on any of these.
 
 ---
 
 ## 6. Component boot sequence
 
+**V0 — single-UID non-root boot (revised 2026-06-16d)**
+
 ```
-1.  Component starts as ROOT (parent = Advocate).
-2.  Advocate reads /data/config.json + KBC_TOKEN; validates Configuration (existing model).
-3.  Advocate runs Phase 0 (clean): derives + signs the Intent Contract (§7.1) from
+1.  Component starts at euid=1000 (platform-assigned, cannot be changed).
+    Parent = Advocate. No root privileges. No capabilities.
+2.  Advocate reads /data/config.json (#anthropic_key, #github_token, MCP #secrets, config).
+    Validates Configuration (existing model). Reads KBC_TOKEN from env.
+3.  Advocate UNLINKS /data/config.json immediately after reading.
+    (The file no longer exists on the filesystem; the agent cannot read it.)
+4.  Advocate runs env-scrub re-exec (REQUIRED):
+    - Passes KBC_TOKEN via an inherited fd (e.g. pipe or memfd), not env.
+    - Re-execs itself with a scrubbed environment so that /proc/<advocate>/environ
+      no longer exposes KBC_TOKEN or #secrets.
+    (If env-scrub is deferred: accept KBC_TOKEN environ exposure and pair with a
+     least-privilege Storage token as an interim mitigation.)
+5.  Advocate runs Phase 0 (clean): derives + signs the Intent Contract (§7.1) from
     system_prompt + task + flow context + declared tools. NO untrusted data yet.
-4.  Advocate starts, on its side (with secrets, with network):
-       - Anthropic proxy listening on the UDS  (injects #anthropic_key)
-       - configured MCP servers (with their #secrets)
-       - GitHub / HTTP tool executor
+6.  Advocate starts, on its side (with secrets, with network):
+       - Anthropic proxy listening on loopback TCP 127.0.0.1:<port> (injects #anthropic_key)
+       - MCP proxy on loopback (MCP_PROXY_URL) for configured MCP servers (with their #secrets)
+       - GitHub / HTTP tool executor (loopback or shim — see §8)
        - the Contract gate (§7.2)
-5.  Advocate prepares the agent jail:
-       - chmod 600 root-owned /data/config.json; create /tmp/agent owned by AGENT_UID
-       - mount/stage read-only /skills
-       - build the cleared env: { ORCHESTRATOR_UDS, ANTHROPIC_BASE_URL=<uds>, workspace paths }
-6.  Advocate spawns the AGENT:
-       prctl(NO_NEW_PRIVS) → install seccomp (deny AF_INET/AF_INET6)
-       → [optional] unshare(NET/NS/PID) → setuid(AGENT_UID) → exec claude-sdk loop
-7.  Agent loop runs. Every model call / tool call / MCP call = an RPC over the UDS.
-    The Advocate gates each (§7.2), injects the right scoped credential, executes, logs, returns.
-8.  Agent writes its outputs to /tmp/agent. On completion it signals the Advocate over the UDS.
-9.  Advocate (trusted) promotes results to /data/out (manifests, tables, JSONL transcript),
+7.  Advocate prepares the agent env:
+       - create /tmp/agent workspace
+       - stage read-only /skills
+       - build the cleared env: {
+           ANTHROPIC_BASE_URL = http://127.0.0.1:<proxy-port>,
+           ANTHROPIC_API_KEY  = dummy-key,
+           MCP_PROXY_URL      = http://127.0.0.1:<mcp-port>,   // or loopback path
+           workspace paths,
+           NO KBC_TOKEN, NO #secrets
+         }
+8.  Advocate spawns the AGENT:
+       exec claude-sdk loop  (euid=1000, same as Advocate)
+    The agent's ptrace_scope=1 (verified on-platform) prevents it from ptrace'ing
+    the Advocate or reading /proc/<advocate>/mem.
+9.  Agent loop runs. Every model call / MCP call = a request over loopback TCP.
+    The Advocate gates each (§7.2), injects the right credential, executes, logs, returns.
+10. Agent writes its outputs to /tmp/agent. On completion it notifies the Advocate
+    (over the loopback channel or a signal).
+11. Advocate (trusted) promotes results to /data/out (manifests, tables, JSONL transcript),
     records cost/metering, tears down the agent, exits.
 ```
 
-Storage output promotion happens in the **parent** (step 9), not the agent — the agent never holds
+Storage output promotion happens in the **parent** (step 11), not the agent — the agent never holds
 `KBC_TOKEN` and never writes `/data/out` directly.
 
 ---
@@ -301,26 +381,42 @@ future research, not security guarantees, and the POC ships without them:
   expanded at runtime), there is nothing to "freeze" — the property falls out of the contract being
   immutable. The dynamic taint-tracking version is unvalidated and **not** part of the POC.
 
-Bottom line: the POC's security = broker (token-out) + in-container sandbox (no net, no secrets) +
-deterministic scope/destination allowlist. Everything above is future work, clearly labelled.
+Bottom line: the POC's security = broker (token-out) + credential-cleared agent env + unlinked config
++ ptrace-scope memory protection + env-scrub + deterministic scope/destination allowlist. Everything
+above is future work, clearly labelled.
 
 ---
 
-## 8. Minimizing `claude-sdk` (security must not depend on it)
+## 8. Transport: agent↔Advocate channel is loopback TCP (revised 2026-06-16d)
 
-The agent has no network, so `claude-sdk` cannot call Anthropic/MCP/GitHub directly. All of it routes
-through the Advocate:
+**The channel is loopback TCP, not a Unix-domain socket.** The bundled `claude` CLI uses TCP for
+`ANTHROPIC_BASE_URL`; `cc+unix://` and `ANTHROPIC_UNIX_SOCKET` (the claude-ssh channel) are not
+the right mechanism here (the binary probe confirmed `ANTHROPIC_UNIX_SOCKET` is for the SSH remote
+use-case, not the local broker case). The Advocate listens on `127.0.0.1:<ephemeral-port>`.
 
-- **Model calls:** set `ANTHROPIC_BASE_URL` to the UDS-backed proxy. `claude-sdk` believes it is
-  calling Anthropic; the Advocate injects `#anthropic_key` and forwards. The agent never holds the key.
-- **MCP:** servers are launched by the **Advocate** (with their `#secrets`); the agent calls them as
-  RPCs over the UDS. No raw Bearer/`env` secret in the agent box.
-- **GitHub / HTTP tools:** brokered by the Advocate with scoped tokens injected server-side.
+Transport shape per channel:
+
+- **Anthropic (model calls):** `ANTHROPIC_BASE_URL=http://127.0.0.1:<proxy-port>`,
+  `ANTHROPIC_API_KEY=dummy-key` in the agent env. The Advocate proxy strips the dummy key, injects
+  `#anthropic_key`, and forwards to `api.anthropic.com`. **Upstream must be pinned** — the proxy
+  must never forward to a host supplied by the agent.
+- **MCP:** `MCP_PROXY_URL` (or `MCP_PROXY_PATH`) in the agent env points at the Advocate loopback
+  port. The CLI routes MCP traffic there; the Advocate dispatches to real MCP servers with their
+  `#secrets` injected server-side. **Status: mechanism confirmed via binary string probe; end-to-end
+  wiring not yet validated — Phase 5 must confirm MCP tool calls reach the proxy.**
+- **GitHub:** `HTTPS_PROXY=http://127.0.0.1:<proxy-port>` for the agent process, with a thin shim
+  (or HTTP-over-loopback proxy) that the Advocate serves. Alternative: a `gh`-shim binary on the
+  agent's `PATH` that translates `gh api …` calls to loopback RPCs at `/v1/github`. **Status:
+  unconfirmed — Phase 5 must validate.**
 
 Consequence: even if `claude-sdk`'s `permission_mode`/`allowed_tools`/`settings_json` are bypassed or
-buggy, there is nothing in the agent box to steal and nowhere to send it. `claude-sdk` is reduced to a
-loop engine. (This also makes the Advocate engine-agnostic — a non-Claude runner plugs in the same
-way.)
+buggy, the agent holds no reusable credentials. `claude-sdk` is reduced to a loop engine. (This also
+makes the Advocate engine-agnostic — a non-Claude runner plugs in the same way.)
+
+**Important V0 caveat:** the loopback TCP channel is not the agent's only network path — the agent
+has full container network access. A sophisticated hijacked agent could bypass the proxy and call
+upstreams directly (with a leaked dummy key, not the real key). The broker protects credential
+theft, not all data exfiltration. See §9 and §8.3–8.4.
 
 ---
 
@@ -342,8 +438,8 @@ dummy header plus data, never a reusable credential.
 
 | Credential | Mechanism | Protected? | Caveat |
 |---|---|---|---|
-| Anthropic `#anthropic_key` | UDS proxy injects the key; the agent holds a **dummy** key; upstream pinned to `api.anthropic.com` | **Yes** — static, never in the box | the proxy MUST pin its own upstream and never forward to an agent-supplied host, or the real key leaks |
-| Keboola `KBC_TOKEN` | parent does all Storage I/O (`/data/in`→`/data/out`); Keboola MCP brokered to the stack `connection.*` host | **Yes** — the agent does not need it by default | highest blast radius (whole project) → pair with a **least-privilege Storage token** |
+| Anthropic `#anthropic_key` | loopback-TCP proxy injects the key; agent holds a **dummy** key; upstream pinned to `api.anthropic.com` | **Yes** — static, never in the box | proxy MUST pin its own upstream and never forward to an agent-supplied host, or the real key leaks |
+| Keboola `KBC_TOKEN` | parent does all Storage I/O (`/data/in`→`/data/out`); Keboola MCP brokered; env-scrub prevents environ exposure | **Yes** — agent env cleared; env-scrub required | highest blast radius (whole project) → pair with a **least-privilege Storage token**; env-scrub is required, not optional |
 | GitHub **PAT** | token injected server-side; upstream pinned to `api.github.com` | **Yes** — static | use a **fine-grained, repo-scoped** PAT |
 | GitHub **App** install token | `POST /app/installations/{id}/access_tokens` **returns the token in the response body** | **Only if** the Advocate performs the exchange itself and never forwards the token | if the agent is allowed to trigger the exchange, the install token lands in its context → **unprotected** |
 | Everything else — Salesforce & arbitrary third-party APIs, other MCP server secrets, **secrets a user pastes into the prompt** | — | **No** (POC) | destination-limited only by the opt-in egress allowlist (§8.3–8.4); never theft-proof |
@@ -430,24 +526,41 @@ calls or the agent's GitHub/Storage tools.
 Shippable in-container in this POC (forced proxy + blocked direct egress when the list is set); the
 VM/E2B form (§11) is the stronger V2 of the same idea.
 
+**V0 caveat on egress allowlist enforcement:** "blocking direct sockets" in the opt-in tightening
+path requires the same in-container mechanism as hard egress (seccomp or netns) — which the on-platform
+probe showed is unavailable. In V0, the egress allowlist is therefore **advisory/soft**: the proxy
+denies out-of-allowlist destinations when the agent routes through it, but the agent is not forced
+to use the proxy and could open a raw socket to bypass it. Honest characterization: the allowlist
+closes the egress hole against an agent that honours the proxy (the common case for an LLM agent
+driven by tool calls) but does not hold against a deliberately evasive exploit. The VM/E2B path
+(§11) is the only V0-to-hard upgrade path.
+
 ---
 
-## 9. What is provable vs heuristic (honesty)
+## 9. What is provable vs heuristic (honesty) — revised 2026-06-16d
 
-**What the POC actually relies on:**
+**What Broker V0 actually relies on (provable, on-platform verified):**
 
-| Layer | Strength |
-|---|---|
-| seccomp `AF_INET` deny (network kill) | **provable** (kernel-enforced, guaranteed per kbc-stacks) |
-| UID + `chmod 600` + cleared env (secret-file/env) | **provable** |
-| cross-UID no-ptrace (memory) | **provable** |
-| deterministic contract check (cap/dest/scope) | **provable** |
+| Layer | Mechanism | Strength | Condition |
+|---|---|---|---|
+| Reusable credential theft prevention | Config file unlinked before agent spawn; agent env cleared; loopback-TCP proxy injects real key server-side; agent holds only dummy values | **Provable** — agent process cannot access the credential file or the values by any standard path | proxy must pin its own upstream; env-scrub must be implemented for KBC_TOKEN |
+| Memory isolation (Advocate heap secrets) | `ptrace_scope=1` on-platform (verified): descendant cannot PTRACE_ATTACH or read `/proc/<advocate>/mem` | **Provable** subject to runtime dependency | depends on runtime keeping `ptrace_scope >= 1`; escalate if changed |
+| KBC_TOKEN environ isolation | Advocate env-scrub re-exec: KBC_TOKEN passed via inherited fd, stripped from exec-time env; `/proc/<advocate>/environ` no longer exposes it | **Provable** when env-scrub is implemented; **NOT provable** before it | env-scrub is a required step |
+| Deterministic contract check | Every brokered action checked against frozen contract (cap / destination / scope); hard deny on mismatch; no LLM in the path | **Provable** — deterministic rule, auditable | gate correctness depends on contract derivation logic |
 
-That is the whole security basis: a hijacked agent has no network and no secrets, and may only call
-destinations the deterministic allowlist already permits. No probabilistic component is load-bearing.
+**What Broker V0 does NOT provide (be explicit — do not overclaim):**
 
-The §7.4 items (bit-budget, LLM judge, runtime provenance) are **not** in this table on purpose — they
-are future research, not guarantees, and nothing depends on them.
+| Gap | Why | Mitigation |
+|---|---|---|
+| Hard network egress kill | No seccomp AF_INET deny (breaks loopback TCP); no netns (unshare unavailable); no iptables (CAP_NET_ADMIN unavailable) | Egress allowlist is advisory/soft (§8.4); VM/E2B (§11) for hard kill |
+| Forced proxy (agent cannot bypass) | Agent has full container network; can open direct TCP sockets | Same |
+| KBC_TOKEN environ isolation (without env-scrub) | `/proc/<advocate>/environ` is readable by same-uid agent | Implement env-scrub (§5.1 point 3); interim: least-privilege Storage token |
+| UID-based file isolation | No UID drop (euid=1000 forced by platform); config isolation is by unlink, not permissions | Unlink must happen before agent spawn; do not re-create config.json |
+| ptrace_scope guarantee | V0 depends on runtime keeping ptrace_scope >= 1; a platform change to 0 breaks memory isolation | Document as runtime dependency; verify in Phase 0 probe |
+| Arbitrary MCP / third-party secret protection | Only the three brokered credentials (Anthropic, KBC, GitHub) are never in the agent box; all other secrets are not covered | Egress allowlist (§8.4); doc limitation in §8.1 |
+
+That is the full honest picture. The §7.4 items (bit-budget, LLM judge, runtime provenance) are
+**not** relied on — they are future research and nothing in V0 depends on them.
 
 ---
 
@@ -474,16 +587,36 @@ autonomous within a blast radius the platform bounds invisibly.
 
 ---
 
-## 11. Residual risk & the V2 path
+## 11. Residual risk & the V2 path (revised 2026-06-16d)
 
-- The boundary is **kernel-enforced but intra-container**. Against prompt injection it is strong (no
-  network, no secrets for the agent). Against a **kernel/sandbox escape** (0-day LPE) it does not
-  hold — that compromises the whole container including the parent's secrets. Accepted for **internal
-  dev agents**; it is a far higher bar than prompt injection.
-- **Customer-facing / multi-tenant (V2):** route to a VM-grade backend. `kbc-stacks` exposes
-  `runtimeBackendType: e2bSandbox` (E2B microVM) as the strongest existing isolation — if a job can
-  opt into it, that gives a VM boundary **without building plan-v3**. This is the recommended V2
-  direction (open question §12.2).
+**V0 is a soft in-container boundary, not a hard sandbox.** This is the honest assessment:
+
+- **Credential theft (the three brokered paths):** strongly mitigated by V0. A hijacked agent
+  cannot obtain `#anthropic_key`, `#github_token`, or (with env-scrub) `KBC_TOKEN` by any standard
+  path. This is the primary protection V0 delivers.
+- **Data exfiltration to arbitrary hosts:** NOT prevented. The agent has full container network.
+  It can POST data to any host. The egress allowlist (§8.4) is soft/advisory — an evasive exploit
+  bypasses it. For a trust-me agent (the current LLM-driven use case) the proxy-enforced allowlist
+  is a meaningful barrier; for an active exploit it is not.
+- **Authority abuse within allowed scope:** NOT prevented by V0. A hijacked agent with a valid
+  brokered GitHub token can still do whatever the token permits within the contract scope. The
+  deterministic gate bounds scope to what is declared; it does not prevent the agent from exhausting
+  that scope maliciously (e.g., opening hundreds of PRs to declared repos).
+- **KBC_TOKEN exposure without env-scrub:** NOT prevented until env-scrub is implemented. The
+  agent can read `/proc/<advocate>/environ`. Do not ship without env-scrub or a least-privilege
+  token.
+- **ptrace_scope regression:** if the platform sets `ptrace_scope=0`, memory isolation breaks and
+  the agent can read the Advocate's heap (containing decrypted secrets). V0 depends on
+  `ptrace_scope >= 1`; verify on every platform/runtime change.
+- **Kernel/sandbox escape (0-day LPE):** as before, not in scope — this compromises the whole
+  container including the parent. Accepted for internal dev agents. It is a far higher bar than
+  prompt injection.
+
+**Hard boundary = VM (deprioritised by user).** The "ZERO secrets / ZERO internet" agent boundary
+described in earlier spec drafts requires a VM-grade backend. `kbc-stacks` exposes
+`runtimeBackendType: e2bSandbox` (E2B microVM) as the strongest existing isolation — the user has
+deprioritised this path. It remains the only route from V0's soft boundary to a hard guarantee and
+is recorded here as theoretical V2. Do not design current code around it.
 
 ---
 
@@ -555,6 +688,47 @@ Raw probe output:
 }
 ```
 
+> **NOTE (2026-06-16d):** The local Docker result above is **superseded by the on-platform findings
+> in §12.6** for the actual design. The local probe ran as root (euid=0) and could setuid + use
+> seccomp AF_INET deny without issue; kbc-stacks forces euid=1000 and the model pivots entirely.
+> The ctypes-BPF seccomp implementation remains useful for future hardening if/when the platform
+> allows it, but is NOT in the V0 critical path.
+
+---
+
+### 12.6 On-platform runtime findings (2026-06-16) — DESIGN-AUTHORITY RECORD
+
+> Environment: kbc-stacks job-queue runner (production).
+> Probe jobs: 47975338, 47976834, 47978513 (branch images advocate-broker-21/22/23).
+> These findings OVERRIDE the local Docker probe in §12.5 and drive the V0 design.
+
+**Summary: the root+UID-drop+seccomp-net-kill floor is INVALID on the real platform.**
+
+| Finding | Result | Impact on design |
+|---|---|---|
+| Effective UID | **euid=1000**, cap_eff=0 (zero capabilities) — even with `USER root` in the Dockerfile; the runner overrides it | No root→agent UID-drop possible; setuid(AGENT_UID) fails |
+| CAP_SYS_ADMIN / CAP_NET_ADMIN | **Absent** (cap_eff=0) | `unshare(CLONE_NEWNET)` fails; `iptables` unavailable |
+| `unshare(CLONE_NEWNET)` | **EPERM** | No network namespace; no per-UID egress |
+| seccomp AF_INET deny on agent | **NOT USABLE** — the bundled `claude` CLI uses loopback TCP for `ANTHROPIC_BASE_URL`; blocking AF_INET kills model calls | Cannot use seccomp net-kill as designed; transport pivots to loopback TCP |
+| `ptrace_scope` | **= 1** (confirmed) — same-uid descendant CANNOT `PTRACE_ATTACH` or read `/proc/<parent>/mem` (EPERM verified) | Memory isolation holds without UID boundary; this is V0's memory protection |
+| `/proc/<parent>/environ` | **Readable** by same-uid agent (not Yama-gated) | KBC_TOKEN in Advocate exec-time env is exposed → env-scrub required |
+| Keboola component-custom-python Dockerfile | Contains comment: "Keboola running containers with -u 1000:1000" | Confirms euid=1000 is a platform-wide policy, not a transient config |
+
+**Conclusions recorded for Phase 5 implementer:**
+
+1. Drop `setuid`, `prctl(NO_NEW_PRIVS)`, seccomp AF_INET deny, unshare from the V0 implementation.
+   They either fail or break the transport. The `sandbox.py` module built in Phase 1 needs to be
+   simplified accordingly (see plan §15, task #15).
+2. The Advocate and agent run as the same euid=1000. The only boundary is: unlink config.json +
+   clear agent env + env-scrub the Advocate + loopback-TCP credential injection + ptrace_scope=1
+   memory protection.
+3. Implement env-scrub (re-exec Advocate with scrubbed env, KBC_TOKEN via inherited fd) before
+   spawning the agent. This is a security requirement in V0, not optional.
+4. The egress allowlist (§8.4) is soft in V0. Be honest about this in any external communication.
+5. The loopback TCP transport is confirmed for Anthropic (ANTHROPIC_BASE_URL); MCP (MCP_PROXY_URL)
+   and GitHub (shim or HTTPS_PROXY) are the mechanism, but end-to-end wiring must be validated in
+   Phase 5.
+
 ---
 
 ## 13. Discarded alternatives (and why)
@@ -576,16 +750,17 @@ Raw probe output:
 
 ---
 
-## 14. Code impact (initial-implementation → this branch)
+## 14. Code impact (initial-implementation → this branch) — revised 2026-06-16d
 
 | Area | Change |
 |---|---|
-| `src/component.py` | Split `run()` into **Advocate parent** (secrets, Storage I/O, gate, teardown) and **agent spawn** (seccomp + UID-drop + exec). Stop building the agent env with secrets (`_build_env`); build a **cleared** env + `ANTHROPIC_BASE_URL`=UDS. |
-| `src/claude_runner.py` | Point the SDK at the UDS proxy; drop direct secret injection into agent env. |
-| `src/plugin_manager.py` | Stop `{**os.environ, **env}` subprocess inheritance (secret leak); plugin install moves to the Advocate side or a netless, secret-free path. |
-| new `src/advocate/` | UDS server, Anthropic proxy, MCP/GitHub brokers, the contract gate (§7), sandbox launcher (seccomp/uid/optional-namespaces). |
-| `Dockerfile` | (optional) add `bubblewrap`/`nsjail` for §5.2; ensure parent can run as root and drop UID. |
-| tests | datadir/VCR unchanged for the happy path; add: seccomp-blocks-INET, agent-cannot-read-config, agent-env-has-no-secrets, gate denies off-contract dest. |
+| `src/component.py` | Split `run()` into **Advocate parent** (reads config, unlinks config.json, env-scrub re-exec, starts loopback-TCP proxy/brokers, spawns agent with cleared env, promotes outputs to /data/out) and **agent exec** (no setuid, no seccomp, just exec with cleared env). |
+| `src/claude_runner.py` | Point the SDK at the loopback-TCP proxy (`ANTHROPIC_BASE_URL=http://127.0.0.1:<port>`, `ANTHROPIC_API_KEY=dummy`); drop direct secret injection into agent env. |
+| `src/plugin_manager.py` | Stop `{**os.environ, **env}` subprocess inheritance (secret leak); plugin install moves to the Advocate side (before agent spawn, with secrets still available). |
+| new `src/advocate/` | Loopback-TCP server, Anthropic proxy (injects `#anthropic_key`, pins upstream), MCP proxy (injects MCP `#secrets`), GitHub broker/shim (injects `#github_token`), contract gate (§7), env-scrub re-exec helper. **Drop:** UDS server, seccomp/UID sandbox launcher — replaced by loopback-TCP + cleared env. |
+| `src/advocate/sandbox.py` (Phase 1 artifact) | Simplify or remove the seccomp/setuid launcher: those mechanisms do not work on the platform (§12.6). Keep the module as a placeholder for future V1+ hardening but do not invoke it in the V0 critical path. |
+| `Dockerfile` | No setuid/UID-drop setup needed; no bubblewrap/nsjail. Ensure the Advocate reads config.json and unlinks it before agent spawn. |
+| tests | datadir/VCR unchanged for the happy path; add: config-file-unlinked-before-agent-start, agent-env-has-no-secrets (no KBC_TOKEN, no #keys), advocate-environ-does-not-expose-kbc-token (env-scrub), proxy-injects-real-key-not-dummy, gate-denies-off-contract-dest. **Remove:** seccomp-blocks-INET (mechanism not used in V0), agent-cannot-read-config-by-uid (unlink is the mechanism now). |
 
 ---
 
