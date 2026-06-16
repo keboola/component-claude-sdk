@@ -82,6 +82,51 @@ remains.
 - [ ] **Out of POC (spec §7.4), do not build now:** egress bit-budget, secret-blind LLM judge,
       runtime provenance-freeze. Demoted to future research; nothing depends on them.
 
+## Phase 3 findings — CLI wiring (Phase 5 input)
+
+> Investigated by the Phase 3 implementer.  These findings inform Phase 5's wiring work.
+> Verified by grepping the bundled claude CLI binary at `/Users/matyasjirat/.local/bin/claude`
+> (Mach-O arm64, strings-extracted).
+
+### Anthropic proxy (confirmed, Phase 2)
+
+`ANTHROPIC_UNIX_SOCKET` is present in the binary with context string:
+`"process.env.ANTHROPIC_UNIX_SOCKET is set (claude ssh remote), and the local proxy is API-key-authed."`.
+Setting this env var in the agent's cleared env points the CLI's Anthropic calls at the Advocate UDS.
+This is the same mechanism Phase 2 already relies on.
+
+### MCP wiring (confirmed mechanism, Phase 5 to implement)
+
+The binary contains `MCP_PROXY_URL` and `MCP_PROXY_PATH` env var names.  The pattern
+`lmK(H)` parses `"uds:<path>"`, raw Unix paths (`/…`), and Windows named pipes.
+
+**Recommended Phase 5 approach**: For each configured MCP server, point its URL at
+`uds://<advocate-socket-path>` (for remote/HTTP servers) or set `MCP_PROXY_PATH` to the socket path
+(for stdio servers).  The CLI will route the MCP traffic to the Advocate UDS; the broker
+dispatches to the real server with secrets injected server-side.  **NOT YET WIRED** — Phase 5 must
+validate by launching the CLI with these env vars set and confirming MCP tool calls reach
+`/v1/mcp` on the UDS.
+
+### GitHub wiring (unconfirmed, Phase 5 to investigate)
+
+The binary has `GITHUB_API_URL` (likely `gh` CLI convention) and the standard HTTP proxy vars
+(`HTTP_PROXY`, `HTTPS_PROXY`).  The CLI's GitHub tooling uses `gh` / `git` CLI subprocesses;
+those tools respect `GITHUB_API_URL` and `HTTPS_PROXY` for HTTP-level interception.
+
+**Phase 5 approach (to verify)**: Set `HTTPS_PROXY=http+unix://<socket>/<path>` for the agent
+process; write a thin HTTP-over-UDS proxy shim that the Advocate serves on the UDS alongside the
+broker endpoints.  Alternative: a thin shim binary named `gh` on the agent's `PATH` that
+translates `gh api …` calls to UDS RPCs at `/v1/github`.
+
+The shim approach is simpler and avoids TLS interception.  Phase 5 must confirm by running
+`gh api /repos/…` in the agent box with the shim and verifying the Advocate receives the RPC.
+
+**`unix_socket_3p_under_pin` / `unix_socket_ssh_under_pin`** — these appear to be telemetry tags
+for managed-policy enforcement when the CLI detects a UDS; they do not block UDS use but may emit
+warnings about org-pin requirements.  Not blocking for the POC.
+
+---
+
 ## Phase 5 — Wire `component.py` (TDD/integration)
 
 - [ ] Split `run()` into Advocate-parent vs agent-spawn (spec §6 boot sequence).
