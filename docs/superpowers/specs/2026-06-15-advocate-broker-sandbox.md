@@ -22,8 +22,10 @@
 > install tokens are only protected if the Advocate owns the token exchange; everything else (arbitrary
 > third-party APIs, other MCP secrets, user-pasted secrets) is **explicitly unprotected** in the POC.
 > Added the two structural limits that bound it (per-service plumbing; credential-returning auth flows)
-> and elevated **controlled egress** as the general answer for everything the broker can't cover. The
-> single most useful framing of this whole spec now lives in **§8.1–8.3** — read that first.
+> and elevated **controlled egress** as the general answer for everything the broker can't cover —
+> including an **opt-in, default-open egress allowlist** (§8.4) that bounds where the agent can send
+> without the config-hell of a fail-closed contract. The single most useful framing of this whole spec
+> now lives in **§8.1–8.4** — read that first.
 
 ---
 
@@ -344,7 +346,7 @@ dummy header plus data, never a reusable credential.
 | Keboola `KBC_TOKEN` | parent does all Storage I/O (`/data/in`→`/data/out`); Keboola MCP brokered to the stack `connection.*` host | **Yes** — the agent does not need it by default | highest blast radius (whole project) → pair with a **least-privilege Storage token** |
 | GitHub **PAT** | token injected server-side; upstream pinned to `api.github.com` | **Yes** — static | use a **fine-grained, repo-scoped** PAT |
 | GitHub **App** install token | `POST /app/installations/{id}/access_tokens` **returns the token in the response body** | **Only if** the Advocate performs the exchange itself and never forwards the token | if the agent is allowed to trigger the exchange, the install token lands in its context → **unprotected** |
-| Everything else — Salesforce & arbitrary third-party APIs, other MCP server secrets, **secrets a user pastes into the prompt** | — | **No** (POC) | covered only by §8.3 (controlled egress) |
+| Everything else — Salesforce & arbitrary third-party APIs, other MCP server secrets, **secrets a user pastes into the prompt** | — | **No** (POC) | destination-limited only by the opt-in egress allowlist (§8.3–8.4); never theft-proof |
 
 ### 8.2 Two limits that bound the broker (why it is only three paths)
 
@@ -380,6 +382,53 @@ overridden by prompt injection by definition, and the agent can still leak via e
 tool. It is recorded here only to be explicitly ruled out. The orthogonal damage-cap that *is* always
 worth applying — independent of mechanism — is **least-privilege, short-TTL / scoped tokens**: it caps
 blast radius if a secret is exposed, but does not prevent the exposure.
+
+### 8.4 Opt-in egress allowlist (config) — permissive by default, tightened on demand
+
+Controlled egress (§8.3) need not be all-or-nothing or deferred to V2. The pragmatic, GA-friendly form
+is a **config-driven host allowlist that defaults to "all"**:
+
+```jsonc
+{
+  "egress_unrestricted": true,            // UI toggle: "Allow all internet access" (default ON)
+  // when false, the UI reveals a creatable host list (Keboola options.dependencies):
+  "egress_allowlist": ["github.com", "*.githubusercontent.com", "api.example.com"]
+}
+```
+
+**UI shape:** a single **"Allow all internet access"** boolean, default **on** (= full internet).
+Turning it **off** reveals a creatable host list (an `array` field shown conditionally via
+`options.dependencies`). Off with an **empty** list = maximum lockdown: the agent reaches *only* the
+brokered services and nothing else. The brokered three (Anthropic, GitHub, Keboola Storage) route
+through the Advocate's own pinned upstreams and are therefore **exempt from this list** — a user who
+restricts egress never has to add them by hand, and flipping the toggle off must never break model
+calls or the agent's GitHub/Storage tools.
+
+- **Default = open.** With no allowlist the agent has full internet — zero config tax, GA preserved.
+  This is the deliberate inverse of the rejected frozen per-job contract (§7), which fails *closed* on
+  anything the user forgot to declare. Here, forgetting to configure means *more* access, not a broken
+  job. "Secure by architecture, permissive by configuration" realised as a **permissive default +
+  opt-in coarse allowlist** rather than a mandatory derived contract.
+- **Opt-in tightening.** A user who cares sets the list once in config. When the list is non-empty the
+  Advocate engages the egress chokepoint — the agent's traffic is forced through the Advocate's proxy
+  and **direct sockets are blocked** (otherwise the agent just ignores the proxy) — and **denies any
+  destination not on the list, returning the denial as a normal tool error to the SDK** (e.g.
+  `egress denied: <host> not in allowlist`). The model sees a failed call and adapts rather than
+  hanging. The expensive enforcement only runs when the user actually asks for it.
+- **Enforcement granularity (do not oversell):** **host/domain** matching is enforced cleanly from the
+  TLS SNI / `CONNECT` target (`github.com`, `*.example.com`). **Path-level** rules
+  (`example.com/branch/*`) are **not** enforceable for HTTPS without terminating TLS at the proxy with
+  an agent-trusted CA (a MITM) — so the POC supports host/domain allowlisting and treats path-level as
+  out of scope (or behind explicit TLS termination).
+- **What it buys / does not:** it limits *where* the agent can send, closing the **data-exfil** hole the
+  permissive default otherwise leaves (a hijacked agent can no longer POST repo/table data to an
+  arbitrary host — including secrets a user pasted into the prompt). It does **not** stop *authority
+  abuse* within an allowed host (a malicious push to an allowed repo), and it is independent of the
+  broker — the two compose: the broker keeps the three credentials out of the agent; the allowlist
+  bounds where everything else can go.
+
+Shippable in-container in this POC (forced proxy + blocked direct egress when the list is set); the
+VM/E2B form (§11) is the stronger V2 of the same idea.
 
 ---
 
