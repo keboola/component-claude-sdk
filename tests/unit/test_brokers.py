@@ -860,6 +860,7 @@ class TestMcpStdioTimeout:
         mock_proc.stdin.flush = MagicMock()
         # stdout needs a real fileno for select; use a real pipe read-end.
         import os as _os  # noqa: PLC0415
+
         r_fd, w_fd = _os.pipe()
         # Leave the write end open but never write — select will time out.
         mock_proc.stdout = _os.fdopen(r_fd, "rb")
@@ -870,6 +871,7 @@ class TestMcpStdioTimeout:
         mcp_broker._proc_locks["hung-mcp"] = threading.Lock()
 
         from advocate import idempotency  # noqa: PLC0415
+
         idempotency.clear()
 
         payload = {"action_id": "hung-1", "server_name": "hung-mcp", "method": "tools/list"}

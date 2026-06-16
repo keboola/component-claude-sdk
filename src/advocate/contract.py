@@ -196,7 +196,7 @@ def verify_contract(envelope: dict, secret: bytes) -> bool:
     try:
         contract = envelope["contract"]
         claimed_sig = envelope["signature"]
-    except KeyError, TypeError:
+    except (KeyError, TypeError):  # fmt: skip
         log.warning("contract verification failed: missing contract or signature")
         return False
 

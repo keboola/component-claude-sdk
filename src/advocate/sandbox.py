@@ -164,15 +164,15 @@ def build_seccomp_filter() -> bytes:
     # insn 6: JEQ AF_INET6;   jt=0 (match→insn 7 DENY), jf=1 (no-match→skip insn 7→insn 8 ALLOW)
 
     insns = b""
-    insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, 4)              # 0: load arch field
+    insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, 4)  # 0: load arch field
     insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH, 0, 5)  # 1: arch match→2, mismatch→7 (DENY)
-    insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, 0)              # 2: load nr field
-    insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, NR_SOCKET, 0, 4)   # 3: socket→4, other→8 (ALLOW)
-    insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, 16)             # 4: load args[0] (domain)
-    insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, AF_INET, 1, 0)     # 5: AF_INET→7 (DENY), else→6
-    insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, AF_INET6, 0, 1)    # 6: AF_INET6→7 (DENY), else→8 (ALLOW)
-    insns += _bpf_stmt(BPF_RET | BPF_K, EACCES_RET)              # 7: DENY
-    insns += _bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)       # 8: ALLOW
+    insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, 0)  # 2: load nr field
+    insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, NR_SOCKET, 0, 4)  # 3: socket→4, other→8 (ALLOW)
+    insns += _bpf_stmt(BPF_LD | BPF_W | BPF_ABS, 16)  # 4: load args[0] (domain)
+    insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, AF_INET, 1, 0)  # 5: AF_INET→7 (DENY), else→6
+    insns += _bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, AF_INET6, 0, 1)  # 6: AF_INET6→7 (DENY), else→8 (ALLOW)
+    insns += _bpf_stmt(BPF_RET | BPF_K, EACCES_RET)  # 7: DENY
+    insns += _bpf_stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)  # 8: ALLOW
 
     assert len(insns) % 8 == 0
     return insns

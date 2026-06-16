@@ -275,7 +275,9 @@ def test_error_result_not_cached_retry_calls_upstream_again() -> None:
                     headers={"content-type": "application/json"},
                 )
             assert resp2.status_code == 200
-            assert mock_call.call_count == 2, f"expected 2 upstream calls (error not cached), got {mock_call.call_count}"
+            assert mock_call.call_count == 2, (
+                f"expected 2 upstream calls (error not cached), got {mock_call.call_count}"
+            )
     finally:
         server.stop()
 
