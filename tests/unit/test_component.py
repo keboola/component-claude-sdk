@@ -278,24 +278,37 @@ def test_memory_warning_silent_without_mcp_or_plugins(caplog):
     assert not any("runtime.backend.type" in r.message for r in caplog.records)
 
 
-def test_build_env_sets_writable_caches_for_read_only_image():
-    """uvx/npx MCP launchers default their cache + HOME to the read-only image
-    root and die before the server starts (Finding 5). _build_env must redirect
-    HOME and the uv/npm/xdg caches to the writable /tmp."""
+def test_build_cleared_env_sets_loopback_routing_and_writable_caches():
+    """Broker V0: _build_cleared_env must point the agent at the loopback proxy
+    (ANTHROPIC_BASE_URL), carry a dummy API key (never the real one), redirect
+    HOME and the uv/npm/xdg caches to the writable /tmp (Finding 5), and contain
+    NO real secrets (no real anthropic key, no KBC_TOKEN, no GITHUB_TOKEN)."""
     import component as component_module
+    from component import _DUMMY_ANTHROPIC_KEY
     from configuration import Configuration
 
-    cfg = Configuration(**{"#anthropic_key": "KEY_NAME_ONLY"})
-    env = Component._build_env(cfg)
+    cfg = Configuration(**{"#anthropic_key": "REAL_KEY_NEVER_IN_AGENT_ENV"})
+    proxy_port = 54321
+    env = Component._build_cleared_env(cfg, proxy_port)
+
+    # Loopback proxy routing
+    assert env["ANTHROPIC_BASE_URL"] == f"http://127.0.0.1:{proxy_port}"
+    # Dummy key — NOT the real key
+    assert env["ANTHROPIC_API_KEY"] == _DUMMY_ANTHROPIC_KEY
+    assert env["ANTHROPIC_API_KEY"] != "REAL_KEY_NEVER_IN_AGENT_ENV"
+
+    # Writable caches (Finding 5)
     assert env["HOME"] == component_module.AGENT_HOME
     assert env["UV_CACHE_DIR"] == component_module.UV_CACHE_DIR
     assert env["NPM_CONFIG_CACHE"] == component_module.NPM_CONFIG_CACHE
     assert env["XDG_CACHE_HOME"] == component_module.XDG_CACHE_HOME
-    # every redirected path is under the writable /tmp
     for key in ("HOME", "UV_CACHE_DIR", "NPM_CONFIG_CACHE", "XDG_CACHE_HOME"):
         assert env[key].startswith("/tmp/")
-    # secrets still threaded
-    assert env["ANTHROPIC_API_KEY"] == "KEY_NAME_ONLY"
+
+    # NO secrets in the agent env
+    assert "KBC_TOKEN" not in env
+    assert "GITHUB_TOKEN" not in env
+    assert "GH_TOKEN" not in env
 
 
 def test_run_task_launch_failure_is_user_exception(tmp_path, monkeypatch):

@@ -239,7 +239,7 @@ class TranscriptWriter:
         return row
 
     @staticmethod
-    def _project_content_blocks(message: Any, row: dict[str, str]) -> None:
+    def _project_content_blocks(message: Any, row: dict[str, Any]) -> None:
         texts: list[str] = []
         for block in getattr(message, "content", []) or []:
             block_type = type(block).__name__

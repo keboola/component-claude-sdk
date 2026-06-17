@@ -270,6 +270,70 @@ After the agent loop the component promotes every `*.csv` in `/tmp/outputs/` to
 configuration error. The destination is never set — the component relies on the
 component's default bucket.
 
+Security model — Advocate Broker V0
+------------------------------------
+
+The component runs an intra-container **Advocate Broker** (V0) to prevent the LLM
+agent from accessing raw credentials at rest or in process memory. The broker is
+implemented without OS-level privilege separation (the Keboola job runner forces
+`euid=1000, cap_eff=0` — no root, no `setuid`, no `CAP_NET_ADMIN`) so the boundary
+is achieved through process arrangement and kernel memory protection.
+
+**What V0 protects:**
+
+- **Anthropic key** (`#anthropic_key`): never placed in the agent subprocess
+  environment. The agent's `ANTHROPIC_API_KEY` is a dummy value; every model call
+  goes through the Advocate's loopback-TCP proxy at `127.0.0.1:<port>`, which injects
+  the real key server-side and forwards the response. The agent cannot recover the
+  real key even if it reads its own environment.
+- **Keboola Storage token** (`KBC_TOKEN`): removed from the exec-time environment
+  via an `os.execve` re-exec (env-scrub) before the agent spawns. The token is passed
+  back to the Advocate via an inherited pipe fd and held only in process memory. With
+  env-scrub active, `/proc/<advocate>/environ` no longer exposes the token.
+- **GitHub token** (`#github_token`): not placed in the agent environment. GitHub
+  API calls are brokered server-side by the Advocate's `/v1/github` endpoint, which
+  checks every request against a frozen Intent Contract before forwarding.
+- **Config secrets at rest**: `config.json` is overwritten with a scrubbed copy
+  (all `#`-prefixed keys blanked) before the agent subprocess is started. The
+  decrypted values are held only in the Advocate's Python object.
+- **Advocate heap protection**: `ptrace_scope=1` (confirmed on-platform) prevents
+  the same-UID agent from attaching with `PTRACE_ATTACH` or reading
+  `/proc/<advocate>/mem`.
+- **Deterministic contract gate**: every brokered action (Anthropic call, GitHub
+  call, MCP call) is checked against a contract derived at run start from the
+  configuration — no LLM in the path, hard deny on mismatch.
+
+**Honest limits — what V0 does NOT provide:**
+
+- **Hard network egress kill**: `CAP_NET_ADMIN` (iptables), `unshare(CLONE_NEWNET)`,
+  and seccomp `AF_INET` deny are all unavailable on the current Keboola runtime (no
+  root, no capabilities). The agent retains full container network. The loopback proxy
+  is an egress routing hint, not a forced chokepoint — an adversarial agent can open
+  direct TCP sockets to arbitrary hosts.
+- **Forced proxy**: because there is no network namespace or seccomp kill, a
+  sufficiently motivated agent can bypass the Advocate and call the Anthropic API
+  directly (with the dummy key, it will get auth errors — but data exfiltration to
+  other hosts is not blocked at the OS level).
+- **Same-UID `/proc/environ` protection**: `/proc/<advocate>/environ` is readable
+  by same-UID processes and is NOT gated by `ptrace_scope`. Env-scrub (re-exec) is
+  the mitigation; without it, the KBC_TOKEN leaks. Env-scrub is implemented in V0.
+- **Arbitrary MCP / third-party secrets**: only the three brokered credentials above
+  are withheld from the agent. Any secret in a stdio MCP server's `env` map or an
+  HTTP MCP server's `headers` is visible to the agent through normal channel
+  enumeration unless the operator also brokers them.
+- **Runtime regression**: memory isolation depends on the platform maintaining
+  `ptrace_scope >= 1`. If the runtime changes this to 0, the isolation breaks.
+  Re-run `scripts/sandbox_probe.py` in a container when the platform configuration
+  changes (see spec `docs/superpowers/specs/2026-06-15-advocate-broker-sandbox.md`
+  §12.6).
+- **GitHub/MCP agent-side routing**: the Advocate's `/v1/github` and `/v1/mcp`
+  broker endpoints exist and gate requests against the contract, but end-to-end
+  routing through the CLI (e.g., via `HTTPS_PROXY`) is a documented follow-on and
+  has not been validated on-platform in V0.
+
+For the full design rationale, on-platform probe findings, and V1+ hardening path,
+see `docs/superpowers/specs/2026-06-15-advocate-broker-sandbox.md`.
+
 Development
 -----------
 

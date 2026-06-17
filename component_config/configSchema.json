@@ -60,17 +60,23 @@
           "description": "Claude model used for the agent's reasoning and tool calls.",
           "enum": [
             "claude-opus-4-8",
+            "claude-opus-4-8-20250514",
             "claude-sonnet-4-6",
-            "claude-haiku-4-5"
+            "claude-sonnet-4-6-20251101",
+            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001"
           ],
           "options": {
             "grid_columns": 6,
             "enum_titles": [
               "Claude Opus 4.8 — most capable",
+              "Claude Opus 4.8 (2025-05-14) — pinned release",
               "Claude Sonnet 4.6 — balanced",
-              "Claude Haiku 4.5 — fastest / cheapest"
+              "Claude Sonnet 4.6 (2025-11-01) — pinned release",
+              "Claude Haiku 4.5 — fastest / cheapest",
+              "Claude Haiku 4.5 (2025-10-01) — pinned release"
             ],
-            "tooltip": "Drives capability vs. cost for the whole run. In tasks-table mode a per-row 'model' column overrides this for that task. Costlier models burn the budget faster, so pair the model with Max Turns and Max Budget."
+            "tooltip": "Drives capability vs. cost for the whole run. In tasks-table mode a per-row 'model' column overrides this for that task. Costlier models burn the budget faster, so pair the model with Max Turns and Max Budget. Use a pinned (dated) id if the bare alias is unavailable on your API key."
           },
           "default": "claude-opus-4-8",
           "propertyOrder": 1
@@ -81,15 +87,21 @@
           "description": "Optional. Model used if the primary is unavailable.",
           "enum": [
             "claude-opus-4-8",
+            "claude-opus-4-8-20250514",
             "claude-sonnet-4-6",
-            "claude-haiku-4-5"
+            "claude-sonnet-4-6-20251101",
+            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001"
           ],
           "options": {
             "grid_columns": 6,
             "enum_titles": [
               "Claude Opus 4.8 — most capable",
+              "Claude Opus 4.8 (2025-05-14) — pinned release",
               "Claude Sonnet 4.6 — balanced",
-              "Claude Haiku 4.5 — fastest / cheapest"
+              "Claude Sonnet 4.6 (2025-11-01) — pinned release",
+              "Claude Haiku 4.5 — fastest / cheapest",
+              "Claude Haiku 4.5 (2025-10-01) — pinned release"
             ],
             "tooltip": "Passed to the SDK as fallback_model. Leave empty to fail rather than silently downgrade. A cheaper fallback keeps a job running through a transient capacity issue on the primary model."
           },
