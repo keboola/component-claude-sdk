@@ -776,6 +776,48 @@ class TestGithubCapabilityMapping:
 
         assert _github_capability("PATCH", "/repos/org/repo/issues/1") == "gh.write_branch"
 
+    def test_bare_repo_patch_maps_to_gh_admin(self) -> None:
+        """PATCH /repos/{o}/{r} (repo settings, incl. default_branch) → gh.admin."""
+        from advocate.server import _github_capability
+
+        assert _github_capability("PATCH", "/repos/org/repo") == "gh.admin"
+
+    def test_branch_protection_maps_to_gh_admin(self) -> None:
+        from advocate.server import _github_capability
+
+        assert _github_capability("PUT", "/repos/org/repo/branches/main/protection") == "gh.admin"
+
+    def test_repo_admin_write_denied_by_default_contract(self) -> None:
+        """A bare-repo PATCH (default_branch change) is denied under the default contract."""
+        from advocate import idempotency
+        from advocate.server import AdvocateServer
+
+        idempotency.clear()
+        cfg = _make_cfg(github_enabled=True)
+        c = derive_contract(cfg, operates_on="org/repo-X")
+        secret = new_invocation_secret()
+        envelope = sign_contract(c, secret)
+
+        server = AdvocateServer(
+            anthropic_key="dummy",
+            github_token="dummy",
+            contract_envelope=envelope,
+            contract_signing_secret=secret,
+        )
+        server.start()
+        try:
+            payload = {
+                "action_id": "admin-1",
+                "method": "PATCH",
+                "path": "/repos/org/repo-X",
+                "body": {"default_branch": "attacker-controlled"},
+            }
+            with _tcp_client(server.port) as client:
+                resp = client.post("/v1/github", json=payload, headers={"content-type": "application/json"})
+            assert resp.status_code == 403
+        finally:
+            server.stop()
+
     def test_delete_via_uds_denied_by_default_contract(self) -> None:
         """DELETE under the default github contract → 403 (gh.delete not granted)."""
         from advocate import idempotency
@@ -943,6 +985,65 @@ class TestWritableBranchGate:
             write_branch="agent/fix-1",
         )
         assert isinstance(result, GateAllow)
+
+    def test_path_traversal_repo_escape_denied_via_uds(self) -> None:
+        """`/repos/org/repo-X/../other` must NOT reach another repo (httpx collapses `..`)."""
+        from advocate.brokers import github_broker
+        from advocate.server import AdvocateServer
+
+        cfg = _make_cfg(github_enabled=True)
+        c = derive_contract(cfg, operates_on="org/repo-X")
+        secret = new_invocation_secret()
+        envelope = sign_contract(c, secret)
+
+        server = AdvocateServer(
+            anthropic_key="dummy",
+            github_token="dummy",
+            github_allowed_destinations=["/repos/org/repo-X"],
+            contract_envelope=envelope,
+            contract_signing_secret=secret,
+        )
+        server.start()
+        try:
+            # If the broker ever called upstream, this would explode the test.
+            with patch.object(github_broker, "_call_github", side_effect=AssertionError("must not reach upstream")):
+                for path in ("/repos/org/repo-X/../other-repo", "/repos/org/repo-X/../../org/secret"):
+                    payload = {"action_id": "trav-1", "method": "GET", "path": path}
+                    with _tcp_client(server.port) as client:
+                        resp = client.post("/v1/github", json=payload, headers={"content-type": "application/json"})
+                    assert resp.status_code in (400, 403), f"{path!r} expected deny, got {resp.status_code}"
+        finally:
+            server.stop()
+
+    def test_contents_write_without_branch_denied_via_uds(self) -> None:
+        """A Contents-API PUT with no explicit branch defaults to main → denied."""
+        from advocate.server import AdvocateServer
+
+        cfg = _make_cfg(github_enabled=True)
+        c = derive_contract(cfg, operates_on="org/repo-X")
+        secret = new_invocation_secret()
+        envelope = sign_contract(c, secret)
+
+        server = AdvocateServer(
+            anthropic_key="dummy",
+            github_token="dummy",
+            contract_envelope=envelope,
+            contract_signing_secret=secret,
+        )
+        server.start()
+        try:
+            payload = {
+                "action_id": "contents-1",
+                "method": "PUT",
+                "path": "/repos/org/repo-X/contents/app.py",
+                "body": {"message": "x", "content": "eA=="},  # no "branch" → default branch
+            }
+            with _tcp_client(server.port) as client:
+                resp = client.post("/v1/github", json=payload, headers={"content-type": "application/json"})
+            assert resp.status_code == 403
+            assert "branch" in resp.json()["error"]
+        finally:
+            server.stop()
 
     def test_push_to_main_denied_via_uds(self) -> None:
         """End-to-end: a PATCH that force-moves refs/heads/main → 403 at the gate."""

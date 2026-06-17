@@ -184,6 +184,30 @@ class TestGithubValidate:
         validated, err = github_broker.validate(raw)
         assert err is None
 
+    def test_rejects_dotdot_traversal(self) -> None:
+        """A `..` segment is rejected — httpx would collapse it to a different repo."""
+        for path in (
+            "/repos/org/repo/../other-repo",
+            "/repos/org/repo/../../org/secret-repo",
+            "/repos/org/repo/../victim-repo/contents/x",
+        ):
+            validated, err = github_broker.validate({"action_id": "t", "method": "GET", "path": path})
+            assert validated is None, f"{path!r} should be rejected"
+            assert "traversal" in err
+
+    def test_rejects_encoded_traversal_and_double_slash(self) -> None:
+        for path in ("/repos/org/repo/..%2fother", "//repos/org/repo", "/repos//org/repo"):
+            validated, err = github_broker.validate({"action_id": "t", "method": "GET", "path": path})
+            assert validated is None, f"{path!r} should be rejected"
+
+    def test_legitimate_dotted_filename_allowed(self) -> None:
+        """A real filename containing a dot is a single segment, not a `.` segment."""
+        validated, err = github_broker.validate(
+            {"action_id": "ok", "method": "GET", "path": "/repos/org/repo/contents/file.txt"}
+        )
+        assert err is None
+        assert validated is not None
+
     def test_agent_headers_field_accepted_but_will_be_discarded(self) -> None:
         """Agent may send headers field; it must be accepted (no 400) but never used."""
         raw = {

@@ -66,6 +66,14 @@
   check all bind to that single repo; ref-targeting REST writes are gated against
   `writable_branches` (default `agent/*`, so pushes to `main` are denied).
   `derive_contract` withholds all GitHub capabilities when `operates_on` is absent.
+  Hardened after adversarial re-verification: the GitHub broker now rejects path
+  traversal (`..`/`.`/`//`, raw and percent-decoded) at the validator — `httpx`
+  collapses `..` before the request, so `/repos/org/repo/../other` would otherwise
+  reach a different repo with the real PAT; Contents-API writes with no explicit
+  `branch` (which default to the repo default branch, often `main`) are denied; and
+  repository-settings / branch-protection writes (`PATCH /repos/{o}/{r}`,
+  `…/branches/*/protection`) require a withheld `gh.admin` capability so a
+  `write_branch`-scoped agent cannot re-point `default_branch` or disable protection.
 - **HIGH-4 — the Anthropic endpoint is gated.** `/v1/messages` runs the contract
   gate (capability `anthropic`, pinned destination) on both the structured and
   transparent-proxy paths before injecting the real key.

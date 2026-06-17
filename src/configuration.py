@@ -303,6 +303,12 @@ class Configuration(BaseModel):
             )
         return v
 
+    @field_validator("operates_on", mode="before")
+    @classmethod
+    def _strip_operates_on(cls, v):
+        """Trim surrounding whitespace so the stored repo scope is clean (HIGH-3)."""
+        return v.strip() if isinstance(v, str) else v
+
     @field_validator("task_id_filter", mode="before")
     @classmethod
     def _normalise_task_filter(cls, v):
@@ -332,7 +338,7 @@ class Configuration(BaseModel):
         broad access.
         """
         if self.github_enabled:
-            repo = (self.operates_on or "").strip()
+            repo = self.operates_on or ""
             if not repo:
                 raise UserException(
                     "github_enabled requires 'operates_on' (\"org/repo\") so the GitHub token is "
@@ -340,8 +346,11 @@ class Configuration(BaseModel):
                     "token against arbitrary repos."
                 )
             parts = repo.split("/")
-            if len(parts) != 2 or not all(p.strip() for p in parts):
-                raise UserException(f"operates_on must be in 'org/repo' form, got: {self.operates_on!r}")
+            # Exactly two non-empty segments and no embedded whitespace — a dirty
+            # value would otherwise flow into the scope/allowlist and silently
+            # mismatch the real repo path.
+            if len(parts) != 2 or not all(parts) or any(c.isspace() for c in repo):
+                raise UserException(f"operates_on must be in 'org/repo' form (no spaces), got: {self.operates_on!r}")
         return self
 
     @model_validator(mode="after")

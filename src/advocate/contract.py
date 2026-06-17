@@ -70,6 +70,11 @@ CAP_GH_OPEN_PR = "gh.open_pr"
 CAP_GH_COMMENT = "gh.comment"
 CAP_GH_MERGE = "gh.merge"
 CAP_GH_DELETE = "gh.delete"
+# Repository-settings / branch-protection writes (e.g. PATCH /repos/{o}/{r},
+# branch-protection endpoints). Elevated like gh.merge/gh.delete: NOT granted by
+# the default contract, so a write_branch-capable agent cannot change default_branch
+# or disable branch protection (which would undermine the writable-branch scope).
+CAP_GH_ADMIN = "gh.admin"
 
 # The Anthropic model channel.  Every contract grants this: the agent's ONLY
 # model channel is the loopback proxy (it cannot reach the real Anthropic

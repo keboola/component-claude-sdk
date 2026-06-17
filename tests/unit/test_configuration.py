@@ -69,6 +69,18 @@ def test_github_enabled_with_valid_operates_on_parses():
     assert cfg.writable_branches == ["agent/*"]
 
 
+def test_operates_on_surrounding_whitespace_is_stripped():
+    cfg = Configuration(**_base(github_enabled=True, operates_on="  org/repo-X  "))
+    assert cfg.operates_on == "org/repo-X"
+
+
+def test_operates_on_internal_whitespace_rejected():
+    """A dirty value like 'a / b' must be rejected, not silently stored."""
+    with pytest.raises(UserException) as exc:
+        Configuration(**_base(github_enabled=True, operates_on="a / b"))
+    assert "org/repo" in str(exc.value)
+
+
 def test_operates_on_optional_when_github_disabled():
     """operates_on stays optional when GitHub is off."""
     cfg = Configuration(**_base())

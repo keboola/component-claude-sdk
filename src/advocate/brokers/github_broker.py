@@ -26,6 +26,7 @@ import hashlib
 import json
 import logging
 import re
+import urllib.parse
 from typing import Any
 
 import httpx
@@ -48,6 +49,27 @@ _PATH_RE = re.compile(r"^/[a-zA-Z0-9_.~%!$&'()*+,;=:@/-]*$")
 _ALLOWED_FIELDS = frozenset({"action_id", "method", "path", "body", "headers"})
 
 _UPSTREAM_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0)
+
+
+def _is_safe_path(path: str) -> bool:
+    """Reject directory-traversal and empty path segments — the repo-scope escape.
+
+    The contract gate and the broker allowlist both match on the *literal* path
+    string, but ``httpx`` (and the GitHub server) collapse RFC 3986 dot-segments
+    *before the request is sent*. So a literal ``/repos/org/repo/../other-repo``
+    matches the allowed ``/repos/org/repo/`` prefix at gate/allowlist time, yet
+    the real token is injected against ``/repos/org/other-repo``. We close that by
+    hard-denying any path that contains a ``.``/``..`` segment or a ``//`` — in
+    both the raw and percent-decoded forms (so ``..%2f`` is caught too). GitHub
+    REST paths never legitimately need these; a real filename like ``file.txt`` is
+    a single segment, not a ``.`` segment, so it is unaffected.
+    """
+    for candidate in {path, urllib.parse.unquote(path)}:
+        if "//" in candidate:
+            return False
+        if any(seg in (".", "..") for seg in candidate.strip("/").split("/")):
+            return False
+    return True
 
 
 def _server_idem_key(method: str, path: str, body: dict | None) -> str:
@@ -94,6 +116,8 @@ def validate(raw: dict) -> tuple[dict | None, str | None]:
         return None, "path: must start with '/'"
     if not _PATH_RE.match(path):
         return None, "path: contains disallowed characters"
+    if not _is_safe_path(path):
+        return None, "path: directory traversal or empty segments are not allowed"
 
     body = raw.get("body")
     if body is not None and not isinstance(body, dict):

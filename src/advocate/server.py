@@ -26,6 +26,13 @@ _MAX_BODY_BYTES = 5_000_000
 _ACTION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 _MODEL_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 
+# Sentinel returned for a write whose target branch cannot be proven and which
+# GitHub would route to the repository's DEFAULT branch (typically ``main``) —
+# e.g. a Contents-API write with no explicit ``branch``. It never matches a
+# writable-branch glob (NUL is not a legal branch char), so the gate denies it
+# unless the contract explicitly allows all branches (``*``). Fail-closed.
+_DEFAULT_BRANCH_SENTINEL = "\x00default-branch"
+
 # Fields that the structured-agent path allows (action_id required).
 _ALLOWED_FIELDS = frozenset({"action_id", "model", "max_tokens", "messages", "stream", "system"})
 
@@ -54,11 +61,15 @@ def _github_write_branch(method: str, path: str, body: dict | None) -> str | Non
 
     - ``PATCH``/``DELETE`` ``…/git/refs/heads/<branch>``  (update/force / delete ref)
     - ``POST`` ``…/git/refs``        with ``body.ref = "refs/heads/<branch>"``  (create ref)
-    - ``PUT`` ``…/contents/<path>``  with ``body.branch = "<branch>"``           (commit to branch)
+    - ``PUT``/``DELETE`` ``…/contents/<path>``  with ``body.branch = "<branch>"``  (commit to branch)
 
-    Returns ``None`` for reads and for writes that do not name a branch (those
-    remain bounded by capability + repo scope).  Branch-level gating of raw
-    ``git`` CLI pushes is a CLI-routing follow-on (V0 brokers REST only).
+    A Contents-API write with NO explicit ``branch`` defaults to the repo's
+    **default branch** (typically ``main``); that cannot be proven to be allowed,
+    so it returns ``_DEFAULT_BRANCH_SENTINEL`` (the gate then denies it unless the
+    contract allows all branches). Returns ``None`` for reads and for writes that
+    do not target a branch at all (issues, comments, PRs — bounded by capability +
+    repo scope). Branch-level gating of raw ``git`` CLI pushes is a CLI-routing
+    follow-on (V0 brokers REST only).
     """
     if method == "GET":
         return None
@@ -74,22 +85,45 @@ def _github_write_branch(method: str, path: str, body: dict | None) -> str | Non
     branch = body.get("branch")
     if isinstance(branch, str) and branch:
         return branch
+    # Contents-API write with no explicit branch → defaults to the repo default
+    # branch; deny via the sentinel rather than skipping the branch check.
+    if "/contents/" in norm or norm.endswith("/contents"):
+        return _DEFAULT_BRANCH_SENTINEL
     return None
+
+
+def _is_repo_admin_write(method: str, path: str) -> bool:
+    """True for repository-settings / branch-protection writes (elevated, gh.admin).
+
+    Covers ``PATCH /repos/{owner}/{repo}`` (the "update a repository" endpoint —
+    can change ``default_branch``, visibility, etc.) and the branch-protection
+    endpoints (``…/branches/<b>/protection``). These would let a merely
+    ``write_branch``-scoped agent re-point the default branch or disable
+    protection — undermining the writable-branch scope — so they are mapped to a
+    capability the default contract withholds.
+    """
+    if method == "GET":
+        return False
+    norm = path.rstrip("/").lower()
+    segs = norm.strip("/").split("/")
+    if method == "PATCH" and len(segs) == 3 and segs[0] == "repos":
+        return True
+    return "/branches/" in norm and norm.endswith("/protection")
 
 
 def _github_capability(method: str, path: str) -> str:
     """Map an HTTP method + GitHub API path to the narrowest capability name.
 
     The mapping is intentionally conservative: destructive and irreversible
-    operations require capabilities (``gh.delete``, ``gh.merge``) that the
-    default derived contract does NOT grant, so they hard-deny by default.
+    operations require capabilities (``gh.delete``, ``gh.merge``, ``gh.admin``)
+    that the default derived contract does NOT grant, so they hard-deny by default.
 
     Mapping:
-    - GET             → ``gh.read``
-    - DELETE          → ``gh.delete``       (destructive — not covered by write_branch)
-    - PUT/POST to a
-      ``…/merge(s)``  → ``gh.merge``        (irreversible — not covered by write_branch)
-    - other writes    → ``gh.write_branch``
+    - GET                         → ``gh.read``
+    - DELETE                      → ``gh.delete``       (destructive — not covered by write_branch)
+    - PUT/POST to a ``…/merge(s)``→ ``gh.merge``        (irreversible — not covered by write_branch)
+    - repo-settings / protection  → ``gh.admin``        (would undermine the branch scope)
+    - other writes                → ``gh.write_branch``
     """
     if method == "GET":
         return "gh.read"
@@ -99,6 +133,8 @@ def _github_capability(method: str, path: str) -> str:
     norm_path = path.rstrip("/").lower()
     if method in ("PUT", "POST") and any(norm_path.endswith(s) for s in _MERGE_PATH_SUFFIXES):
         return "gh.merge"
+    if _is_repo_admin_write(method, path):
+        return "gh.admin"
     return "gh.write_branch"
 
 
