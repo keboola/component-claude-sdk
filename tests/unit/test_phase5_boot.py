@@ -20,8 +20,10 @@ import pytest
 
 from component import (
     _DUMMY_ANTHROPIC_KEY,
+    _PTRACE_OVERRIDE_ENV,
     _SCRUB_DONE_ENV,
     Component,
+    _assert_ptrace_protected,
     _perform_env_scrub,
     _scrub_config_json_impl,
 )
@@ -142,13 +144,15 @@ class TestClearedAgentEnv:
         assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9999"
 
     def test_no_kbc_token_in_cleared_env(self):
+        # Blanked (not omitted): the SDK merges os.environ into the agent env, so
+        # "" must override any inherited KBC_TOKEN.
         env = Component._build_cleared_env(self._cfg(), proxy_port=1)
-        assert "KBC_TOKEN" not in env
+        assert env["KBC_TOKEN"] == ""
 
     def test_no_github_token_in_cleared_env(self):
         env = Component._build_cleared_env(self._cfg(), proxy_port=1)
-        assert "GITHUB_TOKEN" not in env
-        assert "GH_TOKEN" not in env
+        assert env["GITHUB_TOKEN"] == ""
+        assert env["GH_TOKEN"] == ""
         assert "GH_SECRET" not in env.values()
 
     def test_writable_tmp_caches_present(self):
@@ -261,15 +265,12 @@ class TestContractWiredToServer:
         assert "org/repo-X" in contract["scope"]["repos"]
         assert any("org/repo-X" in d for d in contract["destinations"])
 
-    def test_operates_on_none_gives_broad_scope(self):
-        """When operates_on is None the contract allows api.github.com broadly."""
-        from advocate.contract import derive_contract
+    def test_github_enabled_without_operates_on_rejected_at_config(self):
+        """HIGH-3: github_enabled without operates_on fails closed at config parse."""
+        from keboola.component.exceptions import UserException
 
-        cfg = Configuration(**{"#anthropic_key": "key", "github_enabled": True})
-        assert cfg.operates_on is None
-        contract = derive_contract(cfg, operates_on=cfg.operates_on)
-        assert contract["scope"]["repos"] == []
-        assert any("api.github.com" in d for d in contract["destinations"])
+        with pytest.raises(UserException, match="operates_on"):
+            Configuration(**{"#anthropic_key": "key", "github_enabled": True})
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +408,41 @@ else:
 
 
 # ---------------------------------------------------------------------------
+# 5b. ptrace_scope boot gate (HIGH-2) — fail closed unless same-UID attach is restricted
+# ---------------------------------------------------------------------------
+
+
+class TestPtraceScopeGate:
+    """``_assert_ptrace_protected`` must fail closed when ptrace_scope < 1."""
+
+    def test_scope_one_passes(self, monkeypatch):
+        monkeypatch.setattr("component._read_ptrace_scope", lambda: 1)
+        _assert_ptrace_protected()  # must not raise
+
+    def test_scope_two_passes(self, monkeypatch):
+        monkeypatch.setattr("component._read_ptrace_scope", lambda: 2)
+        _assert_ptrace_protected()  # must not raise
+
+    def test_unreadable_warns_and_proceeds(self, monkeypatch):
+        """Non-Linux / no Yama (None) cannot verify — warn, do not fail."""
+        monkeypatch.setattr("component._read_ptrace_scope", lambda: None)
+        _assert_ptrace_protected()  # must not raise
+
+    def test_scope_zero_fails_closed(self, monkeypatch):
+        from keboola.component.exceptions import UserException
+
+        monkeypatch.setattr("component._read_ptrace_scope", lambda: 0)
+        monkeypatch.delenv(_PTRACE_OVERRIDE_ENV, raising=False)
+        with pytest.raises(UserException, match="ptrace_scope=0"):
+            _assert_ptrace_protected()
+
+    def test_scope_zero_with_override_proceeds(self, monkeypatch):
+        monkeypatch.setattr("component._read_ptrace_scope", lambda: 0)
+        monkeypatch.setenv(_PTRACE_OVERRIDE_ENV, "1")
+        _assert_ptrace_protected()  # override → must not raise
+
+
+# ---------------------------------------------------------------------------
 # 6. Output promotion in parent + transcript flush on failure
 # ---------------------------------------------------------------------------
 
@@ -502,6 +538,7 @@ class TestOutputPromotionAndTranscript:
             {
                 "#github_token": "gh_real_secret",
                 "github_enabled": True,
+                "operates_on": "org/repo-X",
                 "task": {"prompt": "hi"},
             },
         )
@@ -542,10 +579,11 @@ class TestOutputPromotionAndTranscript:
         assert captured_env.get("ANTHROPIC_API_KEY") == _DUMMY_ANTHROPIC_KEY
         assert "REAL_KEY_NEVER_EXPOSED" not in captured_env.values()
         assert "gh_real_secret" not in captured_env.values()
-        # No platform-injected secrets
-        assert "KBC_TOKEN" not in captured_env
-        assert "GITHUB_TOKEN" not in captured_env
-        assert "GH_TOKEN" not in captured_env
+        # Platform-injected secrets are explicitly blanked ("" overrides any
+        # value the SDK's os.environ merge would otherwise pass through).
+        assert captured_env.get("KBC_TOKEN") == ""
+        assert captured_env.get("GITHUB_TOKEN") == ""
+        assert captured_env.get("GH_TOKEN") == ""
         # Loopback routing must be present
         assert "ANTHROPIC_BASE_URL" in captured_env
         assert "127.0.0.1" in captured_env["ANTHROPIC_BASE_URL"]

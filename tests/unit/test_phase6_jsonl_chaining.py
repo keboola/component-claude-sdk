@@ -223,10 +223,11 @@ class TestJsonlSecretFreeByConstruction:
         )
         assert "sk-ant-REAL-KEY-9999" not in env.values(), "Real API key must not appear in cleared env"
         assert "ghp-REAL-TOKEN" not in env.values(), "Real GitHub token must not appear in cleared env"
-        # KBC_TOKEN must not be present at all (env-scrub guarantee).
-        assert "KBC_TOKEN" not in env, "KBC_TOKEN must not be present in cleared agent env"
-        assert "GITHUB_TOKEN" not in env, "GITHUB_TOKEN must not be present in cleared agent env"
-        assert "GH_TOKEN" not in env, "GH_TOKEN must not be present in cleared agent env"
+        # Platform secrets are explicitly BLANKED ("" overrides any inherited value
+        # since the SDK transport merges os.environ into the agent env).
+        assert env["KBC_TOKEN"] == "", "KBC_TOKEN must be blanked in cleared agent env"
+        assert env["GITHUB_TOKEN"] == "", "GITHUB_TOKEN must be blanked in cleared agent env"
+        assert env["GH_TOKEN"] == "", "GH_TOKEN must be blanked in cleared agent env"
 
     def test_scrub_is_applied_to_all_jsonl_lines(self, tmp_path, monkeypatch):
         """Every JSONL line written by the TranscriptWriter is scrubbed.

@@ -7,15 +7,21 @@ any overlay is on ``sys.path`` before a single ``claude_agent_sdk`` symbol is us
 
 Boot sequence (Broker V0, spec §6):
 
-1.  Read config.json → Configuration.
-2.  Unlink /data/config.json — agent cannot read decrypted secrets.
-3.  Env-scrub re-exec — KBC_TOKEN removed from Advocate exec-time environ so
-    /proc/<advocate>/environ does not expose it; KBC_TOKEN passed back in via an
-    inherited fd (pipe) so the Advocate retains it in memory.
+0.  Env-scrub re-exec — KBC_TOKEN removed from the Advocate exec-time environ so
+    /proc/<advocate>/environ does not expose it; the value is passed back via an
+    inherited pipe fd (held in memory only). At boot it is set transiently so the
+    keboola base class captures it at construction, then PURGED from os.environ
+    before the agent spawns (the SDK transport merges os.environ into the agent's
+    env, so a lingering KBC_TOKEN would otherwise leak directly — HIGH-1).
+1.  Assert ptrace_scope >= 1 — all in-memory secret protection rests on it; fail
+    closed otherwise (HIGH-2).
+2.  Read config.json → Configuration.
+3.  Scrub /data/config.json in place — agent cannot read decrypted secrets.
 4.  Derive + sign the Intent Contract (Phase 0).
 5.  Start AdvocateServer on loopback TCP 127.0.0.1:<port>.
 6.  Build CLEARED agent env: ANTHROPIC_BASE_URL=loopback, dummy ANTHROPIC_API_KEY,
-    writable /tmp caches — NO real key, NO KBC_TOKEN, NO github_token.
+    writable /tmp caches, explicit blanks for KBC_TOKEN/GITHUB_TOKEN/GH_TOKEN —
+    NO real key, NO KBC_TOKEN, NO github_token.
 7.  Run tasks via ClaudeRunner (SDK spawns the CLI with the cleared env).
 8.  Parent promotes outputs, tears down server (always, via finally).
 """
@@ -85,8 +91,71 @@ _SCRUB_DONE_ENV = "_ADVOCATE_ENV_SCRUB_DONE"
 # We always use fd 3 (first non-standard fd above stderr=2).
 _KBC_TOKEN_PIPE_FD = 3
 
+# ptrace_scope gate (HIGH-2). All in-memory secret protection in the Advocate
+# rests on the kernel restricting same-UID PTRACE_ATTACH (Yama ptrace_scope >= 1).
+# With ptrace_scope=0 the agent can attach to the Advocate and read every secret,
+# so the broker provides no protection — we fail closed.
+_PTRACE_SCOPE_PATH = "/proc/sys/kernel/yama/ptrace_scope"
+# Dev/test escape hatch (NEVER set on the real runtime): proceed despite
+# ptrace_scope=0. Used by the test suite (see tests/conftest.py) where no real
+# same-UID agent attaches to a live Advocate.
+_PTRACE_OVERRIDE_ENV = "ADVOCATE_ALLOW_UNSAFE_PTRACE"
+
+# Container env vars that must never reach the agent. The SDK transport merges
+# os.environ into the agent subprocess env, so the cleared env must EXPLICITLY
+# blank these (an override of "" wins over any inherited value) — defense in
+# depth alongside the KBC_TOKEN purge (HIGH-1 / MED-1).
+_AGENT_ENV_BLANKS = ("KBC_TOKEN", "KBC_URL", "GITHUB_TOKEN", "GH_TOKEN")
+
 
 log = logging.getLogger(__name__)
+
+
+def _read_ptrace_scope() -> int | None:
+    """Return the kernel ptrace_scope value, or ``None`` if it cannot be read.
+
+    ``None`` means non-Linux / no Yama LSM (e.g. local macOS dev) — the caller
+    treats that as "cannot verify" and warns rather than failing.
+    """
+    try:
+        with open(_PTRACE_SCOPE_PATH, encoding="utf-8") as fh:
+            return int(fh.read().strip())
+    except OSError, ValueError:
+        return None
+
+
+def _assert_ptrace_protected() -> None:
+    """Fail closed unless same-UID PTRACE_ATTACH is restricted (HIGH-2).
+
+    Called at the start of the agent run, before any secret is used to do
+    privileged I/O. If ptrace_scope is 0 the Advocate's in-memory secrets are
+    readable by the same-UID agent, so the broker offers no protection — refuse
+    to run (overridable only via the documented dev/test env var).
+    """
+    scope = _read_ptrace_scope()
+    if scope is None:
+        log.warning(
+            "ptrace_scope unreadable at %s — cannot verify same-UID memory protection "
+            "(expected on non-Linux/dev; the production runtime enforces ptrace_scope=1).",
+            _PTRACE_SCOPE_PATH,
+        )
+        return
+    if scope >= 1:
+        log.info("ptrace_scope=%d — same-UID PTRACE_ATTACH restricted; Advocate memory protected.", scope)
+        return
+    if os.environ.get(_PTRACE_OVERRIDE_ENV) == "1":
+        log.warning(
+            "ptrace_scope=0 but %s=1 — proceeding UNSAFELY (dev/test override). Same-UID "
+            "PTRACE_ATTACH is NOT restricted; broker memory is readable by the agent.",
+            _PTRACE_OVERRIDE_ENV,
+        )
+        return
+    raise UserException(
+        "ptrace_scope=0: a same-UID process can PTRACE_ATTACH the Advocate and read every "
+        "decrypted secret, so the broker provides no protection. Refusing to run. The Keboola "
+        f"runtime sets ptrace_scope=1; if this fired on the platform, escalate. (Dev/test only: "
+        f"set {_PTRACE_OVERRIDE_ENV}=1 to override.)"
+    )
 
 
 def _scrub_config_json_impl(kbc_datadir: str) -> None:
@@ -255,21 +324,27 @@ class Component(ComponentBase):
         """Orchestrate the Broker V0 boot sequence, task loop, and output promotion.
 
         Boot sequence (spec §6):
-        1.  Read config.json → Configuration (secrets loaded into memory).
-        2.  Unlink /data/config.json — same-uid agent cannot read it.
-        3.  (Env-scrub handled at process entry — see module-level boot code.)
-        4.  Derive + sign the Intent Contract (Phase 0, clean).
-        5.  Start AdvocateServer on loopback TCP 127.0.0.1:<port>.
-        6.  Build CLEARED agent env (no secrets; loopback routing).
-        7.  Run tasks via ClaudeRunner.  Outputs promoted by parent (step 11).
-        8.  Tear down server (always, via finally).
+        1.  Assert ptrace_scope >= 1 — fail closed if the runtime cannot protect
+            the Advocate's in-memory secrets from a same-UID PTRACE_ATTACH (HIGH-2).
+        2.  Read config.json → Configuration (secrets loaded into memory).
+        3.  Scrub /data/config.json in place — same-uid agent cannot read secrets.
+        4.  (Env-scrub handled at process entry — see module-level boot code.)
+        5.  Derive + sign the Intent Contract (Phase 0, clean).
+        6.  Start AdvocateServer on loopback TCP 127.0.0.1:<port>.
+        7.  Build CLEARED agent env (no secrets; loopback routing).
+        8.  Run tasks via ClaudeRunner.  Outputs promoted by parent.
+        9.  Tear down server (always, via finally).
 
         The ``write_always`` transcript tables MUST be flushed even when a task
         loop or output promotion raises, so the per-task work and ``promote()``
         run inside a ``try`` whose ``finally`` always flushes the transcript
         before any exception propagates (output-state durability guarantee).
         """
-        # Step 1: Parse config (reads decrypted secrets into memory).
+        # Step 1: Fail closed unless the kernel protects Advocate memory (before
+        # any secret is decrypted into memory below).
+        _assert_ptrace_protected()
+
+        # Step 2: Parse config (reads decrypted secrets into memory).
         config = Configuration(**self.configuration.parameters)
         log.info("Starting Claude SDK run: %s", config.log_safe_summary())
         self._warn_if_memory_intensive(config)
@@ -304,12 +379,22 @@ class Component(ComponentBase):
         # Step 5: Build the MCP configs dict for the server.
         mcp_configs = {server.name: server for server in config.mcp_servers}
 
+        # HIGH-3: scope the GitHub broker's destination allowlist to the single
+        # declared repo. ``Configuration`` already requires ``operates_on`` when
+        # github_enabled (fail-closed), so this is a concrete path when GitHub is
+        # in play; otherwise deny all GitHub paths (empty allowlist) — the broker
+        # is unreachable anyway since the contract grants no gh.* capability.
+        if config.github_enabled and config.operates_on:
+            github_allowed_destinations = [f"/repos/{config.operates_on}"]
+        else:
+            github_allowed_destinations = []
+
         # Start the loopback-TCP AdvocateServer.
         server = AdvocateServer(
             config.anthropic_key,
             mcp_configs=mcp_configs,
             github_token=config.github_token,
-            github_allowed_destinations=None,  # no per-repo restriction when operates_on is None
+            github_allowed_destinations=github_allowed_destinations,
             contract_envelope=envelope,
             contract_signing_secret=secret,
         )
@@ -436,11 +521,18 @@ class Component(ComponentBase):
         - CLAUDE_CODE_DISABLE_AUTO_MEMORY=1.
         - Best-effort MCP proxy env (TODO: confirmed routing TBD on-platform §8).
 
-        What is EXPLICITLY absent:
-        - KBC_TOKEN (env-scrubbed from Advocate; never in agent env)
+        What is EXPLICITLY absent / blanked:
+        - KBC_TOKEN (env-scrubbed + purged from Advocate; blanked here too)
         - Real #anthropic_key (held by AdvocateServer; agent uses dummy)
-        - GITHUB_TOKEN / GH_TOKEN (brokered server-side; never in agent env)
+        - GITHUB_TOKEN / GH_TOKEN (brokered server-side; blanked here)
         - Any MCP server secret env values (injected server-side)
+
+        IMPORTANT: the SDK transport MERGES the Advocate's ``os.environ`` into the
+        agent subprocess env (``{**os.environ, **options.env}``).  A cleared env
+        therefore only *overrides* keys it sets — it does NOT drop inherited
+        container vars.  So we explicitly blank the sensitive ones (``""`` wins
+        over any inherited value) as defense-in-depth alongside the KBC_TOKEN
+        purge at boot (HIGH-1 / MED-1).
 
         NOTE: MCP/GitHub CLI wiring via MCP_PROXY_URL / HTTPS_PROXY is MARKED for
         on-platform confirmation (spec §8).  The Anthropic path is the confirmed
@@ -457,6 +549,10 @@ class Component(ComponentBase):
             "NPM_CONFIG_CACHE": NPM_CONFIG_CACHE,
             "XDG_CACHE_HOME": XDG_CACHE_HOME,
         }
+        # Defense-in-depth: explicitly blank inherited container secrets so the
+        # SDK's os.environ merge cannot pass them through to the agent.
+        for key in _AGENT_ENV_BLANKS:
+            env[key] = ""
         # MCP proxy wiring — best-effort; mechanism confirmed via binary probe but
         # end-to-end validation pending on-platform (spec §8 NOTE).
         # TODO: confirm MCP_PROXY_URL routing on-platform before GA.
@@ -514,39 +610,32 @@ class Component(ComponentBase):
         return check_anthropic_connection(config.anthropic_key)
 
 
-# ---------------------------------------------------------------------------
-# Broker V0 entry-point boot: env-scrub guard
-# ---------------------------------------------------------------------------
-# This runs when the module is imported as __main__ (i.e. the component entry
-# point).  It must run BEFORE any Keboola component infrastructure reads config
-# or spawns anything.
-#
-# The guard ensures env-scrub happens exactly once:
-# - First exec (no _SCRUB_DONE_ENV): _perform_env_scrub() re-execs the process
-#   with KBC_TOKEN stripped.  execve() replaces the process image; the code
-#   below the call never runs in the first instance.
-# - Second exec (_SCRUB_DONE_ENV=1): _read_kbc_token_from_pipe() recovers the
-#   token from the inherited fd.  Normal startup continues.
-#
-# KBC_TOKEN is not used directly by the component code (Storage I/O is handled
-# by the keboola.component base class which reads it from os.environ).  After
-# env-scrub the token is NOT in os.environ, so we re-inject it here so the
-# base class can still find it.
-if __name__ == "__main__":
-    if os.environ.get(_SCRUB_DONE_ENV) != "1":
-        # First exec: perform the env-scrub re-exec.
-        # _perform_env_scrub() calls os.execve() and never returns on success.
-        # On failure it logs a warning and falls through to normal startup.
-        _perform_env_scrub()
-        # If we reach here execve failed — start normally without scrub.
-    else:
-        # Re-exec'd process: read KBC_TOKEN back from the inherited pipe fd.
-        kbc_token = _read_kbc_token_from_pipe()
-        if kbc_token:
-            os.environ["KBC_TOKEN"] = kbc_token
+def _boot() -> None:
+    """Construct the component and run the selected action (Broker V0 boot).
+
+    KBC_TOKEN lifecycle (HIGH-1): after the env-scrub re-exec the token is NOT in
+    os.environ. We recover it from the inherited pipe and set it TRANSIENTLY so the
+    keboola base class captures it into ``environment_variables.token`` at
+    construction. We then PURGE it from os.environ before any action runs — the SDK
+    transport merges os.environ into the agent subprocess env, so a lingering
+    KBC_TOKEN would otherwise leak straight into the agent (and any child's /proc).
+    The base class keeps its captured copy in memory; Storage I/O is unaffected.
+    """
+    if os.environ.get(_SCRUB_DONE_ENV) == "1":
+        # Re-exec'd process: recover KBC_TOKEN from the inherited pipe fd and set
+        # it transiently for the base-class capture below.
+        recovered = _read_kbc_token_from_pipe()
+        if recovered:
+            os.environ["KBC_TOKEN"] = recovered
 
     try:
         comp = Component()
+        # The base class has now captured KBC_TOKEN (if any). Purge it from
+        # os.environ unconditionally so it cannot be inherited by the agent
+        # subprocess. (In the rare env-scrub-failed path this still removes it
+        # from the inherited env; the /proc stack copy is covered by the warning
+        # logged at scrub time.)
+        os.environ.pop("KBC_TOKEN", None)
         comp.execute_action()
     except UserException as exc:
         logging.exception(exc)
@@ -554,3 +643,23 @@ if __name__ == "__main__":
     except Exception as exc:
         logging.exception(exc)
         sys.exit(2)
+
+
+# ---------------------------------------------------------------------------
+# Broker V0 entry-point boot: env-scrub guard
+# ---------------------------------------------------------------------------
+# This runs when the module is executed as __main__ (the component entry point).
+# It must run BEFORE any Keboola component infrastructure reads config or spawns
+# anything.
+#
+# The guard ensures env-scrub happens exactly once:
+# - First exec (no _SCRUB_DONE_ENV): _perform_env_scrub() re-execs the process
+#   with KBC_TOKEN stripped.  execve() replaces the process image; the code
+#   below the call never runs in the first instance.  On execve failure (or when
+#   there was no KBC_TOKEN to scrub) it returns and _boot() runs normally.
+# - Second exec (_SCRUB_DONE_ENV=1): _perform_env_scrub() is skipped and _boot()
+#   recovers KBC_TOKEN from the inherited pipe (transient set + purge — HIGH-1).
+if __name__ == "__main__":
+    if os.environ.get(_SCRUB_DONE_ENV) != "1":
+        _perform_env_scrub()  # re-execs on success; returns only on no-op/failure
+    _boot()

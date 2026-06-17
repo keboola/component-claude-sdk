@@ -33,6 +33,50 @@ _ALLOWED_FIELDS = frozenset({"action_id", "model", "max_tokens", "messages", "st
 _MERGE_PATH_SUFFIXES = ("/merge", "/merges")
 
 
+def _github_repo_from_path(path: str) -> str | None:
+    """Extract ``owner/repo`` from a GitHub REST path like ``/repos/owner/repo/...``.
+
+    Returns ``None`` for paths that are not repo-scoped (e.g. ``/user``,
+    ``/search/...``).  Used to feed the contract's ``scope.repos`` check so a
+    GitHub call is bound to the declared repo, not just to ``api.github.com``.
+    """
+    parts = path.strip("/").split("/")
+    if len(parts) >= 3 and parts[0] == "repos":
+        return f"{parts[1]}/{parts[2]}"
+    return None
+
+
+def _github_write_branch(method: str, path: str, body: dict | None) -> str | None:
+    """Return the target branch for a ref-targeting GitHub write, or ``None``.
+
+    Recognises the REST shapes that create/move/delete a branch ref or commit to
+    a branch — exactly the "push to a protected branch" vector:
+
+    - ``PATCH``/``DELETE`` ``…/git/refs/heads/<branch>``  (update/force / delete ref)
+    - ``POST`` ``…/git/refs``        with ``body.ref = "refs/heads/<branch>"``  (create ref)
+    - ``PUT`` ``…/contents/<path>``  with ``body.branch = "<branch>"``           (commit to branch)
+
+    Returns ``None`` for reads and for writes that do not name a branch (those
+    remain bounded by capability + repo scope).  Branch-level gating of raw
+    ``git`` CLI pushes is a CLI-routing follow-on (V0 brokers REST only).
+    """
+    if method == "GET":
+        return None
+    norm = path.rstrip("/")
+    marker = "/git/refs/heads/"
+    idx = norm.find(marker)
+    if idx != -1:
+        return norm[idx + len(marker) :] or None
+    body = body or {}
+    ref = body.get("ref")
+    if isinstance(ref, str) and ref.startswith("refs/heads/"):
+        return ref[len("refs/heads/") :] or None
+    branch = body.get("branch")
+    if isinstance(branch, str) and branch:
+        return branch
+    return None
+
+
 def _github_capability(method: str, path: str) -> str:
     """Map an HTTP method + GitHub API path to the narrowest capability name.
 
@@ -194,6 +238,17 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond(err_status, {"error": err_msg})
             return
 
+        # Gate the Anthropic endpoint too (HIGH-4) — MCP/GitHub both gate; this
+        # path must not be the one ungated hole.  The upstream is hard-pinned to
+        # api.anthropic.com so the blast radius is cost/quota (not exfil), but a
+        # contract that does not carry the ``anthropic`` capability (tampered /
+        # mis-derived) must fail closed rather than silently inject the real key.
+        # No-op when no contract is configured (Phase 3 backward compat).
+        from advocate.contract import DEST_ANTHROPIC  # noqa: PLC0415
+
+        if not self._check_gate("anthropic", DEST_ANTHROPIC):
+            return
+
         from advocate import anthropic_proxy  # local import to keep modules decoupled  # noqa: PLC0415
 
         # Preserve the query string from the original request path so upstream
@@ -309,7 +364,14 @@ class _Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass  # client disconnected; nothing more we can do
 
-    def _check_gate(self, capability: str, destination: str) -> bool:
+    def _check_gate(
+        self,
+        capability: str,
+        destination: str,
+        *,
+        scope_repo: str | None = None,
+        write_branch: str | None = None,
+    ) -> bool:
         """Run the contract gate for a single RPC.  Return True if allowed.
 
         The gate is a no-op **only** when BOTH ``contract_envelope`` and
@@ -348,7 +410,13 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond(403, {"error": "contract verification failed"})
             return False
 
-        result = check_action(envelope["contract"], capability=capability, destination=destination)
+        result = check_action(
+            envelope["contract"],
+            capability=capability,
+            destination=destination,
+            scope_repo=scope_repo,
+            write_branch=write_branch,
+        )
         if isinstance(result, GateDenial):
             self._respond(403, {"error": result.reason})
             return False
@@ -423,8 +491,13 @@ class _Handler(BaseHTTPRequestHandler):
         path: str = validated.get("path", "")
         cap = _github_capability(method, path)
         dest = f"{github_broker.GITHUB_API_HOST}{path}"
+        # HIGH-3: bind the call to the contract's repo scope and writable-branch
+        # scope, not just to api.github.com.  scope_repo enforces scope.repos;
+        # write_branch enforces scope.writable_branches on ref-targeting writes.
+        scope_repo = _github_repo_from_path(path)
+        write_branch = _github_write_branch(method, path, validated.get("body"))
 
-        if not self._check_gate(cap, dest):
+        if not self._check_gate(cap, dest, scope_repo=scope_repo, write_branch=write_branch):
             return
 
         try:

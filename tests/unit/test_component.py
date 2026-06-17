@@ -305,10 +305,13 @@ def test_build_cleared_env_sets_loopback_routing_and_writable_caches():
     for key in ("HOME", "UV_CACHE_DIR", "NPM_CONFIG_CACHE", "XDG_CACHE_HOME"):
         assert env[key].startswith("/tmp/")
 
-    # NO secrets in the agent env
-    assert "KBC_TOKEN" not in env
-    assert "GITHUB_TOKEN" not in env
-    assert "GH_TOKEN" not in env
+    # NO real secrets in the agent env. The SDK transport merges os.environ into
+    # the agent subprocess env, so the cleared env explicitly BLANKS these keys
+    # ("" overrides any inherited container value) rather than omitting them.
+    assert env["KBC_TOKEN"] == ""
+    assert env["GITHUB_TOKEN"] == ""
+    assert env["GH_TOKEN"] == ""
+    assert "REAL_KEY_NEVER_IN_AGENT_ENV" not in env.values()
 
 
 def test_run_task_launch_failure_is_user_exception(tmp_path, monkeypatch):

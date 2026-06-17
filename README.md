@@ -287,21 +287,36 @@ is achieved through process arrangement and kernel memory protection.
   the real key server-side and forwards the response. The agent cannot recover the
   real key even if it reads its own environment.
 - **Keboola Storage token** (`KBC_TOKEN`): removed from the exec-time environment
-  via an `os.execve` re-exec (env-scrub) before the agent spawns. The token is passed
-  back to the Advocate via an inherited pipe fd and held only in process memory. With
-  env-scrub active, `/proc/<advocate>/environ` no longer exposes the token.
-- **GitHub token** (`#github_token`): not placed in the agent environment. GitHub
-  API calls are brokered server-side by the Advocate's `/v1/github` endpoint, which
-  checks every request against a frozen Intent Contract before forwarding.
-- **Config secrets at rest**: `config.json` is overwritten with a scrubbed copy
-  (all `#`-prefixed keys blanked) before the agent subprocess is started. The
+  via an `os.execve` re-exec (env-scrub) so `/proc/<advocate>/environ` does not expose
+  it. The value is passed back over an inherited pipe and set transiently only so the
+  keboola base class captures it at construction, then **purged from `os.environ`
+  before the agent spawns** — the SDK transport merges `os.environ` into the agent's
+  env, so a lingering token would otherwise leak straight into the agent. The cleared
+  agent env also **explicitly blanks** `KBC_TOKEN`/`GITHUB_TOKEN`/`GH_TOKEN` (`""`
+  overrides any inherited value) as defense-in-depth.
+- **GitHub token** (`#github_token`): not placed in the agent environment. GitHub API
+  calls are brokered server-side by the Advocate's `/v1/github` endpoint, which checks
+  every request against a frozen Intent Contract before forwarding. The token is
+  **scoped to a single repository**: `github_enabled` requires `operates_on`
+  (`"org/repo"`) — without it the component fails closed — and the broker enforces both
+  the repo path allowlist and a **writable-branch scope** (`writable_branches`, default
+  `agent/*`) so ref-targeting REST writes to `main` are denied.
+- **Anthropic endpoint**: also gated — `/v1/messages` runs the contract gate (capability
+  `anthropic`, pinned destination) before injecting the real key, so a tampered or
+  mis-derived contract fails closed rather than silently injecting the key.
+- **Config secrets at rest**: `config.json` is overwritten in place with a scrubbed
+  copy (all `#`-prefixed keys blanked) before the agent subprocess is started. The
   decrypted values are held only in the Advocate's Python object.
-- **Advocate heap protection**: `ptrace_scope=1` (confirmed on-platform) prevents
-  the same-UID agent from attaching with `PTRACE_ATTACH` or reading
-  `/proc/<advocate>/mem`.
+- **Advocate heap protection**: `ptrace_scope >= 1` prevents the same-UID agent from
+  attaching with `PTRACE_ATTACH` or reading `/proc/<advocate>/mem`. This is now
+  **asserted at boot before any secret is decrypted** — the component fails closed if
+  `ptrace_scope=0` (overridable only via the documented `ADVOCATE_ALLOW_UNSAFE_PTRACE`
+  dev/test escape hatch).
 - **Deterministic contract gate**: every brokered action (Anthropic call, GitHub
   call, MCP call) is checked against a contract derived at run start from the
-  configuration — no LLM in the path, hard deny on mismatch.
+  configuration — no LLM in the path, hard deny on mismatch. Broker idempotency keys
+  are **server-derived from the request content**, not the agent-supplied `action_id`,
+  so an agent cannot suppress a distinct legitimate call via a cached reply.
 
 **Honest limits — what V0 does NOT provide:**
 
@@ -317,10 +332,22 @@ is achieved through process arrangement and kernel memory protection.
 - **Same-UID `/proc/environ` protection**: `/proc/<advocate>/environ` is readable
   by same-UID processes and is NOT gated by `ptrace_scope`. Env-scrub (re-exec) is
   the mitigation; without it, the KBC_TOKEN leaks. Env-scrub is implemented in V0.
-- **Arbitrary MCP / third-party secrets**: only the three brokered credentials above
-  are withheld from the agent. Any secret in a stdio MCP server's `env` map or an
-  HTTP MCP server's `headers` is visible to the agent through normal channel
-  enumeration unless the operator also brokers them.
+- **stdio MCP server secrets are NOT credential-isolated**: a stdio MCP server must
+  receive its secrets in its own process env, and that subprocess is a same-UID sibling
+  of the agent — so the agent can read them via `/proc/<mcp-pid>/environ`. V0 stops the
+  Advocate's *broader* `os.environ` (e.g. `KBC_TOKEN`) from leaking into that subprocess
+  (a minimal launch env is used), but the server's own `env` secrets remain visible.
+  **Only remote/HTTP MCP servers** (header injection, secret never in a child process)
+  are credential-isolated in V0.
+- **Loopback broker endpoints are unauthenticated**: any in-container process can reach
+  `127.0.0.1:<port>`. A shared Advocate↔CLI bearer would not raise the bar in-container
+  because the agent and the CLI it drives share one process tree and env — a bearer
+  available to the CLI is readable by the agent. The contract gate + repo/branch scoping
+  are the real bounds; a true per-caller boundary needs the standalone-Advocate (V1).
+- **Arbitrary third-party secrets**: only the brokered credentials above are withheld
+  from the agent. Any secret a user pastes into the prompt, or a Salesforce/arbitrary
+  API credential, is not theft-proofed by the broker — brokering stops *credential
+  theft*, not *authority abuse* through an allowed tool.
 - **Runtime regression**: memory isolation depends on the platform maintaining
   `ptrace_scope >= 1`. If the runtime changes this to 0, the isolation breaks.
   Re-run `scripts/sandbox_probe.py` in a container when the platform configuration

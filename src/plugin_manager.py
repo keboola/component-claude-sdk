@@ -5,9 +5,12 @@ job start into a writable ``/tmp/claude-home`` and loaded into the SDK by local
 path (the Python SDK only supports ``{"type": "local", "path": ...}``).
 
 Each entry chooses a pinned ref (reproducible) or ``latest`` (re-pull newest).
-Private sources authenticate via the ``GITHUB_TOKEN``/``GH_TOKEN`` already in the
-subprocess ``env``. All CLI output is logged with secret scrubbing; a non-zero
-exit becomes a ``UserException`` naming the failing source.
+Private sources authenticate via ``GITHUB_TOKEN``/``GH_TOKEN``, which the install
+subprocess receives from the Advocate-held ``#github_token`` (injected into the
+install env only — never into the cleared agent env). The install subprocess runs
+Advocate-side and exits before the agent spawns, so the token is not exposed to
+the agent. All CLI output is logged with secret scrubbing; a non-zero exit
+becomes a ``UserException`` naming the failing source.
 """
 
 from __future__ import annotations
@@ -78,6 +81,9 @@ class PluginManager:
         self._claude_home = claude_home
         self._cache_dir = f"{claude_home}/plugins/cache"
         self._secret_values: list[str] = []
+        # Advocate-held GitHub token for private-source auth; injected into the
+        # install subprocess env only (never into the cleared agent env).
+        self._github_token: str = ""
 
     def prepare(
         self,
@@ -96,6 +102,8 @@ class PluginManager:
         """
         # Scrub the full secret set (caller-provided) plus the github_token.
         self._secret_values = [s for s in {*(secret_values or []), github_token} if s]
+        # Hold the token for private-source auth in the install subprocess env.
+        self._github_token = github_token
 
         env["CLAUDE_CONFIG_DIR"] = self._claude_home
         env["CLAUDE_CODE_PLUGIN_CACHE_DIR"] = self._cache_dir
@@ -284,8 +292,15 @@ class PluginManager:
         KBC_TOKEN and other platform-injected secrets.
         """
         cmd = [_resolve_claude_cli(), *args]
+        install_env = self._plugin_install_env(env)
+        # Inject the GitHub token into the install subprocess ONLY (Advocate-side,
+        # short-lived, exits before the agent spawns) so private-source clones can
+        # authenticate.  It is never placed in the cleared agent env.
+        if self._github_token:
+            install_env["GITHUB_TOKEN"] = self._github_token
+            install_env["GH_TOKEN"] = self._github_token
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, env=self._plugin_install_env(env))
+            proc = subprocess.run(cmd, capture_output=True, text=True, env=install_env)
         except OSError as exc:
             # FileNotFoundError / PermissionError on launch — surface as a clean
             # UserException (exit 1) instead of an unhandled crash (exit 2).
@@ -313,7 +328,10 @@ class PluginManager:
         We pass only:
         - The plugin-specific vars already in agent_env (CLAUDE_CONFIG_DIR etc.)
         - PATH so the CLI can find git/system tools
-        - GITHUB_TOKEN/GH_TOKEN from agent_env (already there for private plugins)
+
+        The GitHub token for private sources is added by the caller (``_run``) into
+        the install subprocess env, NOT here — it must never enter the cleared
+        agent env that this helper copies from.
 
         This is the §14 fix: stop {**os.environ, **env} subprocess inheritance.
         """

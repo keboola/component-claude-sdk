@@ -5,6 +5,28 @@
 > Status: draft for review
 > Date: 2026-06-15
 > Branch: feat/advocate-broker (from initial-implementation)
+>
+> **Revision 2026-06-17e (security review follow-ups — implemented).** Closes the findings on the V0
+> implementation (commit `d493924`). Where this spec's prose lagged the code, the code is authoritative:
+> - **HIGH-1:** KBC_TOKEN is no longer re-injected into `os.environ` after the env-scrub re-exec. It is
+>   set transiently for the base-class capture, then **purged before the agent spawns** (the SDK transport
+>   merges `os.environ` into the agent env). The cleared env also explicitly blanks KBC_TOKEN/GITHUB/GH.
+> - **HIGH-2:** `ptrace_scope >= 1` is now **asserted at boot, fail-closed** (the model's load-bearing
+>   assumption is enforced in code, not just disclosed). Dev/test override: `ADVOCATE_ALLOW_UNSAFE_PTRACE=1`.
+> - **HIGH-3:** GitHub access is **repo- and branch-scoped**. `github_enabled` requires `operates_on`
+>   (fail-closed at config parse); the broker allowlist + contract destination + gate `scope_repo` bind to
+>   that repo, and ref-targeting REST writes are gated against `writable_branches` (default `agent/*`).
+> - **HIGH-4:** the Anthropic `/v1/messages` path now runs the contract gate (capability `anthropic`).
+> - **MED-1:** the stdio MCP subprocess no longer inherits the Advocate's full `os.environ` (minimal
+>   launch env + the server's own `env`). stdio MCP servers remain **not** credential-isolated under the
+>   same-UID runtime (only remote/HTTP MCP is) — documented, not claimed otherwise.
+> - **MED-2:** loopback endpoints are unauthenticated; a shared bearer is **not** a real boundary
+>   in-container (the agent and the CLI it drives share one env). The contract gate + repo/branch scoping
+>   are the bounds; a per-caller boundary needs the standalone Advocate (V1).
+> - **MED-3:** broker idempotency keys are **server-derived from request content**, not the agent's
+>   `action_id` (prevents cached-reply suppression).
+> - Wording fixes: config.json is **scrubbed in place**, never "unlinked"; the §8.4 egress allowlist is
+>   **designed only**, not shipped in V0.
 > Amends: `docs/superpowers/specs/2026-06-14-claude-sdk-design.md` §2.4, §2.9, §6.5, R7
 > Relationship to platform-level work: this is the **plan-v3 Two-Process model collapsed into a
 > single Keboola component container**. It does not require new platform infrastructure.
@@ -160,14 +182,15 @@ secrets and no network. Against the prompt-injection threat this yields the same
 **Broker V0 — single UID, loopback-TCP channel**
 
 Both the Advocate (parent) and the agent (child) run as the platform-assigned euid 1000. There is no
-UID-drop boundary. The boundary is: cleared agent env + unlinked config file + ptrace-scope memory
-protection + loopback-TCP credential injection.
+UID-drop boundary. The boundary is: cleared agent env + scrubbed config file (`#`-secrets blanked
+in place — NOT unlinked, so the keboola base class can still re-read structural config) + ptrace-scope
+memory protection + loopback-TCP credential injection.
 
 ```
 ┌─ ONE component container (ephemeral batch job, euid=1000 throughout) ───┐
 │  ADVOCATE  — parent process, TRUSTED (Keboola-authored)                 │
 │   • reads /data/config.json (#anthropic_key, #github_token, MCP #secrets)│
-│   • IMMEDIATELY unlinks /data/config.json after reading                 │
+│   • IMMEDIATELY scrubs /data/config.json in place (#-secrets→"")        │
 │   • holds KBC_TOKEN (passed via inherited fd after env-scrub re-exec)   │
 │   • HAS network; performs ALL outbound calls                            │
 │   • runs: Anthropic proxy, MCP proxy, GitHub/HTTP tool executor         │
@@ -181,7 +204,7 @@ protection + loopback-TCP credential injection.
 │  │   • same euid 1000 as parent (no UID-drop — platform prevents it)│    │
 │  │   • cleared env: no KBC_TOKEN, no #secrets, only routing values  │    │
 │  │     (ANTHROPIC_BASE_URL, MCP_PROXY_URL, workspace paths)         │    │
-│  │   • cannot read /data/config.json (unlinked before agent spawned) │    │
+│  │   • config.json scrubbed (#-secrets blanked) before agent spawned │    │
 │  │   • cannot ptrace / read parent memory (ptrace_scope=1, verified) │    │
 │  │   • NOTE: /proc/<advocate>/environ IS readable — see §5 env-scrub │    │
 │  │   • workspace = /tmp/agent + /skills (read-only)                  │    │
@@ -523,8 +546,10 @@ calls or the agent's GitHub/Storage tools.
   broker — the two compose: the broker keeps the three credentials out of the agent; the allowlist
   bounds where everything else can go.
 
-Shippable in-container in this POC (forced proxy + blocked direct egress when the list is set); the
-VM/E2B form (§11) is the stronger V2 of the same idea.
+**Status: DESIGNED ONLY — not implemented in V0.** The egress allowlist (config field, forced proxy,
+direct-egress block) is a design; no code ships it on this branch. The "forced proxy + blocked direct
+egress" form is not achievable in-container anyway (see the V0 caveat below — it needs seccomp/netns,
+which the runtime denies). The VM/E2B form (§11) is the stronger V2 of the same idea.
 
 **V0 caveat on egress allowlist enforcement:** "blocking direct sockets" in the opt-in tightening
 path requires the same in-container mechanism as hard egress (seccomp or netns) — which the on-platform

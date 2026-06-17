@@ -27,6 +27,7 @@ Destination matching (spec §7.2 — reuses github_broker boundary logic):
 
 from __future__ import annotations
 
+import fnmatch
 import logging
 from dataclasses import dataclass, field
 
@@ -124,6 +125,16 @@ def _destination_allowed(requested: str, allowed_destinations: list[str]) -> boo
     return any(_dest_matches(requested, a) for a in allowed_destinations)
 
 
+def _branch_allowed(branch: str, allowed_patterns: list[str]) -> bool:
+    """Return True if ``branch`` matches at least one glob pattern in ``allowed_patterns``.
+
+    Patterns use shell-glob semantics (``fnmatch``): ``agent/*`` matches
+    ``agent/fix-123`` but not ``main`` or ``agent`` (no slash). An empty pattern
+    list denies every branch (fail-closed).
+    """
+    return any(fnmatch.fnmatch(branch, pat) for pat in allowed_patterns)
+
+
 # ---------------------------------------------------------------------------
 # Public gate
 # ---------------------------------------------------------------------------
@@ -135,6 +146,7 @@ def check_action(
     capability: str,
     destination: str,
     scope_repo: str | None = None,
+    write_branch: str | None = None,
 ) -> GateAllow | GateDenial:
     """Gate a single agent RPC against the frozen contract.
 
@@ -151,8 +163,13 @@ def check_action(
         scope_repo: Optional repository (``"org/repo-X"``) the action targets.
             When provided and ``contract["scope"]["repos"]`` is non-empty, the
             action is denied if the repo is not in the allowed list.  When
-            ``scope.repos`` is empty (the current POC default when ``operates_on``
-            is absent) the scope check is skipped.
+            ``scope.repos`` is empty (no ``operates_on``) the scope check is
+            skipped — but note GitHub capabilities are then never granted, so a
+            GitHub call is already denied at the capability step.
+        write_branch: Optional target branch (``"agent/fix-1"``, ``"main"``) for
+            a ref-targeting GitHub write.  When provided, the action is denied
+            unless the branch matches ``contract["scope"]["writable_branches"]``
+            (glob).  Pass ``None`` for reads and non-ref-targeting calls.
 
     Returns:
         :class:`GateAllow` if all checks pass, :class:`GateDenial` otherwise.
@@ -161,6 +178,7 @@ def check_action(
     allowed_dests: list[str] = contract.get("destinations", [])
     scope: dict = contract.get("scope", {})
     allowed_repos: list[str] = scope.get("repos", [])
+    allowed_branches: list[str] = scope.get("writable_branches", [])
 
     # 1. Capability check
     if capability not in allowed_caps:
@@ -195,6 +213,17 @@ def check_action(
                 reason=f"repository '{scope_repo}' is not in the contract scope",
                 failed_check="scope",
             )
+
+    # 4. Writable-branch check (only for ref-targeting writes that name a branch)
+    if write_branch is not None and not _branch_allowed(write_branch, allowed_branches):
+        log.warning(
+            "gate: branch denied — branch=%r not in contract writable_branches",
+            write_branch,
+        )
+        return GateDenial(
+            reason=f"branch '{write_branch}' is not writable under the contract",
+            failed_check="branch",
+        )
 
     return GateAllow(capability=capability, destination=destination)
 

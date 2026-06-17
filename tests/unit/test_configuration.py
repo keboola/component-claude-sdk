@@ -47,6 +47,35 @@ def test_alias_roundtrip_github_token():
     assert cfg.github_token == "GH_NAME_ONLY"
 
 
+def test_github_enabled_requires_operates_on():
+    """HIGH-3: github_enabled without operates_on fails closed at config parse."""
+    with pytest.raises(UserException) as exc:
+        Configuration(**_base(github_enabled=True))
+    assert "operates_on" in str(exc.value)
+
+
+def test_github_enabled_rejects_malformed_operates_on():
+    """operates_on must be 'org/repo' — a bare name (no slash) is rejected."""
+    with pytest.raises(UserException) as exc:
+        Configuration(**_base(github_enabled=True, operates_on="just-a-name"))
+    assert "org/repo" in str(exc.value)
+
+
+def test_github_enabled_with_valid_operates_on_parses():
+    cfg = Configuration(**_base(github_enabled=True, operates_on="org/repo-X"))
+    assert cfg.github_enabled is True
+    assert cfg.operates_on == "org/repo-X"
+    # Default writable-branch scope confines the agent to its own branches.
+    assert cfg.writable_branches == ["agent/*"]
+
+
+def test_operates_on_optional_when_github_disabled():
+    """operates_on stays optional when GitHub is off."""
+    cfg = Configuration(**_base())
+    assert cfg.github_enabled is False
+    assert cfg.operates_on is None
+
+
 def test_prompting_permission_mode_rejected():
     with pytest.raises(UserException) as exc:
         Configuration(**_base(permission_mode="acceptEdits"))
@@ -225,7 +254,7 @@ def test_nested_section_shape_full_round_trip():
             "permission_mode": "bypassPermissions",
             "allowed_tools": ["Read", "Bash(git *)"],
         },
-        github={"github_enabled": True, "#github_token": "GH_NAME_ONLY"},
+        github={"github_enabled": True, "#github_token": "GH_NAME_ONLY", "operates_on": "org/repo-X"},
         task_output={
             "task": {"prompt": "do the thing"},
             "task_id_filter": "a, b",
@@ -285,7 +314,7 @@ def test_root_level_value_wins_over_section_wrapper():
 
 def test_flat_shape_still_parses_alongside_sections():
     """The historical flat shape (no wrappers) is left fully untouched."""
-    cfg = Configuration(**_base(max_turns=3, github_enabled=True))
+    cfg = Configuration(**_base(max_turns=3, github_enabled=True, operates_on="org/repo-X"))
     assert cfg.max_turns == 3
     assert cfg.github_enabled is True
 

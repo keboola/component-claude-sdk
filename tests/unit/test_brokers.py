@@ -881,6 +881,95 @@ class TestMcpStdioTimeout:
 # ---------------------------------------------------------------------------
 
 
+class TestMcpStdioEnvIsolation:
+    """MED-1: the stdio MCP subprocess must NOT inherit the Advocate's full os.environ."""
+
+    def test_kbc_token_not_passed_to_stdio_subprocess(self, monkeypatch) -> None:
+        """A container secret in os.environ (KBC_TOKEN) must not reach the subprocess env."""
+        from configuration import McpStdioServer
+
+        monkeypatch.setenv("KBC_TOKEN", "super-secret-storage-token")
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+        cfg = McpStdioServer(name="iso-mcp", command="cat", args=[], env={"SERVER_SECRET": "ok"})
+
+        captured_envs: list[dict] = []
+        response = b'{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}\n'
+        r_fd, w_fd = os.pipe()
+        os.write(w_fd, response)
+        os.close(w_fd)
+        real_stdout = os.fdopen(r_fd, "rb")
+
+        class _FakeProc:
+            poll = MagicMock(return_value=None)
+
+            def __init__(self, *args, env=None, **kwargs):  # noqa: ARG002
+                captured_envs.append(dict(env or {}))
+                self.stdin = MagicMock()
+                self.stdout = real_stdout
+
+        mcp_broker._procs.clear()
+        mcp_broker._proc_locks.clear()
+        idempotency.clear()
+        with patch("advocate.brokers.mcp_broker.subprocess.Popen", _FakeProc):
+            payload = {"action_id": "iso-1", "server_name": "iso-mcp", "method": "tools/list"}
+            status, _ = mcp_broker.handle_request(payload, {"iso-mcp": cfg})
+
+        assert status == 200
+        assert len(captured_envs) == 1
+        env = captured_envs[0]
+        # The server's own secret IS injected; the container secret is NOT.
+        assert env.get("SERVER_SECRET") == "ok"
+        assert "KBC_TOKEN" not in env
+        # A safe launch var (PATH) is still passed through.
+        assert env.get("PATH") == "/usr/bin:/bin"
+
+
+class TestServerDerivedIdempotency:
+    """MED-3: cache key is server-derived from request content, not agent action_id."""
+
+    def test_same_action_id_different_request_not_suppressed(self) -> None:
+        """A reused action_id with DIFFERENT content must NOT return a cached reply.
+
+        This is the suppression footgun: an agent pre-seeds action_id=X with a
+        benign call, then a distinct legitimate call reuses X. With a server-derived
+        key the second call executes (different content → different key).
+        """
+        idempotency.clear()
+        calls: list[str] = []
+
+        def _fake_call(p, token):  # noqa: ARG001
+            calls.append(p["path"])
+            return (200, {"path": p["path"]})
+
+        with patch.object(github_broker, "_call_github", side_effect=_fake_call):
+            first = {"action_id": "X", "method": "GET", "path": "/repos/org/repo"}
+            second = {"action_id": "X", "method": "POST", "path": "/repos/org/repo/issues", "body": {"t": "1"}}
+            github_broker.handle_request(first, "tok")
+            github_broker.handle_request(second, "tok")
+
+        # Both executed — the second was not suppressed by the reused action_id.
+        assert calls == ["/repos/org/repo", "/repos/org/repo/issues"]
+
+    def test_identical_request_dedupes_regardless_of_action_id(self) -> None:
+        """Two identical requests with DIFFERENT action_ids still dedupe (true idempotency)."""
+        idempotency.clear()
+        calls: list[str] = []
+
+        def _fake_call(p, token):  # noqa: ARG001
+            calls.append(p["path"])
+            return (200, {"ok": True})
+
+        with patch.object(github_broker, "_call_github", side_effect=_fake_call):
+            a = {"action_id": "A", "method": "GET", "path": "/repos/org/repo"}
+            b = {"action_id": "B", "method": "GET", "path": "/repos/org/repo"}
+            github_broker.handle_request(a, "tok")
+            github_broker.handle_request(b, "tok")
+
+        # Identical content → one upstream call despite different action_ids.
+        assert calls == ["/repos/org/repo"]
+
+
 class TestAdvocateServerShutdownWiring:
     """AdvocateServer.stop() must call mcp_broker.shutdown_all() to terminate subprocesses."""
 

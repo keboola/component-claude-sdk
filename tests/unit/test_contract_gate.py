@@ -133,10 +133,13 @@ class TestDeriveContract:
         # The broad host-only destination must NOT be present when scoped.
         assert GITHUB_API_HOST not in dests
 
-    def test_no_operates_on_uses_broad_github_destination(self) -> None:
+    def test_no_operates_on_withholds_github_entirely(self) -> None:
+        """HIGH-3 fail-closed: github_enabled WITHOUT operates_on grants no GitHub
+        capability and emits no GitHub destination (not even the broad host)."""
         cfg = _make_cfg(github_enabled=True)
-        c = derive_contract(cfg)
-        assert GITHUB_API_HOST in c["destinations"]
+        c = derive_contract(cfg)  # no operates_on
+        assert not any(cap.startswith("gh.") for cap in c["capabilities"])
+        assert not any(GITHUB_API_HOST in d for d in c["destinations"])
 
     def test_repos_scope_set_when_operates_on_given(self) -> None:
         cfg = _make_cfg(github_enabled=True)
@@ -401,9 +404,18 @@ class TestCheckAction:
         assert result.failed_check == "scope"
 
     def test_scope_check_skipped_when_repos_empty(self) -> None:
-        """When scope.repos is empty (no operates_on), the scope check is a no-op."""
-        cfg = _make_cfg(github_enabled=True)
-        c = derive_contract(cfg)  # no operates_on → repos = []
+        """When scope.repos is empty, the scope check is a no-op.
+
+        Derive_contract no longer produces a GitHub-capable contract with empty
+        repos (HIGH-3 fail-closed), so we hand-build a contract that DOES carry
+        the capability + destination but an empty repos list, to isolate the
+        gate's scope-skip branch.
+        """
+        c = {
+            "scope": {"repos": [], "writable_branches": ["agent/*"]},
+            "capabilities": [CAP_GH_READ],
+            "destinations": [GITHUB_API_HOST],
+        }
         # Even if we pass a scope_repo, the gate should not deny on scope.
         result = check_action(
             c,
@@ -873,5 +885,164 @@ class TestGithubCapabilityMapping:
                         headers={"content-type": "application/json"},
                     )
             assert resp.status_code == 201
+        finally:
+            server.stop()
+
+
+# ---------------------------------------------------------------------------
+# 9. Writable-branch enforcement (HIGH-3) — push to main denied, agent/* allowed
+# ---------------------------------------------------------------------------
+
+
+class TestWritableBranchGate:
+    """The gate must deny ref-targeting writes to branches outside writable_branches."""
+
+    def test_branch_allowed_glob(self) -> None:
+        from advocate.gate import _branch_allowed
+
+        assert _branch_allowed("agent/fix-1", ["agent/*"]) is True
+        assert _branch_allowed("main", ["agent/*"]) is False
+        assert _branch_allowed("agent", ["agent/*"]) is False  # no slash → not under agent/*
+        assert _branch_allowed("anything", []) is False  # empty list denies
+
+    def test_write_branch_extraction(self) -> None:
+        from advocate.server import _github_write_branch
+
+        # PATCH/DELETE on a ref path
+        assert _github_write_branch("PATCH", "/repos/o/r/git/refs/heads/main", None) == "main"
+        assert _github_write_branch("DELETE", "/repos/o/r/git/refs/heads/agent/x", None) == "agent/x"
+        # POST create-ref with body.ref
+        assert _github_write_branch("POST", "/repos/o/r/git/refs", {"ref": "refs/heads/main"}) == "main"
+        # PUT contents with body.branch
+        assert _github_write_branch("PUT", "/repos/o/r/contents/f.txt", {"branch": "main"}) == "main"
+        # Reads and non-branch writes return None
+        assert _github_write_branch("GET", "/repos/o/r", None) is None
+        assert _github_write_branch("POST", "/repos/o/r/issues", {"title": "x"}) is None
+
+    def test_check_action_denies_main_branch(self) -> None:
+        cfg = _make_cfg(github_enabled=True)
+        c = derive_contract(cfg, operates_on="org/repo-X")  # writable_branches=["agent/*"]
+        result = check_action(
+            c,
+            capability=CAP_GH_WRITE_BRANCH,
+            destination=f"{GITHUB_API_HOST}/repos/org/repo-X/git/refs",
+            scope_repo="org/repo-X",
+            write_branch="main",
+        )
+        assert isinstance(result, GateDenial)
+        assert result.failed_check == "branch"
+
+    def test_check_action_allows_agent_branch(self) -> None:
+        cfg = _make_cfg(github_enabled=True)
+        c = derive_contract(cfg, operates_on="org/repo-X")
+        result = check_action(
+            c,
+            capability=CAP_GH_WRITE_BRANCH,
+            destination=f"{GITHUB_API_HOST}/repos/org/repo-X/git/refs",
+            scope_repo="org/repo-X",
+            write_branch="agent/fix-1",
+        )
+        assert isinstance(result, GateAllow)
+
+    def test_push_to_main_denied_via_uds(self) -> None:
+        """End-to-end: a PATCH that force-moves refs/heads/main → 403 at the gate."""
+        from advocate.server import AdvocateServer
+
+        cfg = _make_cfg(github_enabled=True)
+        c = derive_contract(cfg, operates_on="org/repo-X")
+        secret = new_invocation_secret()
+        envelope = sign_contract(c, secret)
+
+        server = AdvocateServer(
+            anthropic_key="dummy",
+            github_token="dummy",
+            contract_envelope=envelope,
+            contract_signing_secret=secret,
+        )
+        server.start()
+        try:
+            payload = {
+                "action_id": "branch-deny-1",
+                "method": "PATCH",
+                "path": "/repos/org/repo-X/git/refs/heads/main",
+                "body": {"sha": "deadbeef", "force": True},
+            }
+            with _tcp_client(server.port) as client:
+                resp = client.post("/v1/github", json=payload, headers={"content-type": "application/json"})
+            assert resp.status_code == 403
+            assert "branch" in resp.json()["error"]
+        finally:
+            server.stop()
+
+
+# ---------------------------------------------------------------------------
+# 10. Anthropic endpoint is gated (HIGH-4)
+# ---------------------------------------------------------------------------
+
+
+class TestAnthropicGate:
+    """The Anthropic path must be denied when the contract lacks the capability."""
+
+    def test_anthropic_denied_when_capability_absent(self) -> None:
+        """A signed contract WITHOUT the 'anthropic' capability → /v1/messages 403.
+
+        derive_contract always grants it, so we hand-build + sign a contract that
+        omits it to prove the gate is actually wired on the Anthropic path.
+        """
+        from advocate.server import AdvocateServer
+
+        contract = {
+            "scope": {"repos": [], "writable_branches": ["agent/*"]},
+            "capabilities": [],  # no 'anthropic'
+            "destinations": [DEST_ANTHROPIC],
+            "irreversible_gate": [],
+            "expiry": "this_invocation",
+        }
+        secret = new_invocation_secret()
+        envelope = sign_contract(contract, secret)
+
+        server = AdvocateServer(
+            anthropic_key="dummy",
+            contract_envelope=envelope,
+            contract_signing_secret=secret,
+        )
+        server.start()
+        try:
+            payload = {"model": "claude-opus-4-8", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}
+            with _tcp_client(server.port) as client:
+                resp = client.post("/v1/messages", json=payload, headers={"content-type": "application/json"})
+            assert resp.status_code == 403
+        finally:
+            server.stop()
+
+    def test_anthropic_allowed_with_normal_contract(self) -> None:
+        """A normal derived contract carries 'anthropic' → the gate lets it through.
+
+        We stub the upstream call so no network happens; only the gate is exercised.
+        """
+        from advocate import anthropic_proxy
+        from advocate.server import AdvocateServer
+
+        cfg = _make_cfg()
+        contract = derive_contract(cfg)
+        secret = new_invocation_secret()
+        envelope = sign_contract(contract, secret)
+
+        server = AdvocateServer(
+            anthropic_key="dummy",
+            contract_envelope=envelope,
+            contract_signing_secret=secret,
+        )
+        server.start()
+        try:
+            with patch.object(anthropic_proxy, "handle_request_passthrough", return_value=(200, {"ok": True})):
+                payload = {
+                    "model": "claude-opus-4-8",
+                    "max_tokens": 8,
+                    "messages": [{"role": "user", "content": "hi"}],
+                }
+                with _tcp_client(server.port) as client:
+                    resp = client.post("/v1/messages", json=payload, headers={"content-type": "application/json"})
+            assert resp.status_code == 200
         finally:
             server.stop()

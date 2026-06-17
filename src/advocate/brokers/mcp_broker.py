@@ -28,6 +28,7 @@ the secrets.  See Phase 5 investigation in docs/superpowers/plans/.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -58,9 +59,46 @@ _UPSTREAM_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0)
 # Matches the HTTP read timeout so all transports have a consistent budget.
 _STDIO_READ_TIMEOUT_S: float = 30.0
 
+# MED-1: env keys passed through from the Advocate to a stdio MCP subprocess.
+# We do NOT forward the full os.environ (that would leak KBC_TOKEN and other
+# platform-injected vars into a same-uid subprocess the agent can read via
+# /proc/<pid>/environ).  Only these non-secret, launch-required vars are passed,
+# plus the server's own ``cfg.env`` secrets.  NB: the stdio server's OWN
+# ``cfg.env`` secrets are still present in its /proc environ — stdio MCP servers
+# are therefore NOT credential-isolated under the same-uid V0 runtime (only
+# remote/header-injection MCP servers are).  See README "Security model".
+_MCP_SAFE_ENV_KEYS: tuple[str, ...] = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "UV_CACHE_DIR",
+    "NPM_CONFIG_CACHE",
+    "XDG_CACHE_HOME",
+    "NODE_PATH",
+)
+
 # Per-server subprocess handles (Advocate lifetime, not per-request).
 _procs: dict[str, subprocess.Popen] = {}
 _proc_locks: dict[str, threading.Lock] = {}
+
+
+def _server_idem_key(server_name: str, method: str, params: dict | None) -> str:
+    """Derive the idempotency cache key from the gated MCP request content.
+
+    MED-3: server-derived from (server_name, method, params), NOT the
+    agent-supplied ``action_id``.  The JSON-RPC ``id`` is excluded (it is a
+    correlation number, not part of the request's identity).  This prevents an
+    agent from suppressing a distinct legitimate call by reusing an action_id.
+    """
+    canonical = json.dumps(
+        {"server_name": server_name, "method": method, "params": params},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def validate(raw: dict) -> tuple[dict | None, str | None]:
@@ -118,12 +156,14 @@ def handle_request(
     Returns:
         ``(status_code, response_body_dict)`` tuple.
     """
-    action_id: str = payload["action_id"]
-    cached = _idem_get("mcp", action_id)
+    server_name: str = payload["server_name"]
+    # MED-3: cache key is server-derived from the request content, not the
+    # agent-supplied action_id (kept only as a protocol/validation field).
+    idem_key = _server_idem_key(server_name, payload["method"], payload.get("params"))
+    cached = _idem_get("mcp", idem_key)
     if cached is not None:
         return cached
 
-    server_name: str = payload["server_name"]
     cfg = mcp_configs.get(server_name)
     if cfg is None:
         # Never echo the server_name to the agent in a message that could leak
@@ -138,14 +178,14 @@ def handle_request(
         elif isinstance(cfg, McpRemoteServer):
             result = _call_remote(payload, cfg)
         else:
-            log.warning("unknown MCP server config type for action_id=%s", action_id)
+            log.warning("unknown MCP server config type for server=%s", server_name)
             return 500, {"error": "internal server error"}
     except Exception:  # noqa: BLE001
-        log.warning("MCP broker error for action_id=%s", action_id, exc_info=True)
+        log.warning("MCP broker error for server=%s", server_name, exc_info=True)
         return 502, {"error": "MCP request failed"}
 
     status, body = result
-    _idem_store("mcp", action_id, status, body)
+    _idem_store("mcp", idem_key, status, body)
     return result
 
 
@@ -167,9 +207,13 @@ def _get_or_launch_proc(cfg: McpStdioServer) -> subprocess.Popen:
     with _proc_locks[name]:
         proc = _procs.get(name)
         if proc is None or proc.poll() is not None:
-            # Build the subprocess env: inherit the Advocate's env, then overlay
-            # the server-specific secrets.  NEVER forward this env to the agent.
-            env = {**os.environ, **cfg.env}
+            # Build a MINIMAL subprocess env (MED-1): only non-secret launch vars
+            # from the Advocate + the server-specific cfg.env secrets.  We do NOT
+            # forward the full os.environ — that would leak KBC_TOKEN and other
+            # platform vars into this same-uid subprocess (readable by the agent
+            # via /proc/<pid>/environ).
+            env = {k: os.environ[k] for k in _MCP_SAFE_ENV_KEYS if k in os.environ}
+            env.update(cfg.env)
             log.debug("launching MCP stdio server %s: %s %s", name, cfg.command, cfg.args)
             proc = subprocess.Popen(  # noqa: S603
                 [cfg.command, *cfg.args],

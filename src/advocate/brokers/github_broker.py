@@ -22,6 +22,8 @@ Design notes (Phase 5):
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 from typing import Any
@@ -46,6 +48,24 @@ _PATH_RE = re.compile(r"^/[a-zA-Z0-9_.~%!$&'()*+,;=:@/-]*$")
 _ALLOWED_FIELDS = frozenset({"action_id", "method", "path", "body", "headers"})
 
 _UPSTREAM_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0)
+
+
+def _server_idem_key(method: str, path: str, body: dict | None) -> str:
+    """Derive the idempotency cache key from the gated request content.
+
+    MED-3: the cache key is computed SERVER-SIDE from (method, path, body), NOT
+    from the agent-supplied ``action_id``.  An agent therefore cannot pre-seed an
+    ``action_id`` with a benign 2xx and have a *different* legitimate side-effecting
+    call collide with it (cached-reply suppression).  Identical requests still
+    dedupe (true idempotency); different requests always get distinct keys.
+    """
+    canonical = json.dumps(
+        {"method": method, "path": path, "body": body},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def validate(raw: dict) -> tuple[dict | None, str | None]:
@@ -108,32 +128,29 @@ def handle_request(
     Returns:
         ``(status_code, response_body_dict)`` tuple.
     """
-    action_id: str = payload["action_id"]
-    cached = _idem_get("github", action_id)
+    path: str = payload["path"]
+    # MED-3: cache key is server-derived from the request content, not the
+    # agent-supplied action_id (which is kept only as a protocol/validation field).
+    idem_key = _server_idem_key(payload["method"], path, payload.get("body"))
+    cached = _idem_get("github", idem_key)
     if cached is not None:
         return cached
-
-    path: str = payload["path"]
 
     # ---- SSRF / destination check (Phase 3 focused allowlist) ----
     # The upstream host is ALWAYS api.github.com (pinned above).
     # If an explicit path allowlist is configured, enforce it here.
     if allowed_destinations is not None and not _path_allowed(path, allowed_destinations):
-        log.warning(
-            "github broker: off-allowlist destination denied for action_id=%s path=%s",
-            action_id,
-            path,
-        )
+        log.warning("github broker: off-allowlist destination denied for path=%s", path)
         return 403, {"error": "destination not in allowlist"}
 
     try:
         result = _call_github(payload, github_token)
     except Exception:  # noqa: BLE001
-        log.warning("github broker error for action_id=%s", action_id, exc_info=True)
+        log.warning("github broker error for path=%s", path, exc_info=True)
         return 502, {"error": "GitHub request failed"}
 
     status, body = result
-    _idem_store("github", action_id, status, body)
+    _idem_store("github", idem_key, status, body)
     return result
 
 

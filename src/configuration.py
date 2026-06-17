@@ -239,9 +239,15 @@ class Configuration(BaseModel):
 
     # --- intent contract scope (spec §10) ---
     operates_on: str | None = None
-    """Optional ``org/repo`` target the agent operates on; used by the Advocate to narrow
-    the contract destination to a specific GitHub repo. When None, the contract scope is
-    broad (api.github.com with no repo restriction). See spec §10."""
+    """``org/repo`` target the agent operates on; used by the Advocate to scope the
+    GitHub token to a single repository. REQUIRED when ``github_enabled`` is true —
+    without it a hijacked agent could drive the real token against any repo the token
+    can reach, so the broker fails closed (HIGH-3). See spec §10."""
+
+    writable_branches: list[str] = Field(default_factory=lambda: ["agent/*"])
+    """Glob patterns for branches the agent may write via the GitHub broker (HIGH-3).
+    Defaults to ``agent/*`` — the agent may push only to its own branches, never to
+    ``main``. The gate denies ref-targeting REST writes to any branch not matching."""
 
     def __init__(self, **data):
         try:
@@ -315,6 +321,28 @@ class Configuration(BaseModel):
             cleaned = [str(item).strip() for item in v if str(item).strip()]
             return cleaned or None
         return v
+
+    @model_validator(mode="after")
+    def _github_enabled_needs_scoped_repo(self) -> Configuration:
+        """``github_enabled`` requires a concrete ``operates_on`` repo (HIGH-3).
+
+        Without it the GitHub token cannot be bound to a single repository, so a
+        hijacked agent could drive the real token against any repo the token can
+        reach. Fail closed at config time with a clear message rather than grant
+        broad access.
+        """
+        if self.github_enabled:
+            repo = (self.operates_on or "").strip()
+            if not repo:
+                raise UserException(
+                    "github_enabled requires 'operates_on' (\"org/repo\") so the GitHub token is "
+                    "scoped to a single repository — a hijacked agent must not be able to use the "
+                    "token against arbitrary repos."
+                )
+            parts = repo.split("/")
+            if len(parts) != 2 or not all(p.strip() for p in parts):
+                raise UserException(f"operates_on must be in 'org/repo' form, got: {self.operates_on!r}")
+        return self
 
     @model_validator(mode="after")
     def _private_plugins_need_token(self) -> Configuration:

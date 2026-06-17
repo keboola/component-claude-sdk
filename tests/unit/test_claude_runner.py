@@ -58,7 +58,7 @@ def test_build_options_per_task_overrides():
 
 
 def test_build_options_github_tools_added():
-    cfg = _config(github_enabled=True)
+    cfg = _config(github_enabled=True, operates_on="org/repo-X")
     runner = ClaudeRunner(workspace_dir="/tmp/ws")
     opts = runner.build_options(_task(), cfg, [], {})
     assert "Bash" in opts.allowed_tools

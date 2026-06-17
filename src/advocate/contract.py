@@ -22,14 +22,15 @@ Shape (spec §7.1)::
         "expiry": "this_invocation"
     }
 
-Gap note — ``operates_on`` (spec §10):
-    The current ``Configuration`` model does not expose an ``operates_on: org/repo``
-    field.  When it is absent ``scope.repos`` is derived conservatively as an empty
-    list, which means the GitHub broker will gate by ``gh.read``/``gh.write_branch``
-    capability but cannot further restrict to a specific repo path.  Phase 5 (or a
-    later config-schema addition) should add ``operates_on`` to ``Configuration`` and
-    pass it into ``derive_contract`` so the repo scope becomes concrete.  Until then
-    the gate falls back to a capability-only check for GitHub calls (see ``gate.py``).
+Repo scope — ``operates_on`` (spec §10):
+    ``Configuration`` exposes ``operates_on: "org/repo"`` and rejects
+    ``github_enabled`` without it (UserException at parse time).  ``derive_contract``
+    grants GitHub capabilities ONLY when ``operates_on`` is present and scopes the
+    destination to ``api.github.com/repos/<operates_on>``; without it ALL GitHub
+    capabilities are withheld (fail-closed).  The repo is never inferred from the
+    task prompt (untrusted once Phase 2 begins).  The gate additionally enforces
+    ``scope.repos`` and ``scope.writable_branches`` on GitHub writes (see
+    ``gate.py``).
 """
 
 from __future__ import annotations
@@ -69,6 +70,14 @@ CAP_GH_OPEN_PR = "gh.open_pr"
 CAP_GH_COMMENT = "gh.comment"
 CAP_GH_MERGE = "gh.merge"
 CAP_GH_DELETE = "gh.delete"
+
+# The Anthropic model channel.  Every contract grants this: the agent's ONLY
+# model channel is the loopback proxy (it cannot reach the real Anthropic
+# endpoint directly), so the proxy is always reachable.  Granting it explicitly
+# means the Anthropic broker can be gated like every other endpoint (HIGH-4):
+# a contract that does not carry this capability (tampered / mis-derived) makes
+# the Anthropic path fail closed instead of silently ungated.
+CAP_ANTHROPIC = "anthropic"
 
 # MCP capability prefix: "mcp.<server_name>"
 MCP_CAP_PREFIX = "mcp."
@@ -113,20 +122,28 @@ def derive_contract(
         A plain dict representing the contract.  Sign it with :func:`sign_contract`
         before storing; pass the signed envelope to the gate.
     """
-    capabilities: list[str] = []
+    # The Anthropic model channel is always granted (the agent has no other way
+    # to reach a model) — see CAP_ANTHROPIC.
+    capabilities: list[str] = [CAP_ANTHROPIC]
     destinations: list[str] = [DEST_ANTHROPIC]
 
-    # GitHub capabilities — derived from config signals
-    if cfg.github_enabled:
+    # GitHub capabilities — derived from config signals.
+    #
+    # HIGH-3 (fail-closed repo scope): GitHub capabilities are granted ONLY when
+    # a concrete ``operates_on`` repo is known.  Without it we cannot bound the
+    # PAT to a single repo, so the safe default is to grant NOTHING (a hijacked
+    # agent then cannot drive the real token against arbitrary repos).  The
+    # broad ``api.github.com`` destination is never emitted.  ``Configuration``
+    # also rejects ``github_enabled`` without ``operates_on`` at parse time
+    # (UserException), so in production this branch is belt-and-suspenders.
+    if cfg.github_enabled and operates_on:
         capabilities.extend([CAP_GH_READ, CAP_GH_WRITE_BRANCH, CAP_GH_OPEN_PR, CAP_GH_COMMENT])
-        # Scope the destination to the specific repo when operates_on is known.
-        if operates_on:
-            gh_dest = f"{GITHUB_API_HOST}/repos/{operates_on}"
-        else:
-            # No operates_on: allow api.github.com broadly (capability gate still
-            # applies; see gap note in module docstring).
-            gh_dest = GITHUB_API_HOST
-        destinations.append(gh_dest)
+        destinations.append(f"{GITHUB_API_HOST}/repos/{operates_on}")
+    elif cfg.github_enabled and not operates_on:
+        log.warning(
+            "derive_contract: github_enabled but no operates_on repo — withholding ALL "
+            "GitHub capabilities (fail-closed). Set operates_on='org/repo' to grant scoped access."
+        )
 
     # MCP capabilities — one "mcp.<name>" per declared server
     for server in cfg.mcp_servers:
@@ -142,10 +159,15 @@ def derive_contract(
     # Repo scope
     repos: list[str] = [operates_on] if operates_on else []
 
+    # Writable-branch scope (HIGH-3): enforced by the gate on ref-targeting
+    # writes.  Defaults to ``agent/*`` (the agent may push only to its own
+    # branches, never to ``main``); a config may widen it via ``writable_branches``.
+    writable_branches = getattr(cfg, "writable_branches", None) or _DEFAULT_WRITABLE_BRANCHES
+
     contract: dict = {
         "scope": {
             "repos": repos,
-            "writable_branches": _DEFAULT_WRITABLE_BRANCHES,
+            "writable_branches": list(writable_branches),
         },
         "capabilities": sorted(capabilities),
         "destinations": sorted(destinations),

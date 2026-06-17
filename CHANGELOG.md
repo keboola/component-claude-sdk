@@ -27,7 +27,10 @@
 
 - **Env-scrub re-exec** (`src/component.py`): KBC_TOKEN is stripped from the
   exec-time environment via `os.execve` and passed back via an inherited pipe fd,
-  so `/proc/<advocate>/environ` no longer exposes the Storage token.
+  so `/proc/<advocate>/environ` no longer exposes the Storage token. After the
+  base class captures it at construction the value is **purged from `os.environ`
+  before the agent spawns**, so it is not inherited by the agent subprocess (the
+  SDK transport merges `os.environ` into the agent env).
 
 - **Atomic config.json scrub** (`src/component.py`): decrypted `#`-secret values
   are replaced with empty strings before the agent spawns; the scrubbed file is
@@ -46,11 +49,44 @@
   seccomp/setuid primitives and ptrace_scope on any Linux container. Re-run on
   platform/runtime changes (spec §12.6 runtime dependency).
 
+### Security (review follow-ups — commit `d493924` review)
+
+- **HIGH-1 — KBC_TOKEN no longer re-injected into `os.environ`.** The boot path
+  set the token transiently for the base-class capture, then re-left it in the
+  environment; because the SDK transport merges `os.environ` into the agent env,
+  it would have leaked straight into the agent. The token is now purged from
+  `os.environ` before any action runs, and the cleared agent env explicitly blanks
+  `KBC_TOKEN`/`GITHUB_TOKEN`/`GH_TOKEN`.
+- **HIGH-2 — `ptrace_scope >= 1` is asserted at boot.** All in-memory secret
+  protection rests on it; the run fails closed when `ptrace_scope=0` (dev/test
+  override: `ADVOCATE_ALLOW_UNSAFE_PTRACE=1`).
+- **HIGH-3 — GitHub access is repo- and branch-scoped.** `github_enabled` now
+  requires `operates_on` (`"org/repo"`) — fail closed at config parse. The broker
+  destination allowlist, the contract destination, and the gate's `scope_repo`
+  check all bind to that single repo; ref-targeting REST writes are gated against
+  `writable_branches` (default `agent/*`, so pushes to `main` are denied).
+  `derive_contract` withholds all GitHub capabilities when `operates_on` is absent.
+- **HIGH-4 — the Anthropic endpoint is gated.** `/v1/messages` runs the contract
+  gate (capability `anthropic`, pinned destination) on both the structured and
+  transparent-proxy paths before injecting the real key.
+- **MED-1 — stdio MCP subprocess env minimised.** The MCP launcher no longer
+  passes the Advocate's full `os.environ` to the subprocess (only a non-secret
+  launch allowlist + the server's own `env`). stdio MCP servers remain *not*
+  credential-isolated under the same-UID runtime (documented); only remote MCP is.
+- **MED-3 — broker idempotency keys are server-derived** from the request content
+  (GitHub: method+path+body; MCP: server+method+params), not the agent-supplied
+  `action_id`, preventing cached-reply suppression of a distinct legitimate call.
+- **Plugin install fix.** The GitHub token for private plugin sources is now
+  injected into the install subprocess env (Advocate-side, short-lived) instead of
+  being assumed present in the cleared agent env — private marketplace clones can
+  authenticate again, without exposing the token to the agent.
+
 ### Changed
 
 - Component boot sequence (`src/component.py`) wired into the full Broker V0
-  sequence: config parse → config scrub → contract derivation → AdvocateServer
-  start → cleared-env agent spawn → task loop → output promotion → server stop.
+  sequence: ptrace_scope assertion → config parse → config scrub → contract
+  derivation → AdvocateServer start → cleared-env agent spawn → task loop →
+  output promotion → server stop.
 
 ### Removed
 
