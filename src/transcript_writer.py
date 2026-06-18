@@ -167,7 +167,16 @@ class TranscriptWriter:
     # --- flush ----------------------------------------------------------------
 
     def flush(self) -> None:
-        """Write claude_sessions + claude_runs CSVs and their manifests."""
+        """Write claude_sessions + claude_runs CSVs and their manifests.
+
+        Defensively close any per-task JSONL handle still open. If a task raised
+        before :meth:`end_task` ran, the handle would otherwise leak and its
+        buffered tail might not reach disk before the file manifest is registered
+        here.
+        """
+        if self._file is not None:
+            self._file.close()
+            self._file = None
         self._write_file_manifests()
         self._write_table(SESSIONS_TABLE, SESSIONS_SCHEMA, self._sessions_rows)
         self._write_table(RUNS_TABLE, RUNS_SCHEMA, self._runs_rows)

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from collections.abc import Iterator
 
 import httpx
+
+from advocate.idempotency import get as _idem_get
+from advocate.idempotency import store as _idem_store
 
 log = logging.getLogger(__name__)
 
@@ -15,10 +20,6 @@ UPSTREAM_URL = "https://api.anthropic.com"  # HARD-CODED — never taken from ag
 # Messages API rejects with 400 "Extra inputs are not permitted".
 _STRIP_FIELDS: frozenset[str] = frozenset({"action_id", "context_management"})
 
-# Process-lifetime idempotency cache: single-job, intentionally no eviction/TTL.
-# Only successful (2xx) results are stored; transient errors fall through so retries re-attempt upstream.
-_idempotency_cache: dict[str, tuple[int, dict]] = {}
-
 # Timeout for non-streaming calls.
 _UPSTREAM_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0)
 
@@ -27,13 +28,29 @@ _UPSTREAM_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0)
 _UPSTREAM_STREAM_TIMEOUT = httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=5.0)
 
 
+def _server_idem_key(payload: dict, query_string: str) -> str:
+    """Derive a content-addressed idempotency key from the forwarded request.
+
+    Keyed on the request content the broker actually sends upstream (with
+    broker/CLI-internal fields stripped) plus the query string — NOT the
+    agent-supplied ``action_id``. Mirrors the GitHub/MCP brokers (MED-3): an
+    agent cannot pre-seed an ``action_id`` and have a later, different request
+    return a stale cached body, because the key is derived server-side from the
+    actual content rather than from an agent-controlled token.
+    """
+    body = {k: v for k, v in payload.items() if k not in _STRIP_FIELDS}
+    canonical = json.dumps([body, query_string], sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def handle_request(payload: dict, anthropic_key: str, *, query_string: str = "") -> tuple[int, dict]:
     """Forward a validated non-streaming payload to Anthropic, injecting the API key.
 
-    Idempotency: if ``payload['action_id']`` has been seen before **and that
-    result was a success (2xx)**, return the cached result immediately without
-    a second upstream call.  Non-2xx results are NOT cached so a retry with
-    the same ``action_id`` re-attempts upstream.
+    Idempotency: keyed on a server-derived hash of the forwarded request content
+    (NOT the agent-supplied ``action_id``), matching the GitHub/MCP brokers
+    (MED-3). If an identical request was already served with a success (2xx),
+    the cached result is returned without a second upstream call. Non-2xx
+    results are NOT cached, so a retry re-attempts upstream.
 
     Args:
         payload: Validated request dict (must contain ``action_id``).  Must
@@ -46,20 +63,20 @@ def handle_request(payload: dict, anthropic_key: str, *, query_string: str = "")
     Returns:
         ``(status_code, response_body_dict)`` tuple.
     """
-    action_id: str = payload["action_id"]
-    if action_id in _idempotency_cache:
-        log.debug("action_id %s: returning cached result", action_id)
-        return _idempotency_cache[action_id]
+    idem_key = _server_idem_key(payload, query_string)
+    cached = _idem_get("anthropic", idem_key)
+    if cached is not None:
+        return cached
 
     try:
         result = _call_upstream(payload, anthropic_key, query_string=query_string)
     except Exception:  # noqa: BLE001
-        log.warning("_call_upstream raised for action_id=%s", action_id, exc_info=True)
+        log.warning("_call_upstream raised (anthropic structured path)", exc_info=True)
         return 502, {"error": "upstream request failed"}
 
-    status, _ = result
-    if 200 <= status < 300:
-        _idempotency_cache[action_id] = result
+    status, body = result
+    # store() only persists 2xx — transient errors fall through so a retry re-attempts upstream.
+    _idem_store("anthropic", idem_key, status, body)
     return result
 
 
@@ -142,7 +159,10 @@ def _call_upstream(payload: dict, anthropic_key: str, *, query_string: str = "")
             body.get("model", "?"),
         )
         if resp.status_code >= 400:
-            log.warning("upstream error body: %s", resp.text[:500])
+            # Log only the status at WARNING; the raw upstream body is an
+            # unbounded content sink, so keep it at DEBUG.
+            log.warning("upstream error status=%d", resp.status_code)
+            log.debug("upstream error body: %s", resp.text[:500])
         return resp.status_code, resp.json()
     except httpx.HTTPError as exc:
         log.warning("upstream HTTP error for action_id=%s: %s", payload.get("action_id"), type(exc).__name__)

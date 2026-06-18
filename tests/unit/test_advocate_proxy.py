@@ -6,6 +6,7 @@ from unittest.mock import patch
 import httpx
 import vcr as vcrpy
 
+from advocate import idempotency
 from advocate.server import AdvocateServer
 
 MY_VCR = vcrpy.VCR(
@@ -88,9 +89,7 @@ def test_schema_rejects_upstream_override() -> None:
 @MY_VCR.use_cassette("anthropic_proxy_turn.json")
 def test_proxy_completes_turn_via_tcp() -> None:
     """A Python TCP client (no real key) completes a model turn through the proxy."""
-    from advocate import anthropic_proxy
-
-    anthropic_proxy._idempotency_cache.clear()
+    idempotency.clear()
 
     server = AdvocateServer(anthropic_key="dummy-key-for-test")
     server.start()
@@ -116,10 +115,10 @@ def test_proxy_completes_turn_via_tcp() -> None:
 
 
 def test_action_id_idempotency_no_double_upstream_call() -> None:
-    """Replaying the same action_id returns cached result; upstream called exactly once."""
+    """Replaying an identical request body returns the cached result; upstream called once."""
     from advocate import anthropic_proxy
 
-    anthropic_proxy._idempotency_cache.clear()
+    idempotency.clear()
 
     mock_result = (200, {"id": "msg_mock", "role": "assistant", "content": [{"type": "text", "text": "Hi"}]})
 
@@ -139,6 +138,37 @@ def test_action_id_idempotency_no_double_upstream_call() -> None:
         server.stop()
 
 
+def test_same_action_id_different_body_is_not_served_from_cache() -> None:
+    """A reused action_id with a different body must hit upstream again.
+
+    The idempotency key is server-derived from the forwarded content (MED-3),
+    not the agent-supplied action_id, so an agent cannot pre-seed an action_id
+    with one response and have a later, different request return the stale body.
+    """
+    from advocate import anthropic_proxy
+
+    idempotency.clear()
+
+    first = (200, {"id": "msg_a", "role": "assistant", "content": [{"type": "text", "text": "A"}]})
+    second = (200, {"id": "msg_b", "role": "assistant", "content": [{"type": "text", "text": "B"}]})
+
+    payload_a = {**_VALID_PAYLOAD, "action_id": "reused", "messages": [{"role": "user", "content": "first"}]}
+    payload_b = {**_VALID_PAYLOAD, "action_id": "reused", "messages": [{"role": "user", "content": "second"}]}
+
+    server = _make_server()
+    try:
+        with patch.object(anthropic_proxy, "_call_upstream", side_effect=[first, second]) as mock_call:
+            with _tcp_client(server.port) as client:
+                resp1 = client.post("/v1/messages", json=payload_a, headers={"content-type": "application/json"})
+            with _tcp_client(server.port) as client:
+                resp2 = client.post("/v1/messages", json=payload_b, headers={"content-type": "application/json"})
+        assert resp1.json()["id"] == "msg_a"
+        assert resp2.json()["id"] == "msg_b", "different body returned a stale cached response"
+        assert mock_call.call_count == 2, f"expected 2 upstream calls, got {mock_call.call_count}"
+    finally:
+        server.stop()
+
+
 # ---------------------------------------------------------------------------
 # Test 6 (new): upstream httpx failure → sanitized 502, no internal detail leaked
 # ---------------------------------------------------------------------------
@@ -148,7 +178,7 @@ def test_upstream_httpx_error_returns_sanitized_502() -> None:
     """An httpx network error from _call_upstream becomes a clean 502 with no detail."""
     from advocate import anthropic_proxy
 
-    anthropic_proxy._idempotency_cache.clear()
+    idempotency.clear()
 
     server = _make_server()
     try:
@@ -181,7 +211,7 @@ def test_upstream_non_json_body_returns_sanitized_502() -> None:
     """A non-JSON upstream response (e.g. 5xx HTML) becomes a clean 502."""
     from advocate import anthropic_proxy
 
-    anthropic_proxy._idempotency_cache.clear()
+    idempotency.clear()
 
     # Simulate resp.json() raising ValueError (JSONDecodeError) from _call_upstream
     def _bad_json(payload: dict, key: str) -> tuple[int, dict]:  # noqa: ARG001
@@ -212,7 +242,7 @@ def test_error_result_not_cached_retry_calls_upstream_again() -> None:
     """A 502 from upstream is NOT stored in the idempotency cache; retry hits upstream again."""
     from advocate import anthropic_proxy
 
-    anthropic_proxy._idempotency_cache.clear()
+    idempotency.clear()
 
     error_result = (502, {"error": "upstream request failed"})
     success_result = (200, {"id": "msg_ok", "role": "assistant", "content": [{"type": "text", "text": "Hi"}]})

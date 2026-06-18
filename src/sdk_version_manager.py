@@ -56,8 +56,12 @@ class SdkVersionManager:
         except subprocess.CalledProcessError as exc:
             return self._handle_install_failure(exc, sdk_version, on_failure)
 
-        if self._overlay_dir not in sys.path:
-            sys.path.insert(0, self._overlay_dir)
+        # Guarantee the overlay shadows the baked SDK by sitting at sys.path[0].
+        # If a prior call in the same process already added it further down, move
+        # it back to the front rather than leaving it where "prepend" no longer holds.
+        if self._overlay_dir in sys.path:
+            sys.path.remove(self._overlay_dir)
+        sys.path.insert(0, self._overlay_dir)
         resolved = self._overlay_version()
         logging.info("Runtime SDK overlay active: %s==%s", PACKAGE, resolved)
         return resolved

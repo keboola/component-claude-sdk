@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 import httpx
 
+from advocate import idempotency
 from advocate.server import AdvocateServer
 
 # ---------------------------------------------------------------------------
@@ -347,7 +348,7 @@ def test_non_streaming_path_unaffected_by_phase3b() -> None:
     """stream=false/absent still returns JSON and the idempotency cache still fires."""
     from advocate import anthropic_proxy
 
-    anthropic_proxy._idempotency_cache.clear()
+    idempotency.clear()
 
     mock_result = (200, {"id": "msg_noss", "role": "assistant", "content": [{"type": "text", "text": "Hi"}]})
 

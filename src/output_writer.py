@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import shutil
+from typing import Any
 
 from keboola.component.base import ComponentBase
 from keboola.component.dao import BaseType, ColumnDefinition
@@ -73,8 +74,19 @@ class OutputWriter:
             logging.warning("Skipping agent output '%s': empty or headerless CSV.", filename)
             return
         meta = self._read_meta(src)
-        incremental = bool(meta.get("incremental", default_incremental))
-        primary_key = [c for c in meta.get("primary_key", []) if c in columns]
+        # Only honour a real JSON boolean — a truthy string like "false" must not
+        # silently flip the table to incremental; fall back to the default instead.
+        incremental_meta = meta.get("incremental")
+        incremental = incremental_meta if isinstance(incremental_meta, bool) else default_incremental
+        # primary_key must be a list of column names; a bare string would be
+        # iterated character-by-character, silently yielding a wrong/empty PK.
+        # Coerce a lone string to a one-element list and ignore any other shape.
+        declared_pk = meta.get("primary_key", [])
+        if isinstance(declared_pk, str):
+            declared_pk = [declared_pk]
+        elif not isinstance(declared_pk, list):
+            declared_pk = []
+        primary_key = [c for c in declared_pk if c in columns]
         if incremental and not primary_key:
             raise UserException(
                 f"Agent output table '{filename}' is marked incremental but declares no primary_key "
@@ -105,7 +117,7 @@ class OutputWriter:
             return []
 
     @staticmethod
-    def _read_meta(csv_path: str) -> dict:
+    def _read_meta(csv_path: str) -> dict[str, Any]:
         meta_path = csv_path + META_SUFFIX
         if not os.path.isfile(meta_path):
             return {}

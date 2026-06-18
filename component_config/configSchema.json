@@ -235,6 +235,19 @@
           },
           "propertyOrder": 1
         },
+        "operates_on": {
+          "type": "string",
+          "title": "Repository (org/repo)",
+          "description": "The single GitHub repository the agent operates on, in \"org/repo\" form. Required when GitHub is enabled.",
+          "options": {
+            "dependencies": {
+              "github_enabled": true
+            },
+            "grid_columns": 12,
+            "tooltip": "e.g. \"acme/widgets\". The Advocate broker scopes the GitHub token to exactly this repository, so a hijacked agent cannot drive the token against other repos. Must be exactly \"org/repo\" with no spaces."
+          },
+          "propertyOrder": 2
+        },
         "#github_token": {
           "type": "string",
           "title": "GitHub Token",
@@ -247,7 +260,26 @@
             "grid_columns": 12,
             "tooltip": "Fine-grained PAT (Contents r/w, Pull requests r/w) or a classic token with the repo scope. Injected at runtime as GITHUB_TOKEN and GH_TOKEN so the agent's gh and git commands authenticate, and used to clone private plugin marketplaces. A private plugin source also needs this token, so enable GitHub here even if you only use private plugins. Encrypted at rest, never logged."
           },
-          "propertyOrder": 2
+          "propertyOrder": 3
+        },
+        "writable_branches": {
+          "type": "array",
+          "title": "Writable Branches",
+          "description": "Branch-name globs the agent may push to (default: agent/*). Pushes outside these globs are denied by the Advocate broker.",
+          "default": [
+            "agent/*"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "options": {
+            "dependencies": {
+              "github_enabled": true
+            },
+            "grid_columns": 12,
+            "tooltip": "Glob patterns such as \"agent/*\". The broker only allows git pushes to branches matching one of these patterns, so the agent cannot overwrite protected or default branches. Leave as the default unless you have a reason to widen it."
+          },
+          "propertyOrder": 4
         }
       }
     },

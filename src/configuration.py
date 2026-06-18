@@ -11,7 +11,7 @@ Secret VALUES are never logged or echoed here; only key NAMES appear in code.
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from keboola.component.exceptions import UserException
 from pydantic import (
@@ -219,7 +219,7 @@ class Configuration(BaseModel):
 
     # --- prompts & settings passthrough ---
     system_prompt: str = ""
-    settings_json: dict | str | None = None
+    settings_json: dict[str, Any] | str | None = None
     setting_sources: list[Literal["user", "project", "local"]] = Field(default_factory=list)
 
     # --- MCP servers & plugins ---
@@ -374,7 +374,7 @@ class Configuration(BaseModel):
             return self.max_budget_usd
         return min(task_budget, self.max_budget_usd)
 
-    def log_safe_summary(self) -> dict:
+    def log_safe_summary(self) -> dict[str, Any]:
         """A dict safe to log — no secret values, only their presence."""
         return {
             "model": self.model.value,
