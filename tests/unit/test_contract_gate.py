@@ -932,6 +932,105 @@ class TestGithubCapabilityMapping:
 
 
 # ---------------------------------------------------------------------------
+# 8b. Percent-encoding capability bypass — classifier must see the routed path
+# ---------------------------------------------------------------------------
+
+
+class TestPercentEncodingCapabilityBypass:
+    """GitHub percent-decodes path segments once before routing.
+
+    The capability classifier, repo-scope, writable-branch and destination
+    checks therefore MUST run on the once-decoded path; otherwise an agent can
+    hide a privileged operation behind a percent-encoded letter and have the
+    benign classification ride past the gate while GitHub executes the real,
+    privileged endpoint with the injected PAT.
+    """
+
+    @staticmethod
+    def _gated_server() -> object:
+        from advocate import idempotency
+        from advocate.server import AdvocateServer
+
+        idempotency.clear()
+        cfg = _make_cfg(github_enabled=True)
+        c = derive_contract(cfg, operates_on="org/repo-X")
+        secret = new_invocation_secret()
+        envelope = sign_contract(c, secret)
+        server = AdvocateServer(
+            anthropic_key="dummy",
+            github_token="dummy",
+            contract_envelope=envelope,
+            contract_signing_secret=secret,
+        )
+        server.start()
+        return server
+
+    def _assert_denied(self, payload: dict) -> None:
+        from advocate.brokers import github_broker
+
+        server = self._gated_server()
+        try:
+            # _call_github is mocked so a (hypothetical) bypass would NOT actually
+            # reach GitHub — but if the gate let it through we would observe the
+            # mocked 200 instead of a 403, which is exactly what we assert against.
+            with patch.object(github_broker, "_call_github", return_value=(200, {"ok": True})) as called:
+                with _tcp_client(server.port) as client:
+                    resp = client.post(
+                        "/v1/github",
+                        json=payload,
+                        headers={"content-type": "application/json"},
+                    )
+            assert resp.status_code == 403, f"expected gate denial, got {resp.status_code}: {resp.text}"
+            assert called.call_count == 0, "denied request must never reach the upstream call"
+        finally:
+            server.stop()  # type: ignore[attr-defined]
+
+    def test_encoded_merge_denied(self) -> None:
+        """PUT /pulls/42/%6Derge (%6D='m') must be denied — it routes to /merge."""
+        self._assert_denied({"action_id": "enc-merge", "method": "PUT", "path": "/repos/org/repo-X/pulls/42/%6Derge"})
+
+    def test_encoded_protection_denied(self) -> None:
+        """PUT /branches/main/%70rotection (%70='p') must be denied — gh.admin endpoint."""
+        self._assert_denied(
+            {
+                "action_id": "enc-prot",
+                "method": "PUT",
+                "path": "/repos/org/repo-X/branches/main/%70rotection",
+            }
+        )
+
+    def test_encoded_ref_to_main_denied(self) -> None:
+        """PATCH /git/refs/%68eads/main (%68='h') must be denied — writes protected main."""
+        self._assert_denied(
+            {
+                "action_id": "enc-ref",
+                "method": "PATCH",
+                "path": "/repos/org/repo-X/git/refs/%68eads/main",
+                "body": {"sha": "deadbeef", "force": True},
+            }
+        )
+
+    def test_double_encoded_path_rejected_at_validate(self) -> None:
+        """A multiply percent-encoded path is rejected at validation (fail-closed)."""
+        from advocate.brokers.github_broker import validate
+
+        validated, err = validate({"action_id": "dbl", "method": "PUT", "path": "/repos/org/repo-X/pulls/42/%256Derge"})
+        assert validated is None
+        assert err is not None
+
+    def test_validate_canonicalizes_path(self) -> None:
+        """validate exposes the once-decoded path used for gating decisions."""
+        from advocate.brokers.github_broker import validate
+
+        validated, err = validate({"action_id": "canon", "method": "PUT", "path": "/repos/org/repo-X/pulls/42/%6Derge"})
+        assert err is None
+        assert validated is not None
+        assert validated["path_canonical"] == "/repos/org/repo-X/pulls/42/merge"
+        # The raw path is preserved verbatim for the outbound wire request.
+        assert validated["path"] == "/repos/org/repo-X/pulls/42/%6Derge"
+
+
+# ---------------------------------------------------------------------------
 # 9. Writable-branch enforcement (HIGH-3) — push to main denied, agent/* allowed
 # ---------------------------------------------------------------------------
 

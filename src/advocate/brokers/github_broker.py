@@ -119,6 +119,26 @@ def validate(raw: dict) -> tuple[dict | None, str | None]:
     if not _is_safe_path(path):
         return None, "path: directory traversal or empty segments are not allowed"
 
+    # Canonicalize to the path GitHub will actually ROUTE on. GitHub (and the
+    # upstream proxy) percent-decode path segments exactly once before routing,
+    # so the capability classifier, the contract gate, the destination allowlist
+    # and the writable-branch / repo-scope checks MUST all operate on the decoded
+    # path — otherwise an agent hides a privileged operation behind a percent-
+    # encoded letter (e.g. ``/pulls/42/%6Derge`` classifies as ``write_branch``
+    # but GitHub routes it to ``/pulls/42/merge``).  We expose the once-decoded
+    # form as ``path_canonical`` for those decisions while ``path`` is forwarded
+    # verbatim on the wire (it carries no literal query/fragment delimiters —
+    # ``_PATH_RE`` forbids raw ``?``/``#`` — so GitHub's single decode of the raw
+    # path equals ``path_canonical``).  We reject MULTIPLY percent-encoded paths:
+    # no legitimate GitHub REST path needs them, and they would push the gate's
+    # single decode out of step with GitHub's, re-opening the bypass one level
+    # deeper.  Fail-closed.
+    decoded = urllib.parse.unquote(path)
+    if urllib.parse.unquote(decoded) != decoded:
+        return None, "path: multiply percent-encoded segments are not allowed"
+    if not _is_safe_path(decoded):
+        return None, "path: directory traversal or empty segments are not allowed"
+
     body = raw.get("body")
     if body is not None and not isinstance(body, dict):
         return None, "body: must be a JSON object when present"
@@ -130,7 +150,9 @@ def validate(raw: dict) -> tuple[dict | None, str | None]:
     if headers is not None and not isinstance(headers, dict):
         return None, "headers: must be a JSON object when present"
 
-    return dict(raw), None
+    validated = dict(raw)
+    validated["path_canonical"] = decoded
+    return validated, None
 
 
 def handle_request(
@@ -153,9 +175,15 @@ def handle_request(
         ``(status_code, response_body_dict)`` tuple.
     """
     path: str = payload["path"]
+    # The allowlist must match the path GitHub will route on (decoded once), not
+    # the raw encoded form — otherwise an encoded segment could slip a request
+    # past the allowlist while GitHub routes it elsewhere. ``validate`` provides
+    # the canonical form; fall back to the raw path for any caller that bypassed
+    # validation (then they get the stricter raw comparison).
+    canonical_path: str = payload.get("path_canonical", path)
     # MED-3: cache key is server-derived from the request content, not the
     # agent-supplied action_id (which is kept only as a protocol/validation field).
-    idem_key = _server_idem_key(payload["method"], path, payload.get("body"))
+    idem_key = _server_idem_key(payload["method"], canonical_path, payload.get("body"))
     cached = _idem_get("github", idem_key)
     if cached is not None:
         return cached
@@ -163,7 +191,7 @@ def handle_request(
     # ---- SSRF / destination check (Phase 3 focused allowlist) ----
     # The upstream host is ALWAYS api.github.com (pinned above).
     # If an explicit path allowlist is configured, enforce it here.
-    if allowed_destinations is not None and not _path_allowed(path, allowed_destinations):
+    if allowed_destinations is not None and not _path_allowed(canonical_path, allowed_destinations):
         log.warning("github broker: off-allowlist destination denied for path=%s", path)
         return 403, {"error": "destination not in allowlist"}
 

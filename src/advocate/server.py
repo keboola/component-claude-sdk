@@ -524,7 +524,13 @@ class _Handler(BaseHTTPRequestHandler):
         #   PUT/POST to …/merge(s)        → gh.merge    (NOT write_branch — irreversible)
         #   POST/PATCH/PUT (other writes) → gh.write_branch
         method: str = validated.get("method", "GET")
-        path: str = validated.get("path", "")
+        # Classify, scope and gate on the CANONICAL (once-decoded) path — the path
+        # GitHub actually routes on — never the raw encoded form.  Otherwise a
+        # percent-encoded letter (e.g. ``%6Derge`` → ``merge``) lets a privileged
+        # op ride past the classifier as a benign one.  ``github_broker.validate``
+        # produced ``path_canonical``; the raw ``path`` is what we forward on the
+        # wire, and GitHub's single decode of it equals ``path_canonical``.
+        path: str = validated.get("path_canonical", validated.get("path", ""))
         cap = _github_capability(method, path)
         dest = f"{github_broker.GITHUB_API_HOST}{path}"
         # HIGH-3: bind the call to the contract's repo scope and writable-branch

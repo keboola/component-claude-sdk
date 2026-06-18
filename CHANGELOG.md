@@ -74,6 +74,16 @@
   repository-settings / branch-protection writes (`PATCH /repos/{o}/{r}`,
   `…/branches/*/protection`) require a withheld `gh.admin` capability so a
   `write_branch`-scoped agent cannot re-point `default_branch` or disable protection.
+  Hardened again after a second adversarial re-verification: the capability
+  classifier, repo-scope, writable-branch, and destination checks now run on the
+  **once-percent-decoded** path (GitHub decodes path segments once before
+  routing), so an encoded letter — e.g. `PUT /repos/org/repo/pulls/42/%6Derge`
+  (`%6D`=`m`) → `…/merge`, `…/branches/main/%70rotection` → `…/protection`,
+  `PATCH …/git/refs/%68eads/main` → `…/heads/main` — can no longer hide a
+  privileged op (`gh.merge`/`gh.admin`/push-to-`main`) behind a benign
+  `gh.write_branch` classification. The raw path is still forwarded verbatim on
+  the wire (so gate view == GitHub's routed path), and multiply percent-encoded
+  paths are rejected at the validator (fail closed).
 - **HIGH-4 — the Anthropic endpoint is gated.** `/v1/messages` runs the contract
   gate (capability `anthropic`, pinned destination) on both the structured and
   transparent-proxy paths before injecting the real key.
