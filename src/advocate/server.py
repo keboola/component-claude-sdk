@@ -123,7 +123,16 @@ def _github_capability(method: str, path: str) -> str:
     - DELETE                      → ``gh.delete``       (destructive — not covered by write_branch)
     - PUT/POST to a ``…/merge(s)``→ ``gh.merge``        (irreversible — not covered by write_branch)
     - repo-settings / protection  → ``gh.admin``        (would undermine the branch scope)
+    - POST to ``…/pulls``         → ``gh.open_pr``      (open a pull request)
+    - POST to ``…/comments``      → ``gh.comment``      (issue / PR / commit comment)
     - other writes                → ``gh.write_branch``
+
+    ``gh.open_pr`` and ``gh.comment`` are emitted here (not collapsed into
+    ``gh.write_branch``) so the granular capabilities the contract advertises are
+    actually enforced: a contract that grants ``gh.write_branch`` but withholds
+    ``gh.open_pr`` now blocks PR creation.  The default derived contract grants
+    all of read / write_branch / open_pr / comment, so default behaviour is
+    unchanged — the change only makes the granularity real.
     """
     if method == "GET":
         return "gh.read"
@@ -135,6 +144,13 @@ def _github_capability(method: str, path: str) -> str:
         return "gh.merge"
     if _is_repo_admin_write(method, path):
         return "gh.admin"
+    # Less-privileged writes with their own capability.  Checked AFTER merge/admin
+    # so those always take precedence; a GET to the same path is already handled
+    # above (list PRs / list comments are reads, not open_pr / comment).
+    if method == "POST" and norm_path.endswith("/pulls"):
+        return "gh.open_pr"
+    if method == "POST" and norm_path.endswith("/comments"):
+        return "gh.comment"
     return "gh.write_branch"
 
 
@@ -534,6 +550,8 @@ class _Handler(BaseHTTPRequestHandler):
         #   GET                           → gh.read
         #   DELETE                        → gh.delete   (NOT write_branch — destructive)
         #   PUT/POST to …/merge(s)        → gh.merge    (NOT write_branch — irreversible)
+        #   POST to …/pulls               → gh.open_pr
+        #   POST to …/comments            → gh.comment
         #   POST/PATCH/PUT (other writes) → gh.write_branch
         method: str = validated.get("method", "GET")
         # Classify, scope and gate on the CANONICAL (once-decoded) path — the path

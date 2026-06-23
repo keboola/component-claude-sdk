@@ -771,6 +771,103 @@ class TestGithubCapabilityMapping:
 
         assert _github_capability("POST", "/repos/org/repo/issues") == "gh.write_branch"
 
+    def test_post_to_pulls_maps_to_gh_open_pr(self) -> None:
+        from advocate.server import _github_capability
+
+        assert _github_capability("POST", "/repos/org/repo/pulls") == "gh.open_pr"
+
+    def test_get_to_pulls_is_still_read(self) -> None:
+        """Listing PRs (GET …/pulls) is a read, not open_pr — GET precedence holds."""
+        from advocate.server import _github_capability
+
+        assert _github_capability("GET", "/repos/org/repo/pulls") == "gh.read"
+
+    def test_post_to_issue_comments_maps_to_gh_comment(self) -> None:
+        from advocate.server import _github_capability
+
+        assert _github_capability("POST", "/repos/org/repo/issues/1/comments") == "gh.comment"
+
+    def test_post_to_pr_review_comments_maps_to_gh_comment(self) -> None:
+        from advocate.server import _github_capability
+
+        assert _github_capability("POST", "/repos/org/repo/pulls/1/comments") == "gh.comment"
+
+    def test_open_pr_allowed_by_default_contract(self) -> None:
+        """The default derived contract grants gh.open_pr → a PR-open passes the gate."""
+        from advocate import idempotency
+        from advocate.brokers import github_broker
+        from advocate.server import AdvocateServer
+
+        idempotency.clear()
+        cfg = _make_cfg(github_enabled=True)
+        c = derive_contract(cfg, operates_on="org/repo-X")
+        secret = new_invocation_secret()
+        envelope = sign_contract(c, secret)
+
+        server = AdvocateServer(
+            anthropic_key="dummy",
+            github_token="dummy",
+            contract_envelope=envelope,
+            contract_signing_secret=secret,
+        )
+        server.start()
+        mock_result = (201, {"number": 1, "html_url": "https://github.com/org/repo-X/pull/1"})
+        try:
+            with patch.object(github_broker, "_call_github", return_value=mock_result):
+                payload = {
+                    "action_id": "open-pr-1",
+                    "method": "POST",
+                    "path": "/repos/org/repo-X/pulls",
+                    "body": {"title": "x", "head": "agent/fix", "base": "main"},
+                }
+                with _tcp_client(server.port) as client:
+                    resp = client.post("/v1/github", json=payload, headers={"content-type": "application/json"})
+            assert resp.status_code == 201
+        finally:
+            server.stop()
+
+    def test_open_pr_denied_when_capability_withheld(self) -> None:
+        """Granularity is now REAL: a contract granting gh.write_branch but NOT
+        gh.open_pr must block PR creation (the reviewer's #4 point — removing
+        gh.open_pr actually blocks the op now)."""
+        from advocate import idempotency
+        from advocate.brokers import github_broker
+        from advocate.server import AdvocateServer
+
+        idempotency.clear()
+        # Hand-built contract: read + write_branch, but explicitly WITHOUT open_pr.
+        contract = {
+            "scope": {"repos": ["org/repo-X"], "writable_branches": ["agent/*"]},
+            "capabilities": [CAP_GH_READ, CAP_GH_WRITE_BRANCH],
+            "destinations": [f"{GITHUB_API_HOST}/repos/org/repo-X"],
+            "irreversible_gate": ["gh.merge", "gh.delete"],
+            "expiry": "this_invocation",
+        }
+        secret = new_invocation_secret()
+        envelope = sign_contract(contract, secret)
+
+        server = AdvocateServer(
+            anthropic_key="dummy",
+            github_token="dummy",
+            contract_envelope=envelope,
+            contract_signing_secret=secret,
+        )
+        server.start()
+        try:
+            with patch.object(github_broker, "_call_github", return_value=(201, {"number": 1})) as called:
+                payload = {
+                    "action_id": "open-pr-deny-1",
+                    "method": "POST",
+                    "path": "/repos/org/repo-X/pulls",
+                    "body": {"title": "x", "head": "agent/fix", "base": "main"},
+                }
+                with _tcp_client(server.port) as client:
+                    resp = client.post("/v1/github", json=payload, headers={"content-type": "application/json"})
+            assert resp.status_code == 403
+            assert called.call_count == 0, "a capability-denied PR-open must never reach upstream"
+        finally:
+            server.stop()
+
     def test_patch_maps_to_gh_write_branch(self) -> None:
         from advocate.server import _github_capability
 
