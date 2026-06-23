@@ -585,11 +585,25 @@ class Component(ComponentBase):
         env: dict[str, str],
         transcript: TranscriptWriter,
     ) -> ClaudeRunResult:
-        """Run one task inside its own event loop, teeing messages to the transcript."""
+        """Run one task inside its own event loop, teeing messages to the transcript.
+
+        A per-task failure is captured as a failed ``ClaudeRunResult`` rather than
+        propagated. ``run_task`` deliberately maps caps/auth/process errors to a
+        ``UserException``; if that escaped the batch loop it would abort before
+        ``promote()`` and discard output tables already written by earlier
+        successful tasks. Returning a failed result instead keeps the batch loop's
+        behaviour identical whether a cap arrives as a ResultMessage (soft) or a
+        raise (hard): the run continues, promote() runs, and ``_report_outcome``
+        still exits 1 because a failed result is present.
+        """
         log.info("Running task '%s'.", task.task_id)
         options = self._runner.build_options(task, config, plugin_paths, env)
         transcript.begin_task(task.task_id)
-        result = asyncio.run(self._runner.run_task(task, options, on_message=transcript.on_message))
+        try:
+            result = asyncio.run(self._runner.run_task(task, options, on_message=transcript.on_message))
+        except UserException as exc:
+            log.warning("Task '%s' failed: %s", task.task_id, exc)
+            result = ClaudeRunResult(task_id=task.task_id, success=False, error_message=str(exc))
         result.extra_args["model"] = task.model or config.model.value
         transcript.end_task(result)
         return result

@@ -314,6 +314,78 @@ def test_build_cleared_env_sets_loopback_routing_and_writable_caches():
     assert "REAL_KEY_NEVER_IN_AGENT_ENV" not in env.values()
 
 
+def test_earlier_task_outputs_promoted_when_a_later_task_hard_fails(tmp_path, monkeypatch):
+    """In tasks-table mode, a hard per-task failure (a raise from run_task, e.g. a
+    budget cap re-raised by the SDK) must NOT discard output tables already written
+    by earlier successful tasks. The failure is recorded as a failed result so the
+    batch loop completes, promote() runs, and the run still exits 1."""
+    import pytest
+    from claude_agent_sdk import ProcessError
+    from keboola.component.exceptions import UserException
+
+    import component as component_module
+    from tasks import Task
+
+    data_dir = _make_datadir(
+        tmp_path,
+        {"#anthropic_key": "KEY_NAME_ONLY", "task": {"prompt": "ignored"}},
+    )
+    monkeypatch.setenv("KBC_DATADIR", data_dir)
+    comp = Component()
+
+    # Two tasks: the first succeeds and writes an output CSV, the second raises.
+    monkeypatch.setattr(
+        component_module.TaskSource,
+        "load",
+        lambda self, tables: [Task(task_id="first", prompt="first"), Task(task_id="second", prompt="second")],
+    )
+
+    def stream(prompt, options):
+        async def gen():
+            if prompt == "first":
+                yield SystemMessage(subtype="init", data={"session_id": "s1"})
+                out_dir = comp._output_writer.agent_output_dir
+                os.makedirs(out_dir, exist_ok=True)
+                with open(os.path.join(out_dir, "result.csv"), "w", encoding="utf-8", newline="") as fh:
+                    w = csv.writer(fh)
+                    w.writerow(["id", "label"])
+                    w.writerow(["1", "x"])
+                yield ResultMessage(
+                    subtype="success",
+                    duration_ms=10,
+                    duration_api_ms=5,
+                    is_error=False,
+                    num_turns=1,
+                    session_id="s1",
+                    total_cost_usd=0.0,
+                    result="ok",
+                )
+            else:
+                yield SystemMessage(subtype="init", data={"session_id": "s2"})
+                raise ProcessError("CLI exited: hit turn/budget cap and stopped", exit_code=1)
+
+        return gen()
+
+    monkeypatch.setattr(comp._runner, "_query", stream)
+
+    with pytest.raises(UserException) as exc:
+        comp.run()
+    # the run completed both tasks before failing (aggregate, not an abort on task 2)
+    assert "1 of 2 task(s) failed" in str(exc.value)
+
+    # core regression: the first task's output survived the second task's hard fail
+    promoted = os.path.join(data_dir, "out", "tables", "result.csv")
+    assert os.path.isfile(promoted)
+    assert list(csv.DictReader(open(promoted, encoding="utf-8"))) == [{"id": "1", "label": "x"}]
+
+    # both tasks recorded in the durable runs table, with their outcomes
+    runs = {
+        r["task_id"]: r["success"]
+        for r in csv.DictReader(open(os.path.join(data_dir, "out", "tables", "claude_runs.csv"), encoding="utf-8"))
+    }
+    assert runs == {"first": "true", "second": "false"}
+
+
 def test_run_task_launch_failure_is_user_exception(tmp_path, monkeypatch):
     """A CLI-not-found / connection failure surfaces as a clear exit-1 message."""
     import pytest
