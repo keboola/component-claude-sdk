@@ -96,7 +96,8 @@ def test_jsonl_file_written_with_one_line_per_message(tmp_path, monkeypatch):
     _run_writer(comp, files_path, _messages(), _result())
     jsonl = os.path.join(files_path, "claude_session_t1.jsonl")
     assert os.path.isfile(jsonl)
-    lines = [json.loads(line) for line in open(jsonl, encoding="utf-8") if line.strip()]
+    with open(jsonl, encoding="utf-8") as fh:
+        lines = [json.loads(line) for line in fh if line.strip()]
     assert len(lines) == 3
 
 

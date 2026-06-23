@@ -36,6 +36,7 @@ import re
 import select
 import subprocess
 import threading
+import time
 from typing import TYPE_CHECKING
 
 import httpx
@@ -272,22 +273,42 @@ def _call_stdio(
             _evict_proc(cfg.name)
             return 502, {"error": "MCP request failed"}
 
-        # Bound the read with select so a hung server does not block the lock
-        # indefinitely and wedge every subsequent request for this server.
-        ready, _, _ = select.select([proc.stdout], [], [], _STDIO_READ_TIMEOUT_S)
-        if not ready:
+        # Deadline-aware read loop: select guarantees *some* bytes are ready but
+        # readline() still blocks waiting for a newline.  Accumulate chunks until
+        # a full line arrives or the deadline elapses, then evict on timeout.
+        deadline = time.monotonic() + _STDIO_READ_TIMEOUT_S
+        buf = b""
+        response_line = b""
+        timed_out = False
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                ready, _, _ = select.select([proc.stdout], [], [], remaining)
+                if not ready:
+                    timed_out = True
+                    break
+                chunk = os.read(proc.stdout.fileno(), 4096)
+                if not chunk:
+                    break
+                buf += chunk
+                if b"\n" in buf:
+                    idx = buf.index(b"\n")
+                    response_line = buf[: idx + 1]
+                    break
+        except OSError:
+            log.warning("stdio MCP server %s read error", cfg.name, exc_info=True)
+            _evict_proc(cfg.name)
+            return 502, {"error": "MCP request failed"}
+
+        if timed_out:
             log.warning(
                 "stdio MCP server %s timed out after %.1fs — evicting",
                 cfg.name,
                 _STDIO_READ_TIMEOUT_S,
             )
-            _evict_proc(cfg.name)
-            return 502, {"error": "MCP request failed"}
-
-        try:
-            response_line = proc.stdout.readline()
-        except OSError:
-            log.warning("stdio MCP server %s read error", cfg.name, exc_info=True)
             _evict_proc(cfg.name)
             return 502, {"error": "MCP request failed"}
 
