@@ -339,6 +339,49 @@ def test_sse_setup_error_returns_502() -> None:
         server.stop()
 
 
+def test_sse_setup_error_on_first_iteration_returns_502() -> None:
+    """A *generator* whose body fails before the first yield (the real shape —
+    ``raise_for_status()`` on a 401 fires lazily on the first iteration, NOT at
+    call) must still return a clean 502, not "200 + sanitized SSE error".
+
+    Regression for the dead setup ``try``: the server now pulls the first chunk
+    inside the setup try (before headers), so a connect/auth failure surfaces as
+    a 502 rather than implying the stream had started successfully.
+    """
+    from advocate import anthropic_proxy
+
+    def _raises_on_first_iter(payload: dict, anthropic_key: str, **_kwargs: object) -> Iterator[bytes]:  # noqa: ARG001
+        # Real generator: nothing runs until iterated, then the connect/auth
+        # failure raises before any byte is yielded.
+        raise httpx.ConnectError(f"could not connect to {_BAIT_URL} with key={_BAIT_SECRET}")
+        yield b""  # pragma: no cover — unreachable, makes this a generator
+
+    server = _make_server()
+    try:
+        with patch.object(anthropic_proxy, "_stream_upstream", side_effect=_raises_on_first_iter):
+            payload = {
+                "action_id": "sse-003c",
+                "model": "claude-haiku-4-5",
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": True,
+            }
+            with _tcp_client(server.port) as client:
+                resp = client.post(
+                    "/v1/messages",
+                    json=payload,
+                    headers={"content-type": "application/json"},
+                )
+
+        assert resp.status_code == 502, "a generator failing before first yield must be a clean 502, not 200+SSE"
+        body = resp.content
+        assert resp.json()["error"] == "upstream request failed"
+        assert _BAIT_SECRET.encode() not in body, "secret key leaked in 502 response"
+        assert _BAIT_URL.encode() not in body, "upstream URL leaked in 502 response"
+    finally:
+        server.stop()
+
+
 # ---------------------------------------------------------------------------
 # Test 14: Non-streaming path still works and uses idempotency cache
 # ---------------------------------------------------------------------------

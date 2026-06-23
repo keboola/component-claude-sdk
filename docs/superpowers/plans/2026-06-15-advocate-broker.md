@@ -112,7 +112,7 @@ remains.
 ## Phase 3 findings — CLI wiring (Phase 5 input)
 
 > Investigated by the Phase 3 implementer.  These findings inform Phase 5's wiring work.
-> Verified by grepping the bundled claude CLI binary at `/Users/matyasjirat/.local/bin/claude`
+> Verified by grepping the bundled claude CLI binary at `~/.local/bin/claude`
 > (Mach-O arm64, strings-extracted).
 
 ### Anthropic proxy (confirmed, Phase 2)

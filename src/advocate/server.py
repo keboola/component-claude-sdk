@@ -354,10 +354,17 @@ class _Handler(BaseHTTPRequestHandler):
         broker requests for its duration.  Acceptable for the single-job/single-agent
         POC; revisit if future work adds concurrent agent calls.
         """
+        # ``_stream_upstream`` is a generator, so calling it does NOT execute its
+        # body — the real connect/auth failure (``raise_for_status`` on a 401,
+        # a connect error) only surfaces on the FIRST iteration.  Pull that first
+        # chunk INSIDE the setup try, before any response headers go on the wire,
+        # so a setup failure becomes a clean 502 instead of "200 + sanitized SSE
+        # error event" (which would imply the request had succeeded).
         try:
             chunk_iter = anthropic_proxy._stream_upstream(
                 validated, self.server.anthropic_key, query_string=query_string
             )
+            first_chunk = next(chunk_iter, None)
         except Exception:  # noqa: BLE001
             log.warning("_stream_upstream setup error", exc_info=True)
             self._respond(502, {"error": "upstream request failed"})
@@ -381,6 +388,11 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
         try:
+            # The first chunk was already pulled during setup (above); write it,
+            # then drain the rest.  ``first_chunk is None`` means an empty upstream
+            # stream — we still send a clean, terminated 200.
+            if first_chunk:
+                _write_chunk(first_chunk)
             for chunk in chunk_iter:
                 if chunk:
                     _write_chunk(chunk)
