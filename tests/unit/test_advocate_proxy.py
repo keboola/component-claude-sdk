@@ -349,3 +349,40 @@ def test_malformed_content_length_returns_400() -> None:
         assert b"400" in response, f"expected 400 in response, got: {response[:200]}"
     finally:
         server.stop()
+
+
+# ---------------------------------------------------------------------------
+# Test 11 (new): negative Content-Length → 400 (Finding 10)
+# ---------------------------------------------------------------------------
+
+
+def test_negative_content_length_returns_400() -> None:
+    """Content-Length: -1 passes a naive int()/max-size check and would make
+    rfile.read(-1) block until EOF. It must be rejected with a clean 400
+    instead of hanging the handler thread."""
+    server = _make_server()
+    try:
+        raw = (
+            b"POST /v1/messages HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: -1\r\n"
+            b"\r\n"
+        )
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(5)
+            sock.connect(("127.0.0.1", server.port))
+            sock.sendall(raw)
+            response = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+                if b"\r\n\r\n" in response:
+                    break
+
+        assert b"400" in response, f"expected 400 in response, got: {response[:200]}"
+    finally:
+        server.stop()

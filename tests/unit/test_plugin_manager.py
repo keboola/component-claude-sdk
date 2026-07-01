@@ -17,7 +17,7 @@ class FakeRunner:
         self.calls: list[list[str]] = []
         self._list_json = list_json
 
-    def __call__(self, cmd, capture_output, text, env):
+    def __call__(self, cmd, capture_output, text, env, timeout=None):
         # cmd is ["claude", ...args]
         args = cmd[1:]
         self.calls.append(args)
@@ -200,7 +200,7 @@ def test_unknown_shorthand_raises(monkeypatch):
 
 
 def test_failed_command_raises_with_source(monkeypatch):
-    def fail_run(cmd, capture_output, text, env):
+    def fail_run(cmd, capture_output, text, env, timeout=None):
         return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="boom")
 
     monkeypatch.setattr(subprocess, "run", fail_run)
@@ -227,7 +227,7 @@ def test_cache_path_falls_back_to_convention_when_no_install_location(monkeypatc
 
 
 def test_token_scrubbed_from_logs(monkeypatch, caplog):
-    def run_with_token_in_err(cmd, capture_output, text, env):
+    def run_with_token_in_err(cmd, capture_output, text, env, timeout=None):
         return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="auth failed for GH_SECRET_VALUE")
 
     monkeypatch.setattr(subprocess, "run", run_with_token_in_err)
@@ -263,7 +263,7 @@ def test_run_invokes_resolved_cli_not_bare_claude(monkeypatch):
     # Re-run a single command to capture cmd[0] directly.
     captured = {}
 
-    def capture(cmd, capture_output, text, env):
+    def capture(cmd, capture_output, text, env, timeout=None):
         captured["argv0"] = cmd[0]
         return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
 
@@ -280,7 +280,7 @@ def test_cli_launch_failure_raises_user_exception(monkeypatch):
     monkeypatch.setattr(plugin_manager, "_resolve_claude_cli", lambda: "/nonexistent/claude")
     monkeypatch.setattr("os.makedirs", lambda *a, **k: None)
 
-    def raise_fnf(cmd, capture_output, text, env):
+    def raise_fnf(cmd, capture_output, text, env, timeout=None):
         raise FileNotFoundError(2, "No such file or directory", cmd[0])
 
     monkeypatch.setattr(subprocess, "run", raise_fnf)
@@ -295,7 +295,7 @@ def test_full_secret_set_scrubbed_not_just_github_token(monkeypatch):
     """The CLI env also carries ANTHROPIC_API_KEY / MCP secrets; the scrub must
     redact the FULL secret set, not only the github_token."""
 
-    def run_leaking_anthropic_key(cmd, capture_output, text, env):
+    def run_leaking_anthropic_key(cmd, capture_output, text, env, timeout=None):
         return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="boom leaked ANTHROPIC_VALUE and MCP_VALUE")
 
     monkeypatch.setattr(subprocess, "run", run_leaking_anthropic_key)
@@ -309,3 +309,37 @@ def test_full_secret_set_scrubbed_not_just_github_token(monkeypatch):
     assert "ANTHROPIC_VALUE" not in msg
     assert "MCP_VALUE" not in msg
     assert "***" in msg
+
+
+def test_run_passes_bounded_timeout(monkeypatch):
+    """subprocess.run must be called with a bounded timeout= so a stalled
+    ``claude`` CLI (e.g. a hung git clone) cannot hang the job forever."""
+    captured = {}
+
+    def capture(cmd, capture_output, text, env, timeout=None):
+        captured["timeout"] = timeout
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", capture)
+    monkeypatch.setattr("os.makedirs", lambda *a, **k: None)
+    entry = PluginEntry(source="superpowers", plugins=["sp"], version="latest")
+    PluginManager().prepare([entry], {})
+
+    assert captured["timeout"] is not None
+    assert 0 < captured["timeout"] <= 600
+
+
+def test_timeout_expired_raises_user_exception(monkeypatch):
+    """A stalled plugin-install subprocess must raise a clean UserException
+    (naming the source), not an unhandled TimeoutExpired."""
+
+    def raise_timeout(cmd, capture_output, text, env, timeout=None):
+        raise subprocess.TimeoutExpired(cmd, timeout)
+
+    monkeypatch.setattr(subprocess, "run", raise_timeout)
+    monkeypatch.setattr("os.makedirs", lambda *a, **k: None)
+    entry = PluginEntry(source="acme/repo", plugins=["x"], version="latest")
+    with pytest.raises(UserException) as exc:
+        PluginManager().prepare([entry], {})
+    assert "acme/repo" in str(exc.value)
+    assert "timed out" in str(exc.value).lower()

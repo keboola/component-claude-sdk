@@ -209,6 +209,28 @@ def test_secret_values_scrubbed_from_output(tmp_path, monkeypatch):
     assert "***" in jsonl
 
 
+def test_session_less_first_row_backfilled_once_session_id_known(tmp_path, monkeypatch):
+    """A session-less first message buffers with session_id="" (Finding 6). Once
+    a later message reveals the session_id, the earlier buffered row(s) must be
+    back-filled — otherwise repeated task_id runs (session_id="" in the PK) can
+    overwrite each other's earlier rows instead of each getting a distinct key."""
+    comp, data_dir = _component(tmp_path, monkeypatch)
+    files_path = os.path.join(data_dir, "out", "files")
+    tables_path = os.path.join(data_dir, "out", "tables")
+    msgs = [
+        # No session_id attribute exposed / defaults to None -> row buffers with "".
+        AssistantMessage(content=[TextBlock(text="thinking before session is known")], model="m"),
+        SystemMessage(subtype="init", data={"session_id": "sess-late"}),
+    ]
+    result = ClaudeRunResult(task_id="t1", success=True, session_id="sess-late")
+    _run_writer(comp, files_path, msgs, result)
+
+    path = os.path.join(tables_path, f"{SESSIONS_TABLE}.csv")
+    rows = list(csv.DictReader(open(path, encoding="utf-8")))
+    assert len(rows) == 2
+    assert all(r["session_id"] == "sess-late" for r in rows), rows
+
+
 def test_failure_still_writes_transcript_table(tmp_path, monkeypatch):
     """On failure the TABLE sink (write_always) is the durability guarantee."""
     comp, data_dir = _component(tmp_path, monkeypatch)

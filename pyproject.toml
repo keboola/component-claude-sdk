@@ -4,6 +4,11 @@ dynamic = ["version"]
 readme = "README.md"
 requires-python = "~=3.14.0"
 dependencies = [
+    # Exact-pinned: the runtime SDK overlay (src/sdk_version_manager.py), the
+    # bundled `claude` CLI resolution (src/plugin_manager.py), and the "pinned"
+    # baked-version default in configSchema.json are all built and tested
+    # against this specific SDK/CLI release. Bump deliberately, in lockstep
+    # with those call sites, not via a routine dependency update.
     "claude-agent-sdk==0.2.101",
     "keboola-component>=1.10.0",
     "keboola-http-client>=1.0.1",
@@ -14,7 +19,6 @@ dependencies = [
 dev = [
     "freezegun>=1.5.1",
     "keboola.datadirtest>=2.2.0",
-    "mock>=5.2.0",
     "pre-commit>=4.5.0",
     "pytest>=9.0.2",
     "ruff>=0.15.2",

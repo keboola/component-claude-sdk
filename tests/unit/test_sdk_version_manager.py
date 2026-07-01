@@ -81,3 +81,44 @@ def test_install_failure_fallback_pinned_returns_baked(monkeypatch, tmp_path):
     mgr = SdkVersionManager(overlay_dir=str(tmp_path / "o"))
     resolved = mgr.ensure("9.9.9", "fallback_pinned")
     assert resolved  # baked version returned, no raise
+
+
+def test_pip_install_passes_bounded_timeout(monkeypatch, tmp_path):
+    """pip install must run with a bounded timeout= so a stalled install
+    (e.g. no egress) cannot hang the job forever."""
+    captured = {}
+
+    def fake_run(cmd, **k):
+        captured["timeout"] = k.get("timeout")
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    mgr = SdkVersionManager(overlay_dir=str(tmp_path / "overlay"))
+    monkeypatch.setattr(mgr, "_overlay_version", lambda: "0.2.105")
+
+    mgr.ensure("0.2.105", "fail")
+    assert captured["timeout"] is not None
+    assert 0 < captured["timeout"] <= 600
+    sys.path.remove(str(tmp_path / "overlay"))
+
+
+def test_install_timeout_expired_fail_mode_raises(monkeypatch, tmp_path):
+    def fake_run(cmd, **k):
+        raise subprocess.TimeoutExpired(cmd, k.get("timeout"))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    mgr = SdkVersionManager(overlay_dir=str(tmp_path / "o"))
+    with pytest.raises(UserException) as exc:
+        mgr.ensure("9.9.9", "fail")
+    assert "9.9.9" in str(exc.value)
+    assert "timed out" in str(exc.value).lower()
+
+
+def test_install_timeout_expired_fallback_pinned_returns_baked(monkeypatch, tmp_path):
+    def fake_run(cmd, **k):
+        raise subprocess.TimeoutExpired(cmd, k.get("timeout"))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    mgr = SdkVersionManager(overlay_dir=str(tmp_path / "o"))
+    resolved = mgr.ensure("9.9.9", "fallback_pinned")
+    assert resolved  # baked version returned, no raise

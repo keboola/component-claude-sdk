@@ -29,6 +29,11 @@ from keboola.component.exceptions import UserException
 
 from configuration import PUBLIC_MARKETPLACE_REGISTRY, PluginEntry
 
+# Bound every ``claude`` CLI subprocess call (plugin add/install/marketplace list)
+# so a stalled git clone or registry fetch cannot hang the job indefinitely — the
+# platform would otherwise kill it with no useful error (Finding 4).
+_CLI_TIMEOUT_SECONDS = 300
+
 
 @cache
 def _resolve_claude_cli() -> str:
@@ -300,11 +305,18 @@ class PluginManager:
             install_env["GITHUB_TOKEN"] = self._github_token
             install_env["GH_TOKEN"] = self._github_token
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, env=install_env)
+            proc = subprocess.run(cmd, capture_output=True, text=True, env=install_env, timeout=_CLI_TIMEOUT_SECONDS)
         except OSError as exc:
             # FileNotFoundError / PermissionError on launch — surface as a clean
             # UserException (exit 1) instead of an unhandled crash (exit 2).
             raise UserException(f"Claude CLI failed to launch for plugin install (source '{source}'): {exc}") from exc
+        except subprocess.TimeoutExpired as exc:
+            # A stalled git clone / registry fetch would otherwise hang the job
+            # until the platform kills it with no useful error (Finding 4).
+            raise UserException(
+                f"Claude CLI command 'claude {' '.join(args)}' for source '{source}' "
+                f"timed out after {_CLI_TIMEOUT_SECONDS}s"
+            ) from exc
         logging.info("claude %s -> exit %s", " ".join(args), proc.returncode)
         scrubbed_out = self._scrub(proc.stdout)
         if scrubbed_out.strip():

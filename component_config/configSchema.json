@@ -35,11 +35,7 @@
           "type": "button",
           "format": "test-connection",
           "options": {
-            "grid_columns": 12,
-            "async": {
-              "label": "Test Connection",
-              "action": "testConnection"
-            }
+            "grid_columns": 12
           },
           "propertyOrder": 2
         }
@@ -629,6 +625,7 @@
           },
           "uniqueItems": true,
           "options": {
+            "enum_titles": ["User", "Project", "Local"],
             "tooltip": "Maps to ClaudeAgentOptions.setting_sources. The container is ephemeral, so 'user' and 'local' normally find nothing. The one useful case is 'project': when the agent clones a Git repo (GitHub mode) that ships its own .claude/settings.json, add 'project' to let the agent pick up that repo's settings. Leave empty otherwise — adding sources makes runs less reproducible."
           },
           "propertyOrder": 3

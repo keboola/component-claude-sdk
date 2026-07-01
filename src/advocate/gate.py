@@ -180,6 +180,16 @@ def check_action(
     allowed_repos: list[str] = scope.get("repos", [])
     allowed_branches: list[str] = scope.get("writable_branches", [])
 
+    # NOT WIRED: is_irreversible()/contract["irreversible_gate"] are intentionally
+    # not consulted here. No capability that Configuration/derive_contract can
+    # currently grant (gh.read, gh.write, mcp.*, anthropic) is ever a member of
+    # irreversible_gate (gh.merge, deploy, delete) — those capabilities are not
+    # yet issuable, so an irreversible-gate check here would be dead weight with
+    # no observable effect. Wire an is_irreversible() call + an out-of-band
+    # approval step into this function once gh.merge / gh.delete (or another
+    # irreversible capability) become grantable (Phase 5+, per is_irreversible's
+    # own docstring) — do not silently allow them through capability-check alone.
+
     # 1. Capability check
     if capability not in allowed_caps:
         log.warning(

@@ -10,27 +10,42 @@
     }
   },
   "parameters": {
-    "#anthropic_key": "",
-    "#github_token": "",
-    "model": "claude-haiku-4-5",
-    "max_turns": 10,
-    "max_budget_usd": 2.0,
-    "permission_mode": "dontAsk",
-    "allowed_tools": ["Read", "Write", "Bash(git *)"],
-    "disallowed_tools": [],
-    "system_prompt": "You are a data analyst. Analyse the data provided and produce a concise summary table.",
-    "github_enabled": false,
-    "workspace_input_files": false,
-    "task": {
-      "prompt": "Read the input table and produce a summary with row count, column names, and basic statistics. Write the result as a CSV table named output_summary.",
-      "system_prompt": ""
+    "connection": {
+      "#anthropic_key": "..."
     },
-    "output": {
-      "default_incremental": false
+    "model_budget": {
+      "model": "claude-haiku-4-5",
+      "max_turns": 10,
+      "max_budget_usd": 2.0
     },
-    "mcp_servers": [],
-    "plugins": [],
-    "sdk_version": "pinned",
-    "sdk_version_on_failure": "fail"
+    "permissions": {
+      "permission_mode": "dontAsk",
+      "allowed_tools": ["Read", "Write", "Bash(git *)"],
+      "disallowed_tools": []
+    },
+    "github": {
+      "github_enabled": false
+    },
+    "task_output": {
+      "system_prompt": "You are a data analyst. Analyse the data provided and produce a concise summary table.",
+      "task": {
+        "prompt": "Read the input table and produce a summary with row count, column names, and basic statistics. Write the result as a CSV table named output_summary.",
+        "system_prompt": ""
+      },
+      "output": {
+        "default_incremental": false
+      }
+    },
+    "mcp_section": {
+      "mcp_servers": []
+    },
+    "plugins_section": {
+      "plugins": []
+    },
+    "advanced": {
+      "workspace_input_files": false,
+      "sdk_version": "pinned",
+      "sdk_version_on_failure": "fail"
+    }
   }
 }

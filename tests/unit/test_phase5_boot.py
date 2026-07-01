@@ -321,6 +321,50 @@ class TestPluginInstallEnv:
 
 
 # ---------------------------------------------------------------------------
+# 4b. KBC_TOKEN pipe reader: must not truncate a token over one read() chunk
+# ---------------------------------------------------------------------------
+
+
+class TestReadKbcTokenFromPipe:
+    """`_read_kbc_token_from_pipe` must read to EOF, not a single os.read() call."""
+
+    def test_token_over_4096_bytes_is_not_truncated(self):
+        """A token longer than one os.read() chunk (4096 bytes) must not be
+        silently truncated (Finding 7) — the reader must loop to EOF."""
+        from component import _KBC_TOKEN_PIPE_FD, _read_kbc_token_from_pipe
+
+        long_token = "a" * 10_000
+        r, w = os.pipe()
+        saved_fd = None
+        try:
+            os.write(w, long_token.encode("utf-8"))
+            os.close(w)
+            w = -1
+            # _read_kbc_token_from_pipe always reads from the fixed fd number.
+            try:
+                saved_fd = os.dup(_KBC_TOKEN_PIPE_FD)
+            except OSError:
+                saved_fd = None
+            os.dup2(r, _KBC_TOKEN_PIPE_FD)
+            os.close(r)
+            r = -1
+            try:
+                result = _read_kbc_token_from_pipe()
+            finally:
+                if saved_fd is not None:
+                    os.dup2(saved_fd, _KBC_TOKEN_PIPE_FD)
+                    os.close(saved_fd)
+        finally:
+            if w != -1:
+                os.close(w)
+            if r != -1:
+                os.close(r)
+
+        assert result == long_token
+        assert len(result) == 10_000
+
+
+# ---------------------------------------------------------------------------
 # 5. Env-scrub: KBC_TOKEN removed from exec-time environ (Linux only)
 # ---------------------------------------------------------------------------
 
@@ -526,6 +570,35 @@ class TestOutputPromotionAndTranscript:
         assert params.get("#anthropic_key") == "", (
             f"#anthropic_key should be scrubbed to '' before agent runs, got: {params.get('#anthropic_key')!r}"
         )
+
+    def test_server_stopped_when_post_start_setup_raises(self, tmp_path, monkeypatch):
+        """If setup after server.start() (SDK/plugin/transcript build) raises,
+        the AdvocateServer must still be stopped — start() must live inside the
+        try/finally that owns stop() (Finding 5)."""
+        from advocate.server import AdvocateServer
+
+        data_dir = _make_config(tmp_path, {"task": {"prompt": "hi"}})
+        monkeypatch.setenv("KBC_DATADIR", data_dir)
+
+        stop_calls = []
+        original_stop = AdvocateServer.stop
+
+        def tracking_stop(self):
+            stop_calls.append(True)
+            return original_stop(self)
+
+        monkeypatch.setattr(AdvocateServer, "stop", tracking_stop)
+
+        def boom(self, *a, **k):
+            raise RuntimeError("boom in post-start setup")
+
+        monkeypatch.setattr(Component, "_ensure_sdk_and_env", boom)
+
+        comp = Component()
+        with pytest.raises(RuntimeError, match="boom in post-start setup"):
+            comp.run()
+
+        assert stop_calls, "server.stop() must run even when post-start setup raises"
 
     def test_agent_env_has_no_real_secrets_in_options(self, tmp_path, monkeypatch):
         """The env dict passed to ClaudeAgentOptions must contain no real secrets."""

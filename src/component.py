@@ -120,7 +120,11 @@ def _read_ptrace_scope() -> int | None:
     try:
         with open(_PTRACE_SCOPE_PATH, encoding="utf-8") as fh:
             return int(fh.read().strip())
-    except OSError, ValueError:
+    # fmt: skip — ruff format (requires-python="~=3.14.0") has a known bug that
+    # rewrites this into the bare-comma PEP 758 form (`except OSError, ValueError:`),
+    # which is a SyntaxError on <3.14 and reads like the old Python 2 multi-except
+    # syntax (astral-sh/ruff#23090). See advocate/contract.py for the same pattern.
+    except (OSError, ValueError):  # fmt: skip
         return None
 
 
@@ -295,15 +299,22 @@ def _read_kbc_token_from_pipe() -> str:
     """After a successful env-scrub re-exec, read KBC_TOKEN back from the inherited pipe.
 
     The re-exec'ing process wrote the token to the write end of the pipe and then
-    closed it; after exec the write end is gone (was closed before exec) so a single
-    os.read returns the full token (EOF follows immediately).
+    closed it; after exec the write end is gone (was closed before exec), so
+    reading until EOF returns the full token. A single ``os.read(fd, 4096)`` call
+    is NOT sufficient — a token longer than 4096 bytes would be silently
+    truncated (Finding 7), so we loop until an empty read signals EOF.
 
     Returns the token string, or "" if the fd is not open / empty.
     """
     try:
-        data = os.read(_KBC_TOKEN_PIPE_FD, 4096)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(_KBC_TOKEN_PIPE_FD, 4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
         os.close(_KBC_TOKEN_PIPE_FD)
-        return data.decode("utf-8")
+        return b"".join(chunks).decode("utf-8")
     except OSError:
         # fd not open — either env-scrub was skipped or this is not the re-exec'd
         # process; fall back gracefully.
@@ -389,7 +400,10 @@ class Component(ComponentBase):
         else:
             github_allowed_destinations = []
 
-        # Start the loopback-TCP AdvocateServer.
+        # Start the loopback-TCP AdvocateServer. ``start()`` lives inside the same
+        # try/finally that owns ``stop()`` (Finding 5) — if any setup below
+        # (SDK overlay, plugin install, transcript build) raises, the server (and
+        # its MCP subprocesses) must still be torn down rather than leaked.
         server = AdvocateServer(
             config.anthropic_key,
             mcp_configs=mcp_configs,
@@ -398,21 +412,23 @@ class Component(ComponentBase):
             contract_envelope=envelope,
             contract_signing_secret=secret,
         )
-        server.start()
-        port = server.port
-        log.info("AdvocateServer running on 127.0.0.1:%d", port)
-
-        sdk_version, plugin_result, cleared_env = self._ensure_sdk_and_env(config, port)
-        transcript = self._build_transcript(config, sdk_version, plugin_result.resolved)
-        tasks = TaskSource(config).load(self.get_input_tables_definitions())
-
+        transcript = None
         results: list[ClaudeRunResult] = []
         try:
+            server.start()
+            port = server.port
+            log.info("AdvocateServer running on 127.0.0.1:%d", port)
+
+            sdk_version, plugin_result, cleared_env = self._ensure_sdk_and_env(config, port)
+            transcript = self._build_transcript(config, sdk_version, plugin_result.resolved)
+            tasks = TaskSource(config).load(self.get_input_tables_definitions())
+
             for task in tasks:
                 results.append(self._run_one_task(task, config, plugin_result.sdk_plugins, cleared_env, transcript))
             self._output_writer.promote(default_incremental=config.output.default_incremental)
         finally:
-            transcript.flush()
+            if transcript is not None:
+                transcript.flush()
             server.stop()
 
         self._report_outcome(results)

@@ -133,8 +133,19 @@ class TranscriptWriter:
     def on_message(self, message: Any) -> None:
         """Tee one SDK message to the JSONL file and the sessions buffer."""
         row = self._message_to_row(message)
-        if not self._session_id and row["session_id"]:
+        newly_known_session_id = not self._session_id and row["session_id"]
+        if newly_known_session_id:
             self._session_id = row["session_id"]
+            # Back-fill any earlier buffered rows for THIS task that were
+            # appended before the session_id was known (Finding 6). Without
+            # this, those rows keep session_id="" and, with the incremental
+            # PK (task_id, session_id, seq), a repeated task_id across runs
+            # could collide/overwrite the earlier run's rows instead of each
+            # row getting a distinct key.
+            for buffered in reversed(self._sessions_rows):
+                if buffered["task_id"] != self._task_id or buffered["session_id"]:
+                    break
+                buffered["session_id"] = self._session_id
         if self._file is not None:
             self._file.write(self._scrub(row["raw_json"]) + "\n")
         self._sessions_rows.append({k: self._scrub_value(v) for k, v in row.items()})

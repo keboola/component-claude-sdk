@@ -251,6 +251,12 @@ class _Handler(BaseHTTPRequestHandler):
         except ValueError:
             return None, 400, "Content-Length must be an integer"
 
+        if length < 0:
+            # A negative length passes the int()/max-size checks below and would
+            # make rfile.read(length) block until EOF (Finding 10) — reject
+            # cleanly instead of hanging the handler thread.
+            return None, 400, "Content-Length must not be negative"
+
         if length > _MAX_BODY_BYTES:
             return None, 413, "request body too large"
 
