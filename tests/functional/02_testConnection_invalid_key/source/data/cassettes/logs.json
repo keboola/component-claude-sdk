@@ -1,0 +1,5 @@
+{
+  "exit_code": 1,
+  "stderr": "Anthropic API rejected the key (authentication failed). Check #anthropic_key.",
+  "logs": []
+}

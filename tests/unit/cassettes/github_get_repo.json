@@ -1,0 +1,19 @@
+{
+  "_metadata": {"keboola_vcr_version": "0.5.0", "recorded_at": "2026-06-16T00:00:00+00:00"},
+  "interactions": [
+    {
+      "request": {
+        "body": null,
+        "headers": {"authorization": ["Bearer REDACTED"], "accept": ["application/vnd.github+json"]},
+        "method": "GET",
+        "uri": "https://api.github.com/repos/org/repo-x"
+      },
+      "response": {
+        "body": {"string": "{\"id\":123,\"name\":\"repo-x\",\"full_name\":\"org/repo-x\",\"private\":false}"},
+        "headers": {"Content-Type": ["application/json"]},
+        "status": {"code": 200, "message": "OK"}
+      }
+    }
+  ],
+  "version": 1
+}

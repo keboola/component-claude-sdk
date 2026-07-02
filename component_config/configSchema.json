@@ -1,19 +1,677 @@
 {
+  "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
-  "title": "extractor configuration",
-  "required": [
-    "print_hello"
-  ],
+  "title": "Claude Agent SDK Configuration",
+  "required": ["connection"],
   "properties": {
-    "print_hello": {
-      "type": "boolean",
-      "title": "Print Hello",
+    "_setup_modes_note": {
+      "type": "string",
+      "format": "info",
+      "description": "Two ways to drive this component.\n1. Config-prompt mode — leave the input mapping empty and write a single prompt in Task, Prompt & Output below. One agent run.\n2. Tasks-table mode — map one input table named 'tasks'; each row is one agent task, run in order. Required columns: task_id and prompt; optional per-row overrides: system_prompt, model, max_turns, max_budget_usd, output_table. Everything else on this page is the shared environment for every task.",
       "propertyOrder": 1
     },
-    "debug": {
-      "type": "boolean",
-      "title": "Debug",
-      "propertyOrder": 2
+    "connection": {
+      "type": "object",
+      "title": "Connection & Authentication",
+      "format": "grid-strict",
+      "required": ["#anthropic_key"],
+      "options": {
+        "tooltip": "Credentials the agent run needs. The Anthropic key is required for every run; the GitHub token is only needed when you turn on GitHub or use a private plugin source. Both are encrypted at rest and never logged."
+      },
+      "propertyOrder": 10,
+      "properties": {
+        "#anthropic_key": {
+          "type": "string",
+          "title": "Anthropic API Key",
+          "description": "Required. Authenticates every run against api.anthropic.com.",
+          "format": "password",
+          "options": {
+            "grid_columns": 12,
+            "tooltip": "Injected into the agent subprocess as ANTHROPIC_API_KEY — the only credential the Claude agent loop needs. Get it at console.anthropic.com under API Keys. Encrypted at rest and never logged."
+          },
+          "propertyOrder": 1
+        },
+        "test_connection": {
+          "type": "button",
+          "format": "test-connection",
+          "options": {
+            "grid_columns": 12
+          },
+          "propertyOrder": 2
+        }
+      }
+    },
+    "model_budget": {
+      "type": "object",
+      "title": "Model & Budget",
+      "format": "grid-strict",
+      "options": {
+        "tooltip": "Capability vs. cost, and the limits that hard-bound every run. There is NO wall-clock timeout, so Max Turns and Max Budget are the only stop conditions — always keep both set."
+      },
+      "propertyOrder": 20,
+      "properties": {
+        "model": {
+          "type": "string",
+          "title": "Model",
+          "description": "Claude model used for the agent's reasoning and tool calls.",
+          "enum": [
+            "claude-opus-4-8",
+            "claude-opus-4-8-20250514",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-6-20251101",
+            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001"
+          ],
+          "options": {
+            "grid_columns": 6,
+            "enum_titles": [
+              "Claude Opus 4.8 — most capable",
+              "Claude Opus 4.8 (2025-05-14) — pinned release",
+              "Claude Sonnet 4.6 — balanced",
+              "Claude Sonnet 4.6 (2025-11-01) — pinned release",
+              "Claude Haiku 4.5 — fastest / cheapest",
+              "Claude Haiku 4.5 (2025-10-01) — pinned release"
+            ],
+            "tooltip": "Drives capability vs. cost for the whole run. In tasks-table mode a per-row 'model' column overrides this for that task. Costlier models burn the budget faster, so pair the model with Max Turns and Max Budget. Use a pinned (dated) id if the bare alias is unavailable on your API key."
+          },
+          "default": "claude-opus-4-8",
+          "propertyOrder": 1
+        },
+        "fallback_model": {
+          "type": "string",
+          "title": "Fallback Model",
+          "description": "Optional. Model used if the primary is unavailable.",
+          "enum": [
+            "claude-opus-4-8",
+            "claude-opus-4-8-20250514",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-6-20251101",
+            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001"
+          ],
+          "options": {
+            "grid_columns": 6,
+            "enum_titles": [
+              "Claude Opus 4.8 — most capable",
+              "Claude Opus 4.8 (2025-05-14) — pinned release",
+              "Claude Sonnet 4.6 — balanced",
+              "Claude Sonnet 4.6 (2025-11-01) — pinned release",
+              "Claude Haiku 4.5 — fastest / cheapest",
+              "Claude Haiku 4.5 (2025-10-01) — pinned release"
+            ],
+            "tooltip": "Passed to the SDK as fallback_model. Leave empty to fail rather than silently downgrade. A cheaper fallback keeps a job running through a transient capacity issue on the primary model."
+          },
+          "propertyOrder": 2
+        },
+        "max_turns": {
+          "type": "integer",
+          "title": "Max Turns",
+          "description": "Max agent turns (model round-trips) per task.",
+          "default": 20,
+          "minimum": 1,
+          "options": {
+            "grid_columns": 4,
+            "tooltip": "One of the two stop conditions (there is no wall-clock timeout) — always keep it set. Each turn is one model response plus its tool calls; a complex task needs more turns. In tasks-table mode a per-row 'max_turns' column overrides this."
+          },
+          "propertyOrder": 3
+        },
+        "max_budget_usd": {
+          "type": "number",
+          "title": "Max Budget (USD)",
+          "description": "Hard USD cost ceiling per task.",
+          "default": 10.0,
+          "minimum": 0.01,
+          "options": {
+            "grid_columns": 4,
+            "tooltip": "Enforced as ClaudeAgentOptions.max_budget_usd; the run stops once estimated spend reaches it. In tasks-table mode a per-row 'max_budget_usd' is clamped DOWN to this ceiling. Cost is the SDK's client-side estimate (good for capping, not authoritative billing). Your runaway-cost safety net — keep it conservative."
+          },
+          "propertyOrder": 4
+        },
+        "effort": {
+          "type": "string",
+          "title": "Effort Level",
+          "description": "Optional reasoning-effort hint for the model.",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "options": {
+            "grid_columns": 4,
+            "enum_titles": [
+              "Low",
+              "Medium",
+              "High",
+              "Extra High",
+              "Max"
+            ],
+            "tooltip": "Maps to the SDK EffortLevel. Leave empty for the model's default. Higher effort makes the agent think harder before acting, which raises token spend — watch it against Max Budget."
+          },
+          "propertyOrder": 5
+        }
+      }
+    },
+    "permissions": {
+      "type": "object",
+      "title": "Permissions & Tools",
+      "format": "grid-strict",
+      "options": {
+        "tooltip": "What the agent is allowed to do. Only non-prompting permission modes are offered — a mode that pauses for human approval would hang a headless Keboola job."
+      },
+      "propertyOrder": 30,
+      "properties": {
+        "permission_mode": {
+          "type": "string",
+          "title": "Permission Mode",
+          "description": "How the agent decides whether it may run a tool.",
+          "enum": [
+            "dontAsk",
+            "bypassPermissions",
+            "auto"
+          ],
+          "options": {
+            "grid_columns": 12,
+            "enum_titles": [
+              "Don't ask — deny anything not allow-listed, never prompt (recommended)",
+              "Bypass permissions — auto-approve every tool (use deliberately)",
+              "Auto — classifier decides automatically, never prompts"
+            ],
+            "tooltip": "'Don't ask' only lets the agent use tools in Allowed Tools below — the safest default. 'Bypass permissions' lets the agent run ANY tool (deny rules still apply); use only when you trust the prompt. 'Auto' lets an SDK classifier decide. Prompting modes (default / acceptEdits / plan) are hidden because they would block the container until the job times out."
+          },
+          "default": "dontAsk",
+          "propertyOrder": 1
+        },
+        "allowed_tools": {
+          "type": "array",
+          "title": "Allowed Tools",
+          "description": "Allow-list of tools the agent may use (the only tools available in 'Don't ask' mode).",
+          "items": {
+            "type": "string"
+          },
+          "options": {
+            "grid_columns": 12,
+            "tooltip": "Built-in tool names: Read, Write, Edit, Bash, Glob, Grep, WebFetch, WebSearch. Scoped Bash patterns are supported, e.g. Bash(git *). MCP tools are mcp__<server>__<tool>, or mcp__<server>__* for all of a server's tools. Anything not listed is unavailable in 'Don't ask' mode. Enabling GitHub auto-adds Bash(gh *) and Bash(git *)."
+          },
+          "propertyOrder": 2
+        },
+        "disallowed_tools": {
+          "type": "array",
+          "title": "Disallowed Tools",
+          "description": "Deny-list. Blocked regardless of permission mode or the allow-list.",
+          "items": {
+            "type": "string"
+          },
+          "options": {
+            "grid_columns": 12,
+            "tooltip": "A deny rule always wins, even under 'Bypass permissions'. Use it to fence off dangerous tools (e.g. a destructive Bash pattern) while leaving the rest open."
+          },
+          "propertyOrder": 3
+        }
+      }
+    },
+    "github": {
+      "type": "object",
+      "title": "GitHub",
+      "format": "grid-strict",
+      "options": {
+        "tooltip": "Let the agent work against GitHub with gh and git. When enabled, the token below is exported as GITHUB_TOKEN / GH_TOKEN and Bash(gh *) + Bash(git *) are added to Allowed Tools."
+      },
+      "propertyOrder": 40,
+      "properties": {
+        "github_enabled": {
+          "type": "boolean",
+          "title": "Enable GitHub",
+          "description": "Let the agent run gh and git commands against GitHub.",
+          "default": false,
+          "options": {
+            "grid_columns": 12,
+            "tooltip": "When on, Bash(gh *) and Bash(git *) are added to Allowed Tools and the GitHub token is exported as GITHUB_TOKEN / GH_TOKEN so gh and git authenticate automatically. Reveals the GitHub Token field. Leave off if the agent does not need GitHub."
+          },
+          "propertyOrder": 1
+        },
+        "operates_on": {
+          "type": "string",
+          "title": "Repository (org/repo)",
+          "description": "The single GitHub repository the agent operates on, in \"org/repo\" form. Required when GitHub is enabled.",
+          "options": {
+            "dependencies": {
+              "github_enabled": true
+            },
+            "grid_columns": 12,
+            "tooltip": "e.g. \"acme/widgets\". The Advocate broker scopes the GitHub token to exactly this repository, so a hijacked agent cannot drive the token against other repos. Must be exactly \"org/repo\" with no spaces."
+          },
+          "propertyOrder": 2
+        },
+        "#github_token": {
+          "type": "string",
+          "title": "GitHub Token",
+          "description": "GitHub PAT, needed for GitHub work or a private plugin source. Turn on Enable GitHub above to set it.",
+          "format": "password",
+          "options": {
+            "dependencies": {
+              "github_enabled": true
+            },
+            "grid_columns": 12,
+            "tooltip": "Fine-grained PAT (Contents r/w, Pull requests r/w) or a classic token with the repo scope. Injected at runtime as GITHUB_TOKEN and GH_TOKEN so the agent's gh and git commands authenticate, and used to clone private plugin marketplaces. A private plugin source also needs this token, so enable GitHub here even if you only use private plugins. Encrypted at rest, never logged."
+          },
+          "propertyOrder": 3
+        },
+        "writable_branches": {
+          "type": "array",
+          "title": "Writable Branches",
+          "description": "Branch-name globs the agent may push to (default: agent/*). Pushes outside these globs are denied by the Advocate broker.",
+          "default": [
+            "agent/*"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "options": {
+            "dependencies": {
+              "github_enabled": true
+            },
+            "grid_columns": 12,
+            "tooltip": "Glob patterns such as \"agent/*\". The broker only allows git pushes to branches matching one of these patterns, so the agent cannot overwrite protected or default branches. Leave as the default unless you have a reason to widen it."
+          },
+          "propertyOrder": 4
+        }
+      }
+    },
+    "task_output": {
+      "type": "object",
+      "title": "Task, Prompt & Output",
+      "format": "grid",
+      "options": {
+        "tooltip": "The System Prompt shapes every task. Config-prompt mode: write the single prompt here. Tasks-table mode: use the Task ID Filter to pick which rows this config runs. Output settings apply to the tables the agent produces."
+      },
+      "propertyOrder": 50,
+      "properties": {
+        "system_prompt": {
+          "type": "string",
+          "title": "System Prompt",
+          "description": "Optional system prompt prepended to every task; sets the agent's role and output conventions.",
+          "format": "textarea",
+          "options": {
+            "input_height": "120px",
+            "tooltip": "Shared by all tasks in this config. In tasks-table mode a per-row 'system_prompt' column overrides it for that row; the per-task System Prompt below overrides it in config-prompt mode. Use it to tell the agent how to behave and how to shape its output tables."
+          },
+          "propertyOrder": 0
+        },
+        "task": {
+          "type": "object",
+          "title": "Task (Config-Prompt Mode)",
+          "description": "Used ONLY when no tasks input table is mapped. In tasks-table mode the prompt comes from each table row and this block is ignored.",
+          "format": "grid-strict",
+          "options": {
+            "tooltip": "This is setup mode 1 (config-prompt). Leave the input mapping empty and write the agent goal here. If you instead map a tasks table, prompts come from its rows and this block has no effect."
+          },
+          "propertyOrder": 1,
+          "properties": {
+            "prompt": {
+              "type": "string",
+              "title": "Prompt",
+              "description": "The agent goal for this run.",
+              "format": "textarea",
+              "options": {
+                "input_height": "160px",
+                "grid_columns": 12,
+                "tooltip": "Be explicit about the desired OUTPUT, including the table name(s) the agent should produce (e.g. 'write a CSV named order_summary'). The component promotes any CSV the agent drops in its output workspace to a Keboola table."
+              },
+              "propertyOrder": 1
+            },
+            "system_prompt": {
+              "type": "string",
+              "title": "System Prompt (per-task override)",
+              "description": "Optional. Overrides the config-level System Prompt for this single run.",
+              "format": "textarea",
+              "options": {
+                "input_height": "100px",
+                "grid_columns": 12,
+                "tooltip": "Leave empty to use the config-level System Prompt at the top of this section. Set it to give this one run a different role or set of constraints."
+              },
+              "propertyOrder": 2
+            }
+          }
+        },
+        "task_id_filter": {
+          "type": "string",
+          "title": "Task ID Filter (Tasks-Table Mode)",
+          "description": "Tasks-table mode only. Empty = run all rows; a task_id or comma-separated list = run only those rows.",
+          "format": "textarea",
+          "options": {
+            "input_height": "60px",
+            "tooltip": "The 'tasks' input table holds one row per agent task (required columns task_id + prompt). First-class pattern: map ONE shared tasks table into several configs and give each config a different filter, so each owns its own row(s) — per-row ownership and independent scheduling without config rows. Matching is exact on task_id; a filter that matches no row fails the job with a clear error (so a typo is loud, not silent). Ignored in config-prompt mode."
+          },
+          "propertyOrder": 2
+        },
+        "output": {
+          "type": "object",
+          "title": "Output Settings",
+          "description": "Defaults applied to the tables the agent produces.",
+          "format": "grid-strict",
+          "options": {
+            "tooltip": "The agent decides at runtime which tables to create (writer-like). The component promotes each one to the component's default bucket with a manifest. A per-table sidecar (incremental / primary_key) overrides the default below for that table."
+          },
+          "propertyOrder": 3,
+          "properties": {
+            "default_incremental": {
+              "type": "boolean",
+              "title": "Default Incremental Load",
+              "description": "Off (default) overwrites each table every run; on appends (requires a primary key).",
+              "default": false,
+              "options": {
+                "grid_columns": 12,
+                "tooltip": "Applies only when the agent does not declare its own intent for a table. The primary key is set per table by the agent (in each table's .meta.json sidecar), not here. Incremental append needs a primary key on the table, otherwise the run fails rather than appending unbounded duplicates."
+              },
+              "propertyOrder": 1
+            }
+          }
+        }
+      }
+    },
+    "mcp_section": {
+      "type": "object",
+      "title": "MCP Servers",
+      "format": "grid",
+      "options": {
+        "tooltip": "Extra tools from Model Context Protocol servers. Defining a server here only makes its tools VISIBLE — you must also allow-list them in Permissions & Tools above as mcp__<server name>__* (or a specific tool)."
+      },
+      "propertyOrder": 60,
+      "properties": {
+        "mcp_servers": {
+          "type": "array",
+          "title": "MCP Servers",
+          "description": "Model Context Protocol servers to make available to the agent.",
+          "options": {
+            "documentation": {
+              "link": "https://modelcontextprotocol.io/introduction",
+              "tooltip": "Model Context Protocol"
+            },
+            "tooltip": "Defining a server here only makes its tools VISIBLE; to let the agent call them you must allow-list them as mcp__<server name>__* (or a specific tool) in Allowed Tools. stdio servers run as in-container subprocesses; http/sse servers are remote."
+          },
+          "propertyOrder": 1,
+          "items": {
+            "type": "object",
+            "title": "MCP Server",
+            "properties": {
+              "name": {
+                "type": "string",
+                "title": "Server Name",
+                "description": "Identifier referenced in Allowed Tools as mcp__<name>__<tool>.",
+                "options": {
+                  "tooltip": "Use a short, stable name with no spaces — it becomes part of the tool id the agent calls (mcp__<name>__*)."
+                },
+                "propertyOrder": 1
+              },
+              "type": {
+                "type": "string",
+                "title": "Transport Type",
+                "description": "How this server is reached.",
+                "enum": ["stdio", "http", "sse"],
+                "options": {
+                  "enum_titles": [
+                    "stdio — in-container subprocess",
+                    "http — remote HTTP",
+                    "sse — remote SSE"
+                  ],
+                  "tooltip": "stdio launches a local process inside the container (use Command/Args/Env). http and sse connect to a remote server (use Server URL/Headers). The form swaps the relevant fields automatically."
+                },
+                "default": "stdio",
+                "propertyOrder": 2
+              },
+              "command": {
+                "type": "string",
+                "title": "Command",
+                "description": "Executable that launches the stdio server (e.g. uvx, python, npx).",
+                "options": {
+                  "dependencies": {
+                    "type": "stdio"
+                  },
+                  "tooltip": "uvx and uv are already in the image; npx is available too. The process is spawned inside the Keboola container at job start."
+                },
+                "propertyOrder": 10
+              },
+              "args": {
+                "type": "array",
+                "title": "Arguments",
+                "description": "Command-line arguments passed to the stdio command.",
+                "items": {
+                  "type": "string"
+                },
+                "options": {
+                  "dependencies": {
+                    "type": "stdio"
+                  },
+                  "tooltip": "One entry per argument, e.g. for `uvx some-mcp --flag value` add: some-mcp, --flag, value."
+                },
+                "propertyOrder": 11
+              },
+              "env": {
+                "type": "object",
+                "title": "Environment Variables",
+                "description": "Env vars for the stdio server. Prefix a key with # to encrypt it (e.g. #TOKEN).",
+                "format": "editor",
+                "options": {
+                  "dependencies": {
+                    "type": "stdio"
+                  },
+                  "editor": {
+                    "mode": "application/json",
+                    "lineNumbers": true
+                  },
+                  "tooltip": "This is where a stdio server's secrets go — always use a #-prefixed key (e.g. {\"#API_TOKEN\": \"...\"}) so the value is encrypted at rest and scrubbed from logs. Non-secret config can use a plain key."
+                },
+                "propertyOrder": 12
+              },
+              "url": {
+                "type": "string",
+                "title": "Server URL",
+                "description": "URL of the remote HTTP or SSE MCP server.",
+                "options": {
+                  "dependencies": {
+                    "type": ["http", "sse"]
+                  },
+                  "tooltip": "The full https:// endpoint of the remote MCP server. Authentication, if any, goes in Headers."
+                },
+                "propertyOrder": 20
+              },
+              "headers": {
+                "type": "object",
+                "title": "HTTP Headers",
+                "description": "Headers sent to the remote server. Prefix a key with # to encrypt it.",
+                "format": "editor",
+                "options": {
+                  "dependencies": {
+                    "type": ["http", "sse"]
+                  },
+                  "editor": {
+                    "mode": "application/json",
+                    "lineNumbers": true
+                  },
+                  "tooltip": "Put auth here, e.g. {\"Authorization\": \"Bearer <token>\"}. Use a #-prefixed key for the secret part so it is encrypted at rest and never logged."
+                },
+                "propertyOrder": 21
+              }
+            }
+          }
+        }
+      }
+    },
+    "plugins_section": {
+      "type": "object",
+      "title": "Plugins",
+      "format": "grid",
+      "options": {
+        "tooltip": "Claude Code plugin marketplaces installed at job start (not baked into the image). Public sources resolve via a built-in registry; private sources need the GitHub Token in the GitHub section."
+      },
+      "propertyOrder": 70,
+      "properties": {
+        "plugins": {
+          "type": "array",
+          "title": "Plugins (Advanced)",
+          "description": "Plugin marketplaces installed at job start; each entry is pinned or tracks latest.",
+          "options": {
+            "documentation": {
+              "link": "https://docs.claude.com/en/docs/claude-code/plugins",
+              "tooltip": "Claude Code plugins"
+            },
+            "tooltip": "At job start each marketplace is fetched into a writable /tmp location and its plugins are loaded into the agent. Public sources resolve via a built-in registry (e.g. 'superpowers'); private sources need the GitHub Token. The resolved version of each plugin is recorded in the claude_runs output table."
+          },
+          "propertyOrder": 1,
+          "items": {
+            "type": "object",
+            "title": "Plugin Entry",
+            "format": "grid-strict",
+            "properties": {
+              "source": {
+                "type": "string",
+                "title": "Source",
+                "description": "The marketplace source.",
+                "options": {
+                  "grid_columns": 7,
+                  "tooltip": "A public shorthand (e.g. superpowers), an explicit owner/repo (e.g. keboola/cf-claude-code-kit), a git URL, or a remote marketplace.json URL. Private repos require the GitHub Token and the Private toggle on."
+                },
+                "propertyOrder": 1
+              },
+              "version": {
+                "type": "string",
+                "title": "Version",
+                "description": "latest (re-pull newest each run) or a pinned tag / commit SHA / branch.",
+                "default": "latest",
+                "options": {
+                  "grid_columns": 3,
+                  "tooltip": "A pinned ref (e.g. v1.4.0, abc1234, main) gives reproducible installs. 'latest' re-pulls the newest commit each run and is NOT reproducible. The resolved version lands in the claude_runs table either way."
+                },
+                "propertyOrder": 2
+              },
+              "private": {
+                "type": "boolean",
+                "title": "Private Source",
+                "description": "Turn on if this source needs authentication.",
+                "default": false,
+                "options": {
+                  "grid_columns": 2,
+                  "tooltip": "When on, the marketplace fetch authenticates with the GitHub Token. Required for private repos; leave off for public sources."
+                },
+                "propertyOrder": 3
+              },
+              "private_token_note": {
+                "type": "string",
+                "title": "Note",
+                "description": "This source is marked private. Turn on Enable GitHub in the GitHub section and set the GitHub Token there to authenticate the marketplace fetch.",
+                "options": {
+                  "dependencies": {
+                    "private": true
+                  },
+                  "inputAttributes": {
+                    "readonly": true,
+                    "placeholder": "Enable GitHub in the GitHub section and set the GitHub Token to authenticate this private plugin source."
+                  },
+                  "grid_columns": 12
+                },
+                "propertyOrder": 4
+              },
+              "plugins": {
+                "type": "array",
+                "title": "Plugin Names",
+                "description": "Plugin name(s) to install. Leave empty or use [\"*\"] for all it offers.",
+                "items": {
+                  "type": "string"
+                },
+                "options": {
+                  "grid_columns": 12,
+                  "tooltip": "One entry per plugin you want from this marketplace. Installing a plugin does not auto-grant its tools — allow-list them in Allowed Tools as usual."
+                },
+                "propertyOrder": 5
+              }
+            }
+          }
+        }
+      }
+    },
+    "advanced": {
+      "type": "object",
+      "title": "Advanced",
+      "format": "grid",
+      "options": {
+        "tooltip": "SDK settings passthrough, on-disk settings sources, the workspace file toggle, and the runtime SDK version. Most runs leave these at their defaults."
+      },
+      "propertyOrder": 80,
+      "properties": {
+        "settings_json": {
+          "type": "object",
+          "title": "Custom Claude Settings (JSON)",
+          "description": "Optional raw Claude settings JSON, passed to the agent verbatim. Leave empty for normal runs.",
+          "format": "editor",
+          "options": {
+            "editor": {
+              "mode": "application/json",
+              "lineNumbers": true
+            },
+            "tooltip": "Escape hatch for SDK settings not exposed as their own field above. The object is written to a settings.json file and handed to ClaudeAgentOptions.settings. Example: {\"env\": {\"MY_VAR\": \"1\"}}. Leave empty unless you have a specific advanced setting to inject."
+          },
+          "propertyOrder": 2
+        },
+        "setting_sources": {
+          "type": "array",
+          "title": "On-Disk Settings Sources",
+          "description": "Which on-disk .claude/settings.json files the agent may load. Empty (default) = none, a fully isolated run.",
+          "format": "select",
+          "items": {
+            "type": "string",
+            "enum": ["user", "project", "local"]
+          },
+          "uniqueItems": true,
+          "options": {
+            "enum_titles": ["User", "Project", "Local"],
+            "tooltip": "Maps to ClaudeAgentOptions.setting_sources. The container is ephemeral, so 'user' and 'local' normally find nothing. The one useful case is 'project': when the agent clones a Git repo (GitHub mode) that ships its own .claude/settings.json, add 'project' to let the agent pick up that repo's settings. Leave empty otherwise — adding sources makes runs less reproducible."
+          },
+          "propertyOrder": 3
+        },
+        "workspace_input_files": {
+          "type": "boolean",
+          "title": "Stage Input Files into Workspace",
+          "description": "Copy input-mapping files into the agent's working directory so it can read them directly.",
+          "default": false,
+          "options": {
+            "tooltip": "When on, files mapped to /data/in/files/ are staged into the agent's /tmp working directory (cwd) and exposed via add_dirs, so a prompt can say e.g. 'read report.pdf'. Leave off if the agent only works with input TABLES or fetches its own data."
+          },
+          "propertyOrder": 4
+        },
+        "sdk_version": {
+          "type": "string",
+          "title": "SDK Version",
+          "description": "pinned (default) uses the baked-in SDK; a concrete version or 'latest' installs at job start (needs HTTPS egress).",
+          "default": "pinned",
+          "options": {
+            "inputAttributes": {
+              "placeholder": "pinned"
+            },
+            "tooltip": "Leave as 'pinned' unless you need a newer SDK without rebuilding the image. 'pinned' = the baked 0.2.101, deterministic and offline-safe. A concrete version (e.g. 0.2.105) or 'latest' pip-installs into /tmp at job start and needs outbound HTTPS; 'latest' is non-reproducible. The resolved version is recorded in claude_runs. The bundled CLI moves with the package, so there is no SDK/CLI skew."
+          },
+          "propertyOrder": 5
+        },
+        "sdk_version_on_failure": {
+          "type": "string",
+          "title": "SDK Version — On Install Failure",
+          "description": "What to do if a non-pinned SDK install fails (no egress, registry down, bad version).",
+          "enum": [
+            "fail",
+            "fallback_pinned"
+          ],
+          "options": {
+            "enum_titles": [
+              "Fail — raise an error, no silent downgrade (recommended)",
+              "Fallback to pinned — log a warning and use the baked version"
+            ],
+            "tooltip": "Only relevant when SDK Version is not 'pinned'. 'Fail' surfaces the install error so you know your requested version did not load. 'Fallback to pinned' keeps the job running on the baked 0.2.101 with a warning."
+          },
+          "default": "fail",
+          "propertyOrder": 6
+        }
+      }
     }
   }
 }

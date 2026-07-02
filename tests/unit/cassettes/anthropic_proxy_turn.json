@@ -1,0 +1,19 @@
+{
+  "_metadata": {"keboola_vcr_version": "0.5.0", "recorded_at": "2026-06-16T00:00:00+00:00"},
+  "interactions": [
+    {
+      "request": {
+        "body": "{\"model\": \"claude-haiku-4-5\", \"max_tokens\": 5, \"messages\": [{\"role\": \"user\", \"content\": \"Say hello\"}], \"stream\": false}",
+        "headers": {"content-type": ["application/json"]},
+        "method": "POST",
+        "uri": "https://api.anthropic.com/v1/messages"
+      },
+      "response": {
+        "body": {"string": "{\"id\":\"msg_test001\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Hello!\"}],\"model\":\"claude-haiku-4-5-20251001\",\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":10,\"output_tokens\":3}}"},
+        "headers": {"Content-Type": ["application/json"]},
+        "status": {"code": 200, "message": "OK"}
+      }
+    }
+  ],
+  "version": 1
+}

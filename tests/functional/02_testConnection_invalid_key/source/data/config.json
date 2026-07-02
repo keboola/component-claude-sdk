@@ -1,0 +1,6 @@
+{
+  "action": "testConnection",
+  "parameters": {
+    "#anthropic_key": "INVALID-TEST-KEY-EXPECT-401"
+  }
+}

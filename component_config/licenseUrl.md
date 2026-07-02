@@ -1,1 +1,1 @@
-https://github.com/keboola/component-claude-sdk/blob/master/LICENSE.md
+https://github.com/keboola/component-claude-sdk/blob/main/LICENSE.md

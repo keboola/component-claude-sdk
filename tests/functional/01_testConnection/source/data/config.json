@@ -1,0 +1,6 @@
+{
+  "action": "testConnection",
+  "parameters": {
+    "#anthropic_key": "DUMMY_KEY_REPLACED_FROM_SECRETS"
+  }
+}
