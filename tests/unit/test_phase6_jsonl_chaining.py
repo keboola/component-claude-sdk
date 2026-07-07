@@ -68,19 +68,19 @@ class _Cfg:
         self.mcp_servers = mcp_servers or []
 
 
-def _make_downstream_contract(*, operates_on: str = "org/repo-X") -> tuple[dict, dict, bytes]:
+def _make_downstream_contract(*, operates_on: list[str] | None = None) -> tuple[dict, dict, bytes]:
     """Return (contract, envelope, secret) for a downstream agent with a fresh invocation secret.
 
     This simulates the boot-sequence ordering: derive + sign FIRST, no JSONL involved.
     """
     cfg = _Cfg(github_enabled=True)
     secret = new_invocation_secret()
-    contract = derive_contract(cfg, operates_on=operates_on)
+    contract = derive_contract(cfg, operates_on=operates_on if operates_on is not None else ["org/repo-X"])
     envelope = sign_contract(contract, secret)
     return contract, envelope, secret
 
 
-def _build_contaminated_upstream_jsonl(*, upstream_secret: bytes, operates_on: str = "org/repo-X") -> list[dict]:
+def _build_contaminated_upstream_jsonl(*, upstream_secret: bytes, operates_on: list[str] | None = None) -> list[dict]:
     """Build a contaminated upstream JSONL list.
 
     Carries two attack payloads:
@@ -94,7 +94,9 @@ def _build_contaminated_upstream_jsonl(*, upstream_secret: bytes, operates_on: s
     _ = McpStdioServer  # ensure import works; not used directly
 
     cfg_elevated = _Cfg(github_enabled=True)
-    upstream_contract = derive_contract(cfg_elevated, operates_on=operates_on)
+    upstream_contract = derive_contract(
+        cfg_elevated, operates_on=operates_on if operates_on is not None else ["org/repo-X"]
+    )
     # Inject an elevated capability that the downstream's own config would never grant.
     upstream_contract["capabilities"].append(CAP_GH_DELETE)
     upstream_envelope = sign_contract(upstream_contract, upstream_secret)
@@ -214,7 +216,7 @@ class TestJsonlSecretFreeByConstruction:
             github_token = "ghp-REAL-TOKEN"
             github_enabled = False
             mcp_servers = []
-            operates_on = None
+            operates_on = []
 
         env = Component._build_cleared_env(_FakeCfg(), proxy_port=12345)
 
@@ -315,7 +317,7 @@ class TestSecureChainingSemantics:
         The contract must be identical whether or not JSONL was present first.
         """
         cfg = _Cfg(github_enabled=True)
-        operates_on = "org/repo-X"
+        operates_on = ["org/repo-X"]
 
         # Step 1: derive + sign (no JSONL involved — this is the spec §6 boot order).
         secret_a = new_invocation_secret()
@@ -579,7 +581,7 @@ class TestLedger8ContaminatedJsonl:
         """
         upstream_secret = new_invocation_secret()
         cfg = _Cfg(github_enabled=True)
-        upstream_contract = derive_contract(cfg, operates_on="org/repo-X")
+        upstream_contract = derive_contract(cfg, operates_on=["org/repo-X"])
         upstream_contract["capabilities"].append(CAP_GH_DELETE)
         upstream_envelope = sign_contract(upstream_contract, upstream_secret)
 

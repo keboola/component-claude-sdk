@@ -26,6 +26,7 @@ from advocate.contract import (
     _ConfigProto,
     derive_contract,
     new_invocation_secret,
+    operates_on_to_repo_path,
     sign_contract,
     verify_contract,
 )
@@ -96,17 +97,25 @@ def _tcp_client(port: int) -> httpx.Client:
 # ---------------------------------------------------------------------------
 
 
+class TestOperatesOnToRepoPath:
+    def test_exact_repo_passes_through(self) -> None:
+        assert operates_on_to_repo_path("org/repo") == "org/repo"
+
+    def test_org_wildcard_strips_suffix(self) -> None:
+        assert operates_on_to_repo_path("org/*") == "org"
+
+
 class TestDeriveContract:
     def test_same_inputs_yield_same_contract(self) -> None:
         """Derivation is deterministic: same inputs → identical contract dict."""
         cfg = _make_cfg(github_enabled=True)
-        c1 = derive_contract(cfg, operates_on="org/repo-X")
-        c2 = derive_contract(cfg, operates_on="org/repo-X")
+        c1 = derive_contract(cfg, operates_on=["org/repo-X"])
+        c2 = derive_contract(cfg, operates_on=["org/repo-X"])
         assert c1 == c2
 
     def test_github_enabled_adds_capabilities(self) -> None:
         cfg = _make_cfg(github_enabled=True)
-        c = derive_contract(cfg, operates_on="org/repo-X")
+        c = derive_contract(cfg, operates_on=["org/repo-X"])
         caps = c["capabilities"]
         assert CAP_GH_READ in caps
         assert CAP_GH_WRITE_BRANCH in caps
@@ -126,7 +135,7 @@ class TestDeriveContract:
 
     def test_operates_on_scopes_github_destination(self) -> None:
         cfg = _make_cfg(github_enabled=True)
-        c = derive_contract(cfg, operates_on="org/repo-X")
+        c = derive_contract(cfg, operates_on=["org/repo-X"])
         dests = c["destinations"]
         # The scoped destination must be present.
         assert f"{GITHUB_API_HOST}/repos/org/repo-X" in dests
@@ -143,13 +152,38 @@ class TestDeriveContract:
 
     def test_repos_scope_set_when_operates_on_given(self) -> None:
         cfg = _make_cfg(github_enabled=True)
-        c = derive_contract(cfg, operates_on="org/repo-X")
+        c = derive_contract(cfg, operates_on=["org/repo-X"])
         assert c["scope"]["repos"] == ["org/repo-X"]
 
     def test_repos_scope_empty_without_operates_on(self) -> None:
         cfg = _make_cfg(github_enabled=True)
         c = derive_contract(cfg)
         assert c["scope"]["repos"] == []
+
+    def test_multiple_repos_all_scoped_as_destinations(self) -> None:
+        cfg = _make_cfg(github_enabled=True)
+        c = derive_contract(cfg, operates_on=["org/repo-X", "org/repo-Y"])
+        dests = c["destinations"]
+        assert f"{GITHUB_API_HOST}/repos/org/repo-X" in dests
+        assert f"{GITHUB_API_HOST}/repos/org/repo-Y" in dests
+
+    def test_multiple_repos_all_in_scope_list(self) -> None:
+        cfg = _make_cfg(github_enabled=True)
+        c = derive_contract(cfg, operates_on=["org/repo-X", "org/repo-Y"])
+        assert c["scope"]["repos"] == ["org/repo-X", "org/repo-Y"]
+
+    def test_org_wildcard_scopes_destination_to_org_only(self) -> None:
+        cfg = _make_cfg(github_enabled=True)
+        c = derive_contract(cfg, operates_on=["org/*"])
+        dests = c["destinations"]
+        assert f"{GITHUB_API_HOST}/repos/org" in dests
+        # No repo-specific or double-org destination leaked in.
+        assert f"{GITHUB_API_HOST}/repos/org/*" not in dests
+
+    def test_org_wildcard_kept_as_literal_pattern_in_scope(self) -> None:
+        cfg = _make_cfg(github_enabled=True)
+        c = derive_contract(cfg, operates_on=["org/*"])
+        assert c["scope"]["repos"] == ["org/*"]
 
     def test_mcp_remote_server_adds_capability_and_destination(self) -> None:
         server = _make_remote_server("keboola-mcp", "https://mcp.keboola.com/rpc")
@@ -188,7 +222,7 @@ class TestSignVerify:
         """sign then verify with the same secret → True."""
         secret = new_invocation_secret()
         cfg = _make_cfg(github_enabled=True)
-        contract = derive_contract(cfg, operates_on="org/repo-X")
+        contract = derive_contract(cfg, operates_on=["org/repo-X"])
         envelope = sign_contract(contract, secret)
         assert verify_contract(envelope, secret) is True
 
@@ -196,7 +230,7 @@ class TestSignVerify:
         """Modifying capabilities after signing → verify returns False."""
         secret = new_invocation_secret()
         cfg = _make_cfg(github_enabled=True)
-        contract = derive_contract(cfg, operates_on="org/repo-X")
+        contract = derive_contract(cfg, operates_on=["org/repo-X"])
         envelope = sign_contract(contract, secret)
 
         # Tamper: widen capabilities post-signing.
@@ -208,7 +242,7 @@ class TestSignVerify:
         """Adding a destination after signing → verify returns False."""
         secret = new_invocation_secret()
         cfg = _make_cfg(github_enabled=True)
-        contract = derive_contract(cfg, operates_on="org/repo-X")
+        contract = derive_contract(cfg, operates_on=["org/repo-X"])
         envelope = sign_contract(contract, secret)
 
         envelope["contract"]["destinations"].append("https://evil.com/exfil")
@@ -249,7 +283,7 @@ class TestSignVerify:
         """Same contract + same secret → same signature every time."""
         secret = new_invocation_secret()
         cfg = _make_cfg(github_enabled=True)
-        c = derive_contract(cfg, operates_on="org/repo-X")
+        c = derive_contract(cfg, operates_on=["org/repo-X"])
         e1 = sign_contract(c, secret)
         e2 = sign_contract(c, secret)
         assert e1["signature"] == e2["signature"]
@@ -298,9 +332,9 @@ class TestDestMatching:
 
 
 class TestCheckAction:
-    def _gh_contract(self, *, operates_on: str = "org/repo-X") -> dict:
+    def _gh_contract(self, *, operates_on: list[str] | None = None) -> dict:
         cfg = _make_cfg(github_enabled=True)
-        return derive_contract(cfg, operates_on=operates_on)
+        return derive_contract(cfg, operates_on=operates_on if operates_on is not None else ["org/repo-X"])
 
     # --- ALLOW cases ---
 
@@ -393,7 +427,7 @@ class TestCheckAction:
 
     def test_off_scope_repo_denied(self) -> None:
         """When scope.repos is non-empty, a different repo is denied."""
-        c = self._gh_contract(operates_on="org/repo-X")
+        c = self._gh_contract(operates_on=["org/repo-X"])
         result = check_action(
             c,
             capability=CAP_GH_READ,
@@ -426,13 +460,69 @@ class TestCheckAction:
         # capability and destination match → should pass despite scope_repo given
         assert isinstance(result, GateAllow)
 
+    def test_org_wildcard_scope_allows_any_repo_under_org(self) -> None:
+        """A contract scoped to 'org/*' must allow gh.read on ANY repo under org."""
+        c = self._gh_contract(operates_on=["org/*"])
+        result = check_action(
+            c,
+            capability=CAP_GH_READ,
+            destination=f"{GITHUB_API_HOST}/repos/org",
+            scope_repo="org/some-other-repo",
+        )
+        assert isinstance(result, GateAllow)
+
+    def test_org_wildcard_scope_denies_different_org(self) -> None:
+        """A contract scoped to 'org/*' must NOT allow a repo under a different org."""
+        c = self._gh_contract(operates_on=["org/*"])
+        result = check_action(
+            c,
+            capability=CAP_GH_READ,
+            destination=f"{GITHUB_API_HOST}/repos/org",
+            scope_repo="other-org/some-repo",
+        )
+        assert isinstance(result, GateDenial)
+        assert result.failed_check == "scope"
+
+    def test_multi_repo_scope_allows_either_listed_repo(self) -> None:
+        c = self._gh_contract(operates_on=["org/repo-X", "org/repo-Y"])
+        result = check_action(
+            c,
+            capability=CAP_GH_READ,
+            destination=f"{GITHUB_API_HOST}/repos/org/repo-Y",
+            scope_repo="org/repo-Y",
+        )
+        assert isinstance(result, GateAllow)
+
+    def test_multi_repo_scope_denies_unlisted_repo(self) -> None:
+        c = self._gh_contract(operates_on=["org/repo-X", "org/repo-Y"])
+        result = check_action(
+            c,
+            capability=CAP_GH_READ,
+            destination=f"{GITHUB_API_HOST}/repos/org/repo-X",
+            scope_repo="org/repo-Z",
+        )
+        assert isinstance(result, GateDenial)
+        assert result.failed_check == "scope"
+
+    def test_exact_repo_scope_still_rejects_prefix_leak(self) -> None:
+        """A literal 'org/repo' pattern (no wildcard chars) must not glob-match 'org/repo-evil'."""
+        c = self._gh_contract(operates_on=["org/repo"])
+        result = check_action(
+            c,
+            capability=CAP_GH_READ,
+            destination=f"{GITHUB_API_HOST}/repos/org/repo",
+            scope_repo="org/repo-evil",
+        )
+        assert isinstance(result, GateDenial)
+        assert result.failed_check == "scope"
+
     # --- Denial is clean, not a crash ---
 
     def test_denial_has_reason_not_secret_detail(self) -> None:
         """GateDenial.reason must not contain signing secrets or internal contract dump."""
         secret = new_invocation_secret()
         cfg = _make_cfg(github_enabled=True)
-        c = derive_contract(cfg, operates_on="org/repo-X")
+        c = derive_contract(cfg, operates_on=["org/repo-X"])
         result = check_action(c, capability="evil.cap", destination="https://evil.com")
         assert isinstance(result, GateDenial)
         # The reason should be a short, sanitized string — not a full contract dump.
@@ -475,7 +565,7 @@ class TestGateViaUds:
         from advocate.server import AdvocateServer
 
         cfg = _make_cfg(github_enabled=True)
-        c = derive_contract(cfg, operates_on="org/repo-X")
+        c = derive_contract(cfg, operates_on=["org/repo-X"])
         secret = new_invocation_secret()
         envelope = sign_contract(c, secret)
 
@@ -584,7 +674,7 @@ class TestGateViaUds:
         from advocate.server import AdvocateServer
 
         cfg = _make_cfg(github_enabled=True)
-        c = derive_contract(cfg, operates_on="org/repo-X")
+        c = derive_contract(cfg, operates_on=["org/repo-X"])
         secret = new_invocation_secret()
         envelope = sign_contract(c, secret)
 
@@ -661,7 +751,7 @@ class TestFailClosed:
         from advocate.server import AdvocateServer
 
         cfg = _make_cfg(github_enabled=True)
-        c = derive_contract(cfg, operates_on="org/repo-X")
+        c = derive_contract(cfg, operates_on=["org/repo-X"])
         secret = new_invocation_secret()
         envelope = sign_contract(c, secret)
 
@@ -696,7 +786,7 @@ class TestFailClosed:
         from advocate.server import _Handler, _TcpServer
 
         cfg = _make_cfg(github_enabled=True)
-        c = derive_contract(cfg, operates_on="org/repo-X")
+        c = derive_contract(cfg, operates_on=["org/repo-X"])
         secret = new_invocation_secret()
         envelope = sign_contract(c, secret)
 
@@ -800,7 +890,7 @@ class TestGithubCapabilityMapping:
 
         idempotency.clear()
         cfg = _make_cfg(github_enabled=True)
-        c = derive_contract(cfg, operates_on="org/repo-X")
+        c = derive_contract(cfg, operates_on=["org/repo-X"])
         secret = new_invocation_secret()
         envelope = sign_contract(c, secret)
 
@@ -891,7 +981,7 @@ class TestGithubCapabilityMapping:
 
         idempotency.clear()
         cfg = _make_cfg(github_enabled=True)
-        c = derive_contract(cfg, operates_on="org/repo-X")
+        c = derive_contract(cfg, operates_on=["org/repo-X"])
         secret = new_invocation_secret()
         envelope = sign_contract(c, secret)
 
@@ -922,7 +1012,7 @@ class TestGithubCapabilityMapping:
 
         idempotency.clear()
         cfg = _make_cfg(github_enabled=True)
-        c = derive_contract(cfg, operates_on="org/repo-X")
+        c = derive_contract(cfg, operates_on=["org/repo-X"])
         secret = new_invocation_secret()
         envelope = sign_contract(c, secret)
 
@@ -960,7 +1050,7 @@ class TestGithubCapabilityMapping:
 
         idempotency.clear()
         cfg = _make_cfg(github_enabled=True)
-        c = derive_contract(cfg, operates_on="org/repo-X")
+        c = derive_contract(cfg, operates_on=["org/repo-X"])
         secret = new_invocation_secret()
         envelope = sign_contract(c, secret)
 
@@ -997,7 +1087,7 @@ class TestGithubCapabilityMapping:
 
         idempotency.clear()
         cfg = _make_cfg(github_enabled=True)
-        c = derive_contract(cfg, operates_on="org/repo-X")
+        c = derive_contract(cfg, operates_on=["org/repo-X"])
         secret = new_invocation_secret()
         envelope = sign_contract(c, secret)
 
@@ -1050,7 +1140,7 @@ class TestPercentEncodingCapabilityBypass:
 
         idempotency.clear()
         cfg = _make_cfg(github_enabled=True)
-        c = derive_contract(cfg, operates_on="org/repo-X")
+        c = derive_contract(cfg, operates_on=["org/repo-X"])
         secret = new_invocation_secret()
         envelope = sign_contract(c, secret)
         server = AdvocateServer(
@@ -1159,7 +1249,7 @@ class TestWritableBranchGate:
 
     def test_check_action_denies_main_branch(self) -> None:
         cfg = _make_cfg(github_enabled=True)
-        c = derive_contract(cfg, operates_on="org/repo-X")  # writable_branches=["agent/*"]
+        c = derive_contract(cfg, operates_on=["org/repo-X"])  # writable_branches=["agent/*"]
         result = check_action(
             c,
             capability=CAP_GH_WRITE_BRANCH,
@@ -1172,7 +1262,7 @@ class TestWritableBranchGate:
 
     def test_check_action_allows_agent_branch(self) -> None:
         cfg = _make_cfg(github_enabled=True)
-        c = derive_contract(cfg, operates_on="org/repo-X")
+        c = derive_contract(cfg, operates_on=["org/repo-X"])
         result = check_action(
             c,
             capability=CAP_GH_WRITE_BRANCH,
@@ -1188,7 +1278,7 @@ class TestWritableBranchGate:
         from advocate.server import AdvocateServer
 
         cfg = _make_cfg(github_enabled=True)
-        c = derive_contract(cfg, operates_on="org/repo-X")
+        c = derive_contract(cfg, operates_on=["org/repo-X"])
         secret = new_invocation_secret()
         envelope = sign_contract(c, secret)
 
@@ -1216,7 +1306,7 @@ class TestWritableBranchGate:
         from advocate.server import AdvocateServer
 
         cfg = _make_cfg(github_enabled=True)
-        c = derive_contract(cfg, operates_on="org/repo-X")
+        c = derive_contract(cfg, operates_on=["org/repo-X"])
         secret = new_invocation_secret()
         envelope = sign_contract(c, secret)
 
@@ -1246,7 +1336,7 @@ class TestWritableBranchGate:
         from advocate.server import AdvocateServer
 
         cfg = _make_cfg(github_enabled=True)
-        c = derive_contract(cfg, operates_on="org/repo-X")
+        c = derive_contract(cfg, operates_on=["org/repo-X"])
         secret = new_invocation_secret()
         envelope = sign_contract(c, secret)
 

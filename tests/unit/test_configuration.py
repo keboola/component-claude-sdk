@@ -54,38 +54,68 @@ def test_github_enabled_requires_operates_on():
     assert "operates_on" in str(exc.value)
 
 
-def test_github_enabled_rejects_malformed_operates_on():
-    """operates_on must be 'org/repo' — a bare name (no slash) is rejected."""
+def test_github_enabled_rejects_empty_operates_on_list():
+    """An explicit empty list is treated the same as absent — still fails closed."""
     with pytest.raises(UserException) as exc:
-        Configuration(**_base(github_enabled=True, operates_on="just-a-name"))
+        Configuration(**_base(github_enabled=True, operates_on=[]))
+    assert "operates_on" in str(exc.value)
+
+
+def test_github_enabled_rejects_malformed_operates_on_entry():
+    """Each entry must be 'org/repo' or 'org/*' — a bare name (no slash) is rejected."""
+    with pytest.raises(UserException) as exc:
+        Configuration(**_base(github_enabled=True, operates_on=["just-a-name"]))
     assert "org/repo" in str(exc.value)
 
 
-def test_github_enabled_with_valid_operates_on_parses():
-    cfg = Configuration(**_base(github_enabled=True, operates_on="org/repo-X"))
+def test_github_enabled_with_valid_single_repo_parses():
+    cfg = Configuration(**_base(github_enabled=True, operates_on=["org/repo-X"]))
     assert cfg.github_enabled is True
-    assert cfg.operates_on == "org/repo-X"
+    assert cfg.operates_on == ["org/repo-X"]
     # Default writable-branch scope confines the agent to its own branches.
     assert cfg.writable_branches == ["agent/*"]
 
 
-def test_operates_on_surrounding_whitespace_is_stripped():
-    cfg = Configuration(**_base(github_enabled=True, operates_on="  org/repo-X  "))
-    assert cfg.operates_on == "org/repo-X"
+def test_github_enabled_with_multiple_repos_parses():
+    cfg = Configuration(**_base(github_enabled=True, operates_on=["org/repo-X", "org/repo-Y"]))
+    assert cfg.operates_on == ["org/repo-X", "org/repo-Y"]
+
+
+def test_github_enabled_with_org_wildcard_parses():
+    cfg = Configuration(**_base(github_enabled=True, operates_on=["org/*"]))
+    assert cfg.operates_on == ["org/*"]
+
+
+def test_github_enabled_rejects_double_star_wildcard():
+    """'org/**' is not a supported pattern — only a literal 'org/*' wildcard."""
+    with pytest.raises(UserException) as exc:
+        Configuration(**_base(github_enabled=True, operates_on=["org/**"]))
+    assert "org/repo" in str(exc.value)
+
+
+def test_operates_on_surrounding_whitespace_is_stripped_per_entry():
+    cfg = Configuration(**_base(github_enabled=True, operates_on=["  org/repo-X  ", "org/repo-Y"]))
+    assert cfg.operates_on == ["org/repo-X", "org/repo-Y"]
 
 
 def test_operates_on_internal_whitespace_rejected():
     """A dirty value like 'a / b' must be rejected, not silently stored."""
     with pytest.raises(UserException) as exc:
-        Configuration(**_base(github_enabled=True, operates_on="a / b"))
+        Configuration(**_base(github_enabled=True, operates_on=["a / b"]))
     assert "org/repo" in str(exc.value)
 
 
+def test_operates_on_empty_string_entry_dropped_before_validation():
+    """A blank entry (e.g. from a UI artifact) is dropped, not treated as a repo."""
+    cfg = Configuration(**_base(github_enabled=True, operates_on=["org/repo-X", "  "]))
+    assert cfg.operates_on == ["org/repo-X"]
+
+
 def test_operates_on_optional_when_github_disabled():
-    """operates_on stays optional when GitHub is off."""
+    """operates_on stays optional (empty) when GitHub is off."""
     cfg = Configuration(**_base())
     assert cfg.github_enabled is False
-    assert cfg.operates_on is None
+    assert cfg.operates_on == []
 
 
 def test_prompting_permission_mode_rejected():
@@ -266,7 +296,7 @@ def test_nested_section_shape_full_round_trip():
             "permission_mode": "bypassPermissions",
             "allowed_tools": ["Read", "Bash(git *)"],
         },
-        github={"github_enabled": True, "#github_token": "GH_NAME_ONLY", "operates_on": "org/repo-X"},
+        github={"github_enabled": True, "#github_token": "GH_NAME_ONLY", "operates_on": ["org/repo-X"]},
         task_output={
             "task": {"prompt": "do the thing"},
             "task_id_filter": "a, b",
@@ -326,7 +356,7 @@ def test_root_level_value_wins_over_section_wrapper():
 
 def test_flat_shape_still_parses_alongside_sections():
     """The historical flat shape (no wrappers) is left fully untouched."""
-    cfg = Configuration(**_base(max_turns=3, github_enabled=True, operates_on="org/repo-X"))
+    cfg = Configuration(**_base(max_turns=3, github_enabled=True, operates_on=["org/repo-X"]))
     assert cfg.max_turns == 3
     assert cfg.github_enabled is True
 

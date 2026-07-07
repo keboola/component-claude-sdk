@@ -43,7 +43,7 @@ from configuration import Configuration
 from output_writer import OutputWriter
 from plugin_manager import PluginManager, PluginResult
 from sdk_version_manager import SdkVersionManager
-from sync_actions import check_anthropic_connection
+from sync_actions import check_anthropic_connection, list_github_repos
 from tasks import Task, TaskSource
 from transcript_writer import TranscriptWriter
 
@@ -390,15 +390,12 @@ class Component(ComponentBase):
         # Step 5: Build the MCP configs dict for the server.
         mcp_configs = {server.name: server for server in config.mcp_servers}
 
-        # HIGH-3: scope the GitHub broker's destination allowlist to the single
-        # declared repo. ``Configuration`` already requires ``operates_on`` when
+        # HIGH-3: scope the GitHub broker's destination allowlist to the repos in
+        # operates_on. ``Configuration`` already requires ``operates_on`` when
         # github_enabled (fail-closed), so this is a concrete path when GitHub is
         # in play; otherwise deny all GitHub paths (empty allowlist) — the broker
         # is unreachable anyway since the contract grants no gh.* capability.
-        if config.github_enabled and config.operates_on:
-            github_allowed_destinations = [f"/repos/{config.operates_on}"]
-        else:
-            github_allowed_destinations = []
+        github_allowed_destinations = self._build_github_allowed_destinations(config)
 
         # Start the loopback-TCP AdvocateServer. ``start()`` lives inside the same
         # try/finally that owns ``stop()`` (Finding 5) — if any setup below
@@ -480,6 +477,20 @@ class Component(ComponentBase):
             secrets.extend(getattr(server, "env", {}).values())
             secrets.extend(getattr(server, "headers", {}).values())
         return [s for s in secrets if s]
+
+    @staticmethod
+    def _build_github_allowed_destinations(config: Configuration) -> list[str]:
+        """Path-prefix allowlist for the GitHub broker, one entry per operates_on repo.
+
+        An "org/*" entry becomes the org-only prefix "/repos/org" — the broker's
+        existing child-path matching (github_broker._path_allowed) already scopes
+        that to every repo under the org without further narrowing here.
+        """
+        from advocate.contract import operates_on_to_repo_path  # noqa: PLC0415
+
+        if not (config.github_enabled and config.operates_on):
+            return []
+        return [f"/repos/{operates_on_to_repo_path(entry)}" for entry in config.operates_on]
 
     def _stage_input_files(self) -> None:
         """Copy /data/in/files/ into the agent workspace so the agent can read them.
@@ -638,6 +649,12 @@ class Component(ComponentBase):
         """Validate #anthropic_key with a single cheap in-process API call."""
         config = Configuration(**self.configuration.parameters)
         return check_anthropic_connection(config.anthropic_key)
+
+    @sync_action("load_github_repos")
+    def load_github_repos(self):
+        """Populate the Repositories multi-select with repos the token can access."""
+        config = Configuration(**self.configuration.parameters)
+        return list_github_repos(config.github_token)
 
 
 def _boot() -> None:

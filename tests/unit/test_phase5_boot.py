@@ -260,7 +260,7 @@ class TestContractWiredToServer:
         """operates_on from config narrows the contract repo scope."""
         from advocate.contract import derive_contract
 
-        cfg = Configuration(**{"#anthropic_key": "key", "github_enabled": True, "operates_on": "org/repo-X"})
+        cfg = Configuration(**{"#anthropic_key": "key", "github_enabled": True, "operates_on": ["org/repo-X"]})
         contract = derive_contract(cfg, operates_on=cfg.operates_on)
         assert "org/repo-X" in contract["scope"]["repos"]
         assert any("org/repo-X" in d for d in contract["destinations"])
@@ -611,7 +611,7 @@ class TestOutputPromotionAndTranscript:
             {
                 "#github_token": "gh_real_secret",
                 "github_enabled": True,
-                "operates_on": "org/repo-X",
+                "operates_on": ["org/repo-X"],
                 "task": {"prompt": "hi"},
             },
         )
