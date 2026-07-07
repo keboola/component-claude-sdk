@@ -43,7 +43,7 @@ from configuration import Configuration
 from output_writer import OutputWriter
 from plugin_manager import PluginManager, PluginResult
 from sdk_version_manager import SdkVersionManager
-from sync_actions import check_anthropic_connection
+from sync_actions import check_anthropic_connection, list_github_repos
 from tasks import Task, TaskSource
 from transcript_writer import TranscriptWriter
 
@@ -647,6 +647,12 @@ class Component(ComponentBase):
         """Validate #anthropic_key with a single cheap in-process API call."""
         config = Configuration(**self.configuration.parameters)
         return check_anthropic_connection(config.anthropic_key)
+
+    @sync_action("load_github_repos")
+    def load_github_repos(self):
+        """Populate the Repositories multi-select with repos the token can access."""
+        config = Configuration(**self.configuration.parameters)
+        return list_github_repos(config.github_token)
 
 
 def _boot() -> None:
