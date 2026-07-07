@@ -451,6 +451,62 @@ class TestCheckAction:
         # capability and destination match → should pass despite scope_repo given
         assert isinstance(result, GateAllow)
 
+    def test_org_wildcard_scope_allows_any_repo_under_org(self) -> None:
+        """A contract scoped to 'org/*' must allow gh.read on ANY repo under org."""
+        c = self._gh_contract(operates_on=["org/*"])
+        result = check_action(
+            c,
+            capability=CAP_GH_READ,
+            destination=f"{GITHUB_API_HOST}/repos/org",
+            scope_repo="org/some-other-repo",
+        )
+        assert isinstance(result, GateAllow)
+
+    def test_org_wildcard_scope_denies_different_org(self) -> None:
+        """A contract scoped to 'org/*' must NOT allow a repo under a different org."""
+        c = self._gh_contract(operates_on=["org/*"])
+        result = check_action(
+            c,
+            capability=CAP_GH_READ,
+            destination=f"{GITHUB_API_HOST}/repos/org",
+            scope_repo="other-org/some-repo",
+        )
+        assert isinstance(result, GateDenial)
+        assert result.failed_check == "scope"
+
+    def test_multi_repo_scope_allows_either_listed_repo(self) -> None:
+        c = self._gh_contract(operates_on=["org/repo-X", "org/repo-Y"])
+        result = check_action(
+            c,
+            capability=CAP_GH_READ,
+            destination=f"{GITHUB_API_HOST}/repos/org/repo-Y",
+            scope_repo="org/repo-Y",
+        )
+        assert isinstance(result, GateAllow)
+
+    def test_multi_repo_scope_denies_unlisted_repo(self) -> None:
+        c = self._gh_contract(operates_on=["org/repo-X", "org/repo-Y"])
+        result = check_action(
+            c,
+            capability=CAP_GH_READ,
+            destination=f"{GITHUB_API_HOST}/repos/org/repo-X",
+            scope_repo="org/repo-Z",
+        )
+        assert isinstance(result, GateDenial)
+        assert result.failed_check == "scope"
+
+    def test_exact_repo_scope_still_rejects_prefix_leak(self) -> None:
+        """A literal 'org/repo' pattern (no wildcard chars) must not glob-match 'org/repo-evil'."""
+        c = self._gh_contract(operates_on=["org/repo"])
+        result = check_action(
+            c,
+            capability=CAP_GH_READ,
+            destination=f"{GITHUB_API_HOST}/repos/org/repo",
+            scope_repo="org/repo-evil",
+        )
+        assert isinstance(result, GateDenial)
+        assert result.failed_check == "scope"
+
     # --- Denial is clean, not a crash ---
 
     def test_denial_has_reason_not_secret_detail(self) -> None:
