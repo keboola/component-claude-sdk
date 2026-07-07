@@ -238,11 +238,14 @@ class Configuration(BaseModel):
     task: TaskConfig = Field(default_factory=TaskConfig)
 
     # --- intent contract scope (spec §10) ---
-    operates_on: str | None = None
-    """``org/repo`` target the agent operates on; used by the Advocate to scope the
-    GitHub token to a single repository. REQUIRED when ``github_enabled`` is true —
-    without it a hijacked agent could drive the real token against any repo the token
-    can reach, so the broker fails closed (HIGH-3). See spec §10."""
+    operates_on: list[str] = Field(default_factory=list)
+    """One or more ``org/repo`` entries, or ``org/*`` for an entire org, that the
+    agent operates on; used by the Advocate to scope the GitHub token. REQUIRED
+    (non-empty) when ``github_enabled`` is true — without it a hijacked agent
+    could drive the real token against any repo the token can reach, so the
+    broker fails closed (HIGH-3). ``org/*`` is a deliberate, broader opt-in:
+    it scopes the token to every repo under that org rather than one repo.
+    See spec §10."""
 
     writable_branches: list[str] = Field(default_factory=lambda: ["agent/*"])
     """Glob patterns for branches the agent may write via the GitHub broker (HIGH-3).
@@ -306,8 +309,12 @@ class Configuration(BaseModel):
     @field_validator("operates_on", mode="before")
     @classmethod
     def _strip_operates_on(cls, v):
-        """Trim surrounding whitespace so the stored repo scope is clean (HIGH-3)."""
-        return v.strip() if isinstance(v, str) else v
+        """Trim whitespace and drop blank entries so the stored repo scope is clean (HIGH-3)."""
+        if isinstance(v, str):
+            v = [v]
+        if not isinstance(v, list):
+            return v
+        return [entry.strip() for entry in v if isinstance(entry, str) and entry.strip()]
 
     @field_validator("task_id_filter", mode="before")
     @classmethod
@@ -330,27 +337,30 @@ class Configuration(BaseModel):
 
     @model_validator(mode="after")
     def _github_enabled_needs_scoped_repo(self) -> Configuration:
-        """``github_enabled`` requires a concrete ``operates_on`` repo (HIGH-3).
+        """``github_enabled`` requires at least one ``operates_on`` entry (HIGH-3).
 
-        Without it the GitHub token cannot be bound to a single repository, so a
+        Without it the GitHub token cannot be bound to any repository, so a
         hijacked agent could drive the real token against any repo the token can
         reach. Fail closed at config time with a clear message rather than grant
-        broad access.
+        broad access. Each entry must be exactly ``org/repo`` or the literal
+        wildcard ``org/*`` — a dirty value would otherwise flow into the
+        scope/allowlist and silently mismatch the real repo path.
         """
         if self.github_enabled:
-            repo = self.operates_on or ""
-            if not repo:
+            if not self.operates_on:
                 raise UserException(
-                    "github_enabled requires 'operates_on' (\"org/repo\") so the GitHub token is "
-                    "scoped to a single repository — a hijacked agent must not be able to use the "
-                    "token against arbitrary repos."
+                    "github_enabled requires 'operates_on' (one or more \"org/repo\" entries, or "
+                    '"org/*" for an entire org) so the GitHub token is scoped — a hijacked agent '
+                    "must not be able to use the token against arbitrary repos."
                 )
-            parts = repo.split("/")
-            # Exactly two non-empty segments and no embedded whitespace — a dirty
-            # value would otherwise flow into the scope/allowlist and silently
-            # mismatch the real repo path.
-            if len(parts) != 2 or not all(parts) or any(c.isspace() for c in repo):
-                raise UserException(f"operates_on must be in 'org/repo' form (no spaces), got: {self.operates_on!r}")
+            for entry in self.operates_on:
+                parts = entry.split("/")
+                is_wildcard = len(parts) == 2 and parts[0] and parts[1] == "*"
+                is_exact_repo = len(parts) == 2 and all(parts) and parts[1] != "*" and "*" not in parts[1]
+                if any(c.isspace() for c in entry) or not (is_wildcard or is_exact_repo):
+                    raise UserException(
+                        f"operates_on entries must be 'org/repo' or 'org/*' (no spaces), got: {entry!r}"
+                    )
         return self
 
     @model_validator(mode="after")

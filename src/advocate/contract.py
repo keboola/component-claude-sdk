@@ -109,19 +109,19 @@ _IRREVERSIBLE_GATE = ["gh.merge", "deploy", "delete"]
 def derive_contract(
     cfg: _ConfigProto,
     *,
-    operates_on: str | None = None,
+    operates_on: str | list[str] | None = None,
 ) -> dict:
     """Build a frozen Intent Contract from trusted config inputs.
 
     Args:
         cfg: The validated ``Configuration`` for this invocation.  No untrusted
             data must have been processed before this is called (spec §6 step 3).
-        operates_on: Optional ``org/repo`` string identifying the repository this
-            agent operates on.  When not present (current POC default), the repo
-            scope is empty — capability checking still applies but the destination
-            allowlist cannot be narrowed to a specific repo path.  Phase 5 should
-            wire this from a future ``cfg.operates_on`` field; do NOT infer it from
-            the task prompt (that is untrusted once we start Phase 2).
+        operates_on: Optional ``org/repo`` string, or list of repo strings, identifying
+            the repository/repositories this agent operates on.  When not present
+            (current POC default), the repo scope is empty — capability checking still
+            applies but the destination allowlist cannot be narrowed to a specific repo
+            path.  Phase 5 should wire this from ``cfg.operates_on``; do NOT infer it
+            from the task prompt (that is untrusted once we start Phase 2).
 
     Returns:
         A plain dict representing the contract.  Sign it with :func:`sign_contract`
@@ -136,14 +136,19 @@ def derive_contract(
     #
     # HIGH-3 (fail-closed repo scope): GitHub capabilities are granted ONLY when
     # a concrete ``operates_on`` repo is known.  Without it we cannot bound the
-    # PAT to a single repo, so the safe default is to grant NOTHING (a hijacked
-    # agent then cannot drive the real token against arbitrary repos).  The
-    # broad ``api.github.com`` destination is never emitted.  ``Configuration``
-    # also rejects ``github_enabled`` without ``operates_on`` at parse time
-    # (UserException), so in production this branch is belt-and-suspenders.
+    # PAT to repos, so the safe default is to grant NOTHING (a hijacked agent then
+    # cannot drive the real token against arbitrary repos).  The broad ``api.github.com``
+    # destination is never emitted.  ``Configuration`` also rejects ``github_enabled``
+    # without ``operates_on`` at parse time (UserException), so in production this
+    # branch is belt-and-suspenders.
     if cfg.github_enabled and operates_on:
         capabilities.extend([CAP_GH_READ, CAP_GH_WRITE_BRANCH, CAP_GH_OPEN_PR, CAP_GH_COMMENT])
-        destinations.append(f"{GITHUB_API_HOST}/repos/{operates_on}")
+        # Support both string (old) and list (new) forms of operates_on.
+        if isinstance(operates_on, list):
+            for repo in operates_on:
+                destinations.append(f"{GITHUB_API_HOST}/repos/{repo}")
+        else:
+            destinations.append(f"{GITHUB_API_HOST}/repos/{operates_on}")
     elif cfg.github_enabled and not operates_on:
         log.warning(
             "derive_contract: github_enabled but no operates_on repo — withholding ALL "
@@ -161,8 +166,13 @@ def derive_contract(
         if isinstance(server, McpRemoteServer):
             destinations.append(server.url)
 
-    # Repo scope
-    repos: list[str] = [operates_on] if operates_on else []
+    # Repo scope - handle both string (old) and list (new) forms
+    if isinstance(operates_on, list):
+        repos: list[str] = operates_on
+    elif operates_on:
+        repos = [operates_on]
+    else:
+        repos = []
 
     # Writable-branch scope (HIGH-3): enforced by the gate on ref-targeting
     # writes.  Defaults to ``agent/*`` (the agent may push only to its own
