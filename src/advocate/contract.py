@@ -110,6 +110,17 @@ _IRREVERSIBLE_GATE = ["gh.merge", "deploy", "delete"]
 # ---------------------------------------------------------------------------
 
 
+def operates_on_to_repo_path(entry: str) -> str:
+    """Translate one operates_on entry to its GitHub REST path segment.
+
+    A concrete "org/repo" entry maps to itself. An "org/*" wildcard entry maps
+    to the org-only segment "org" — the broker's existing child-path matching
+    (github_broker._path_allowed) already scopes any "/repos/org/<anything>"
+    under that prefix, so no further narrowing is needed here.
+    """
+    return entry[:-2] if entry.endswith("/*") else entry
+
+
 def derive_contract(
     cfg: _ConfigProto,
     *,
@@ -151,7 +162,7 @@ def derive_contract(
             # matching (github_broker._path_allowed) already covers every repo
             # under that org without needing the literal "/*" suffix, and its
             # segment-boundary check already prevents "org-evil" from matching.
-            org_scoped = entry[:-2] if entry.endswith("/*") else entry
+            org_scoped = operates_on_to_repo_path(entry)
             destinations.append(f"{GITHUB_API_HOST}/repos/{org_scoped}")
     elif cfg.github_enabled and not operates_on:
         log.warning(

@@ -26,6 +26,7 @@ from advocate.contract import (
     _ConfigProto,
     derive_contract,
     new_invocation_secret,
+    operates_on_to_repo_path,
     sign_contract,
     verify_contract,
 )
@@ -94,6 +95,14 @@ def _tcp_client(port: int) -> httpx.Client:
 # ---------------------------------------------------------------------------
 # 1. derive_contract — determinism + shape
 # ---------------------------------------------------------------------------
+
+
+class TestOperatesOnToRepoPath:
+    def test_exact_repo_passes_through(self) -> None:
+        assert operates_on_to_repo_path("org/repo") == "org/repo"
+
+    def test_org_wildcard_strips_suffix(self) -> None:
+        assert operates_on_to_repo_path("org/*") == "org"
 
 
 class TestDeriveContract:

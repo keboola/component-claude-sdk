@@ -356,7 +356,7 @@ class Configuration(BaseModel):
             for entry in self.operates_on:
                 parts = entry.split("/")
                 is_wildcard = len(parts) == 2 and parts[0] and parts[1] == "*"
-                is_exact_repo = len(parts) == 2 and all(parts) and parts[1] != "*" and "*" not in parts[1]
+                is_exact_repo = len(parts) == 2 and all(parts) and "*" not in parts[1]
                 if any(c.isspace() for c in entry) or not (is_wildcard or is_exact_repo):
                     raise UserException(
                         f"operates_on entries must be 'org/repo' or 'org/*' (no spaces), got: {entry!r}"

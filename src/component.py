@@ -486,9 +486,11 @@ class Component(ComponentBase):
         existing child-path matching (github_broker._path_allowed) already scopes
         that to every repo under the org without further narrowing here.
         """
+        from advocate.contract import operates_on_to_repo_path  # noqa: PLC0415
+
         if not (config.github_enabled and config.operates_on):
             return []
-        return [f"/repos/{entry[:-2]}" if entry.endswith("/*") else f"/repos/{entry}" for entry in config.operates_on]
+        return [f"/repos/{operates_on_to_repo_path(entry)}" for entry in config.operates_on]
 
     def _stage_input_files(self) -> None:
         """Copy /data/in/files/ into the agent workspace so the agent can read them.
