@@ -15,11 +15,17 @@
       "title": "Connection & Authentication",
       "format": "grid-strict",
       "required": ["#anthropic_key"],
-      "options": {
-        "tooltip": "Credentials the agent run needs. The Anthropic key is required for every run; the GitHub token is only needed when you turn on GitHub or use a private plugin source. Both are encrypted at rest and never logged."
-      },
       "propertyOrder": 10,
       "properties": {
+        "_connection_note": {
+          "type": "string",
+          "format": "info",
+          "description": "Credentials the agent run needs. The Anthropic key is required for every run; the GitHub token is only needed when you turn on GitHub or use a private plugin source. Both are encrypted at rest and never logged.",
+          "options": {
+            "grid_columns": 12
+          },
+          "propertyOrder": 0
+        },
         "#anthropic_key": {
           "type": "string",
           "title": "Anthropic API Key",
@@ -45,11 +51,17 @@
       "type": "object",
       "title": "Model & Budget",
       "format": "grid-strict",
-      "options": {
-        "tooltip": "Capability vs. cost, and the limits that hard-bound every run. There is NO wall-clock timeout, so Max Turns and Max Budget are the only stop conditions — always keep both set."
-      },
       "propertyOrder": 20,
       "properties": {
+        "_model_budget_note": {
+          "type": "string",
+          "format": "info",
+          "description": "Capability vs. cost, and the limits that hard-bound every run. There is NO wall-clock timeout, so Max Turns and Max Budget are the only stop conditions — always keep both set.",
+          "options": {
+            "grid_columns": 12
+          },
+          "propertyOrder": 0
+        },
         "model": {
           "type": "string",
           "title": "Model",
@@ -157,11 +169,17 @@
       "type": "object",
       "title": "Permissions & Tools",
       "format": "grid-strict",
-      "options": {
-        "tooltip": "What the agent is allowed to do. Only non-prompting permission modes are offered — a mode that pauses for human approval would hang a headless Keboola job."
-      },
       "propertyOrder": 30,
       "properties": {
+        "_permissions_note": {
+          "type": "string",
+          "format": "info",
+          "description": "What the agent is allowed to do. Only non-prompting permission modes are offered — a mode that pauses for human approval would hang a headless Keboola job.",
+          "options": {
+            "grid_columns": 12
+          },
+          "propertyOrder": 0
+        },
         "permission_mode": {
           "type": "string",
           "title": "Permission Mode",
@@ -215,11 +233,17 @@
       "type": "object",
       "title": "GitHub",
       "format": "grid-strict",
-      "options": {
-        "tooltip": "Let the agent work against GitHub with gh and git. When enabled, the token below is exported as GITHUB_TOKEN / GH_TOKEN and Bash(gh *) + Bash(git *) are added to Allowed Tools."
-      },
       "propertyOrder": 40,
       "properties": {
+        "_github_note": {
+          "type": "string",
+          "format": "info",
+          "description": "Let the agent work against GitHub with gh and git. When enabled, the token below is exported as GITHUB_TOKEN / GH_TOKEN and Bash(gh *) + Bash(git *) are added to Allowed Tools.",
+          "options": {
+            "grid_columns": 12
+          },
+          "propertyOrder": 0
+        },
         "github_enabled": {
           "type": "boolean",
           "title": "Enable GitHub",
@@ -232,15 +256,25 @@
           "propertyOrder": 1
         },
         "operates_on": {
-          "type": "string",
-          "title": "Repository (org/repo)",
-          "description": "The single GitHub repository the agent operates on, in \"org/repo\" form. Required when GitHub is enabled.",
+          "type": "array",
+          "title": "Repositories",
+          "description": "One or more \"org/repo\" entries, or \"org/*\" for an entire org. Required when GitHub is enabled — there is no \"leave empty for broad access\" option.",
+          "items": {
+            "type": "string"
+          },
+          "format": "select",
           "options": {
             "dependencies": {
               "github_enabled": true
             },
             "grid_columns": 12,
-            "tooltip": "e.g. \"acme/widgets\". The Advocate broker scopes the GitHub token to exactly this repository, so a hijacked agent cannot drive the token against other repos. Must be exactly \"org/repo\" with no spaces."
+            "tags": true,
+            "async": {
+              "label": "Load Repositories",
+              "action": "load_github_repos",
+              "autoload": true
+            },
+            "tooltip": "The Advocate broker scopes the GitHub token to exactly these repos. Pick from the list (repos your token can access) or type manually. \"org/*\" grants the entire org to the agent — broader blast radius than listing individual repos, use deliberately. Each entry must be exactly \"org/repo\" or \"org/*\", no spaces."
           },
           "propertyOrder": 2
         },
@@ -283,11 +317,14 @@
       "type": "object",
       "title": "Task, Prompt & Output",
       "format": "grid",
-      "options": {
-        "tooltip": "The System Prompt shapes every task. Config-prompt mode: write the single prompt here. Tasks-table mode: use the Task ID Filter to pick which rows this config runs. Output settings apply to the tables the agent produces."
-      },
       "propertyOrder": 50,
       "properties": {
+        "_task_output_note": {
+          "type": "string",
+          "format": "info",
+          "description": "The System Prompt shapes every task. Config-prompt mode: write the single prompt here. Tasks-table mode: use the Task ID Filter to pick which rows this config runs. Output settings apply to the tables the agent produces.",
+          "propertyOrder": -1
+        },
         "system_prompt": {
           "type": "string",
           "title": "System Prompt",
@@ -351,11 +388,17 @@
           "title": "Output Settings",
           "description": "Defaults applied to the tables the agent produces.",
           "format": "grid-strict",
-          "options": {
-            "tooltip": "The agent decides at runtime which tables to create (writer-like). The component promotes each one to the component's default bucket with a manifest. A per-table sidecar (incremental / primary_key) overrides the default below for that table."
-          },
           "propertyOrder": 3,
           "properties": {
+            "_output_note": {
+              "type": "string",
+              "format": "info",
+              "description": "The agent decides at runtime which tables to create (writer-like). The component promotes each one to the component's default bucket with a manifest. A per-table sidecar (incremental / primary_key) overrides the default below for that table.",
+              "options": {
+                "grid_columns": 12
+              },
+              "propertyOrder": 0
+            },
             "default_incremental": {
               "type": "boolean",
               "title": "Default Incremental Load",
@@ -375,14 +418,17 @@
       "type": "object",
       "title": "MCP Servers",
       "format": "grid",
-      "options": {
-        "tooltip": "Extra tools from Model Context Protocol servers. Defining a server here only makes its tools VISIBLE — you must also allow-list them in Permissions & Tools above as mcp__<server name>__* (or a specific tool)."
-      },
       "propertyOrder": 60,
       "properties": {
+        "_mcp_section_note": {
+          "type": "string",
+          "format": "info",
+          "description": "Extra tools from Model Context Protocol servers. Defining a server here only makes its tools VISIBLE — you must also allow-list them in Permissions & Tools above as mcp__<server name>__* (or a specific tool).",
+          "propertyOrder": 0
+        },
         "mcp_servers": {
           "type": "array",
-          "title": "MCP Servers",
+          "title": "Servers",
           "description": "Model Context Protocol servers to make available to the agent.",
           "options": {
             "documentation": {
@@ -503,14 +549,17 @@
       "type": "object",
       "title": "Plugins",
       "format": "grid",
-      "options": {
-        "tooltip": "Claude Code plugin marketplaces installed at job start (not baked into the image). Public sources resolve via a built-in registry; private sources need the GitHub Token in the GitHub section."
-      },
       "propertyOrder": 70,
       "properties": {
+        "_plugins_section_note": {
+          "type": "string",
+          "format": "info",
+          "description": "Claude Code plugin marketplaces installed at job start (not baked into the image). Public sources resolve via a built-in registry; private sources need the GitHub Token in the GitHub section.",
+          "propertyOrder": 0
+        },
         "plugins": {
           "type": "array",
-          "title": "Plugins (Advanced)",
+          "title": "Marketplaces",
           "description": "Plugin marketplaces installed at job start; each entry is pinned or tracks latest.",
           "options": {
             "documentation": {
@@ -595,11 +644,14 @@
       "type": "object",
       "title": "Advanced",
       "format": "grid",
-      "options": {
-        "tooltip": "SDK settings passthrough, on-disk settings sources, the workspace file toggle, and the runtime SDK version. Most runs leave these at their defaults."
-      },
       "propertyOrder": 80,
       "properties": {
+        "_advanced_note": {
+          "type": "string",
+          "format": "info",
+          "description": "Four independent settings: SDK settings passthrough (an escape hatch for options not exposed elsewhere), which on-disk settings files the agent may load, whether input-mapping files are staged into the agent's workspace, and which SDK version the run uses. Most runs leave all four at their defaults.",
+          "propertyOrder": 0
+        },
         "settings_json": {
           "type": "object",
           "title": "Custom Claude Settings (JSON)",
@@ -643,7 +695,7 @@
         "sdk_version": {
           "type": "string",
           "title": "SDK Version",
-          "description": "pinned (default) uses the baked-in SDK; a concrete version or 'latest' installs at job start (needs HTTPS egress).",
+          "description": "pinned (default) uses the baked-in SDK, currently 0.2.101; a concrete version or 'latest' installs at job start (needs HTTPS egress).",
           "default": "pinned",
           "options": {
             "inputAttributes": {
