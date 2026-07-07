@@ -390,13 +390,13 @@ class Component(ComponentBase):
         # Step 5: Build the MCP configs dict for the server.
         mcp_configs = {server.name: server for server in config.mcp_servers}
 
-        # HIGH-3: scope the GitHub broker's destination allowlist to the
-        # declared repos. ``Configuration`` already requires ``operates_on`` (non-empty)
-        # when github_enabled (fail-closed), so this is a concrete path when GitHub is
+        # HIGH-3: scope the GitHub broker's destination allowlist to the single
+        # declared repo. ``Configuration`` already requires ``operates_on`` when
+        # github_enabled (fail-closed), so this is a concrete path when GitHub is
         # in play; otherwise deny all GitHub paths (empty allowlist) — the broker
         # is unreachable anyway since the contract grants no gh.* capability.
         if config.github_enabled and config.operates_on:
-            github_allowed_destinations = [f"/repos/{repo}" for repo in config.operates_on]
+            github_allowed_destinations = [f"/repos/{config.operates_on}"]
         else:
             github_allowed_destinations = []
 
