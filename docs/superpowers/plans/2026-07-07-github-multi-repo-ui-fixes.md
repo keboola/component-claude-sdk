@@ -1206,38 +1206,7 @@ def test_build_options_github_tools_added():
 
 - [ ] **Step 2: Write the failing test for multi-repo/wildcard destination building**
 
-`_run_with_broker`'s inline destination-building logic isn't directly testable without a real config.json + AdvocateServer, so extract it as a static method on `Component` first, then unit-test that method directly in a new file, `tests/unit/test_component_github_scope.py` (created in this step):
-
-In `src/component.py`, find:
-```python
-        if config.github_enabled and config.operates_on:
-            github_allowed_destinations = [f"/repos/{config.operates_on}"]
-        else:
-            github_allowed_destinations = []
-```
-Replace with:
-```python
-        github_allowed_destinations = self._build_github_allowed_destinations(config)
-```
-
-Then add this static method near `_secret_values` (around line 476, same style):
-```python
-    @staticmethod
-    def _build_github_allowed_destinations(config: Configuration) -> list[str]:
-        """Path-prefix allowlist for the GitHub broker, one entry per operates_on repo.
-
-        An "org/*" entry becomes the org-only prefix "/repos/org" — the broker's
-        existing child-path matching (github_broker._path_allowed) already scopes
-        that to every repo under the org without further narrowing here.
-        """
-        if not (config.github_enabled and config.operates_on):
-            return []
-        return [
-            f"/repos/{entry[:-2]}" if entry.endswith("/*") else f"/repos/{entry}" for entry in config.operates_on
-        ]
-```
-
-Now add the test. Find the existing tests for `Component` (search for `class TestComponent` or similar) — if none exists in `tests/unit/`, create `tests/unit/test_component_github_scope.py`:
+`_run_with_broker`'s inline destination-building logic isn't directly testable without a real config.json + AdvocateServer, so it will be extracted as a static method on `Component` (next step). Write the test against that not-yet-existing method first, in a new file, `tests/unit/test_component_github_scope.py`:
 
 ```python
 """Unit tests for Component._build_github_allowed_destinations (multi-repo/org-wildcard scoping)."""
@@ -1277,27 +1246,53 @@ def test_mixed_repos_and_wildcard():
     assert Component._build_github_allowed_destinations(cfg) == ["/repos/org/repo-X", "/repos/other-org"]
 ```
 
-- [ ] **Step 3: Run the new test file to verify it fails first (before the `component.py` change), then passes after**
+- [ ] **Step 3: Run the test to verify it fails**
 
-Run (before making the `component.py` edit above — temporarily verify the old inline logic would have broken on a list):
-```bash
-git stash push -- src/component.py
-pytest tests/unit/test_component_github_scope.py -v
-git stash pop
-```
-Expected: the stashed (old) version raises `AttributeError` or produces a malformed path like `/repos/['org/repo-X']` since `config.operates_on` is now a list and the old code did `f"/repos/{config.operates_on}"` — confirms the test is meaningful. After `git stash pop` restores the new `_build_github_allowed_destinations` method, run:
+Run: `pytest tests/unit/test_component_github_scope.py -v`
+Expected: FAIL — `AttributeError: type object 'Component' has no attribute '_build_github_allowed_destinations'`
 
-```bash
-pytest tests/unit/test_component_github_scope.py tests/unit/test_claude_runner.py -v
+- [ ] **Step 4: Extract the destination-building logic into a static method**
+
+In `src/component.py`, find:
+```python
+        if config.github_enabled and config.operates_on:
+            github_allowed_destinations = [f"/repos/{config.operates_on}"]
+        else:
+            github_allowed_destinations = []
 ```
+Replace with:
+```python
+        github_allowed_destinations = self._build_github_allowed_destinations(config)
+```
+
+Then add this static method near `_secret_values` (around line 476, same style):
+```python
+    @staticmethod
+    def _build_github_allowed_destinations(config: Configuration) -> list[str]:
+        """Path-prefix allowlist for the GitHub broker, one entry per operates_on repo.
+
+        An "org/*" entry becomes the org-only prefix "/repos/org" — the broker's
+        existing child-path matching (github_broker._path_allowed) already scopes
+        that to every repo under the org without further narrowing here.
+        """
+        if not (config.github_enabled and config.operates_on):
+            return []
+        return [
+            f"/repos/{entry[:-2]}" if entry.endswith("/*") else f"/repos/{entry}" for entry in config.operates_on
+        ]
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `pytest tests/unit/test_component_github_scope.py tests/unit/test_claude_runner.py -v`
 Expected: PASS
 
-- [ ] **Step 4: Run the broader test suite to catch any other consumer of the old inline shape**
+- [ ] **Step 6: Run the broader test suite to catch any other consumer of the old inline shape**
 
 Run: `pytest tests/unit/ -v -x`
 Expected: PASS (this also catches `test_phase5_boot.py` and `test_phase6_jsonl_chaining.py` regressions from Task 3, and confirms nothing else in `src/component.py` or its tests references the old single-string `operates_on` shape)
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/component.py tests/unit/test_claude_runner.py tests/unit/test_component_github_scope.py
