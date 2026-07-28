@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **`#`-prefixed keys in env/header maps now reach the agent under their clean
+  name.** Keboola decrypts the *value* of a `#`-prefixed key but keeps the key
+  *name* verbatim, so `settings_json.env: {"#WEBHOOK_URL": …}` previously gave
+  the agent an env var literally named `#WEBHOOK_URL` — unreachable as
+  `$WEBHOOK_URL`. The configuration model now strips the `#` marker from key
+  names in `settings_json.env` (object form), `mcp_servers[].env` and
+  `mcp_servers[].headers`; a `#KEY`/`KEY` collision in one map is rejected with
+  a clear error. Values declared secret this way are additionally scrubbed from
+  captured output (`_secret_values`).
+
 ## [Unreleased] — feat/advocate-broker
 
 ### Added

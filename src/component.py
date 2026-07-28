@@ -476,6 +476,7 @@ class Component(ComponentBase):
     def _secret_values(config: Configuration) -> list[str]:
         """All secret strings to scrub from any captured output (defense-in-depth)."""
         secrets = [config.anthropic_key, config.github_token]
+        secrets.extend(config.declared_secret_values)
         for server in config.mcp_servers:
             secrets.extend(getattr(server, "env", {}).values())
             secrets.extend(getattr(server, "headers", {}).values())

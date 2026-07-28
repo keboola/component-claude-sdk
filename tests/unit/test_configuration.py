@@ -349,3 +349,70 @@ def test_system_prompt_lifts_from_either_section():
         advanced={"system_prompt": "role-legacy"},
     )
     assert old_placement.system_prompt == "role-legacy"
+
+
+# --- '#'-prefixed key normalisation (encrypted env vars / headers) ---
+#
+# Keboola decrypts the VALUE of a '#'-prefixed key but keeps the key NAME
+# verbatim, so a passthrough would give the agent an env var literally named
+# '#WEBHOOK_URL' — unreachable as $WEBHOOK_URL. The model strips the marker.
+
+
+def test_settings_json_env_hash_keys_normalized():
+    cfg = Configuration(**_base(settings_json={"env": {"#WEBHOOK_URL": "https://hook.example", "PLAIN": "1"}}))
+    assert cfg.settings_json["env"] == {"WEBHOOK_URL": "https://hook.example", "PLAIN": "1"}
+
+
+def test_settings_json_env_hash_values_are_declared_secrets():
+    cfg = Configuration(**_base(settings_json={"env": {"#WEBHOOK_URL": "https://hook.example", "PLAIN": "1"}}))
+    assert cfg.declared_secret_values == ["https://hook.example"]
+
+
+def test_settings_json_env_hash_key_collision_raises():
+    with pytest.raises(UserException) as exc:
+        Configuration(**_base(settings_json={"env": {"#WEBHOOK_URL": "a", "WEBHOOK_URL": "b"}}))
+    assert "WEBHOOK_URL" in str(exc.value)
+
+
+def test_settings_json_string_form_not_normalized():
+    """The raw-string escape hatch stays verbatim; '#' keys are only supported
+    in the object form (documented limitation)."""
+    raw = '{"env": {"#RAW": "x"}}'
+    cfg = Configuration(**_base(settings_json=raw))
+    assert cfg.settings_json == raw
+    assert cfg.declared_secret_values == []
+
+
+def test_settings_json_without_env_untouched():
+    cfg = Configuration(**_base(settings_json={"permissions": {"allow": ["Bash"]}}))
+    assert cfg.settings_json == {"permissions": {"allow": ["Bash"]}}
+    assert cfg.declared_secret_values == []
+
+
+def test_mcp_stdio_env_hash_keys_normalized():
+    server = McpStdioServer(name="s", command="npx", env={"#TOKEN": "tok-value", "PLAIN": "1"})
+    assert server.env == {"TOKEN": "tok-value", "PLAIN": "1"}
+
+
+def test_mcp_stdio_env_hash_key_collision_raises():
+    with pytest.raises(UserException) as exc:
+        McpStdioServer(name="s", command="npx", env={"#TOKEN": "a", "TOKEN": "b"})
+    assert "TOKEN" in str(exc.value)
+
+
+def test_mcp_remote_headers_hash_keys_normalized():
+    server = McpRemoteServer(type="http", name="r", url="https://mcp.example", headers={"#Authorization": "Bearer t"})
+    assert server.headers == {"Authorization": "Bearer t"}
+
+
+def test_mcp_hash_values_aggregated_into_declared_secrets():
+    cfg = Configuration(
+        **_base(
+            settings_json={"env": {"#WEBHOOK_URL": "https://hook.example"}},
+            mcp_servers=[
+                {"type": "stdio", "name": "s", "command": "npx", "env": {"#TOKEN": "tok-value"}},
+                {"type": "http", "name": "r", "url": "https://mcp.example", "headers": {"#Authorization": "Bearer t"}},
+            ],
+        )
+    )
+    assert sorted(cfg.declared_secret_values) == sorted(["https://hook.example", "tok-value", "Bearer t"])

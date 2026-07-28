@@ -610,7 +610,7 @@
               "mode": "application/json",
               "lineNumbers": true
             },
-            "tooltip": "Escape hatch for SDK settings not exposed as their own field above. The object is written to a settings.json file and handed to ClaudeAgentOptions.settings. Example: {\"env\": {\"MY_VAR\": \"1\"}}. Leave empty unless you have a specific advanced setting to inject."
+            "tooltip": "Escape hatch for SDK settings not exposed as their own field above. The object is written to a settings.json file and handed to ClaudeAgentOptions.settings. Example: {\"env\": {\"MY_VAR\": \"1\"}}. To store an env value encrypted, prefix its key with #: {\"env\": {\"#WEBHOOK_URL\": \"https://...\"}} — the agent sees the variable without the prefix (WEBHOOK_URL). Leave empty unless you have a specific advanced setting to inject."
           },
           "propertyOrder": 2
         },

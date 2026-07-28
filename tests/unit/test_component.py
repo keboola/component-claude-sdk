@@ -412,3 +412,19 @@ def test_run_task_launch_failure_is_user_exception(tmp_path, monkeypatch):
     with pytest.raises(UserException) as exc:
         comp.run()
     assert "CLI/MCP failed to launch" in str(exc.value)
+
+
+def test_secret_values_include_declared_hash_env_secrets():
+    """Values the user marked secret via a '#' key in settings_json.env must be
+    scrubbed from captured output alongside the API/GitHub tokens."""
+    from configuration import Configuration
+
+    cfg = Configuration(
+        **{
+            "#anthropic_key": "KEY_NAME_ONLY",
+            "settings_json": {"env": {"#WEBHOOK_URL": "https://hook.example", "PLAIN": "1"}},
+        }
+    )
+    secrets = Component._secret_values(cfg)
+    assert "https://hook.example" in secrets
+    assert "1" not in secrets
