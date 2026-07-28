@@ -136,6 +136,19 @@ def test_settings_json_object_written_to_file_and_path_passed(tmp_path):
     assert written == {"permissions": {"allow": ["Bash"]}}
 
 
+def test_settings_json_hash_env_key_written_without_prefix(tmp_path):
+    """A '#'-encrypted env var must reach the settings file under its clean name —
+    the agent addresses $WEBHOOK_URL, not an env var literally named '#WEBHOOK_URL'."""
+    import json
+
+    home = str(tmp_path / "home")
+    cfg = _config(settings_json={"env": {"#WEBHOOK_URL": "https://hook.example"}})
+    runner = ClaudeRunner(workspace_dir="/tmp/ws")
+    opts = runner.build_options(_task(), cfg, [], {"CLAUDE_CONFIG_DIR": home})
+    written = json.load(open(opts.settings, encoding="utf-8"))
+    assert written == {"env": {"WEBHOOK_URL": "https://hook.example"}}
+
+
 def test_settings_json_string_written_verbatim(tmp_path):
     home = str(tmp_path / "home")
     cfg = _config(settings_json='{"raw": true}')

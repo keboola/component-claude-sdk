@@ -18,6 +18,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     ValidationError,
     field_validator,
     model_validator,
@@ -55,6 +56,31 @@ _SECTION_WRAPPERS = frozenset(
         "advanced",
     }
 )
+
+
+def _strip_hash_keys(mapping: dict[str, str], where: str) -> tuple[dict[str, str], list[str]]:
+    """Rename ``#KEY`` -> ``KEY`` in an env/header map; return (clean map, secret values).
+
+    Keboola decrypts the VALUE of a ``#``-prefixed key but keeps the key NAME
+    verbatim, so passing the map through unchanged would give the agent an env
+    var (or header) literally named ``#FOO`` — unreachable as ``$FOO``. The
+    ``#`` is a storage-encryption marker only; strip it here and remember the
+    values the user thereby declared secret (for output scrubbing).
+    """
+    normalized: dict[str, str] = {}
+    secrets: list[str] = []
+    for key, value in mapping.items():
+        target = key
+        if isinstance(key, str) and key.startswith("#"):
+            target = key[1:]
+            secrets.append(value)
+        if target in normalized:
+            raise UserException(
+                f"{where}: keys '#{target}' and '{target}' collide after the encryption "
+                f"prefix is stripped — keep only one of them."
+            )
+        normalized[target] = value
+    return normalized, secrets
 
 
 def _coerce_empty_object(v):
@@ -129,6 +155,13 @@ class McpStdioServer(BaseModel):
 
     _coerce_env = field_validator("env", mode="before")(_coerce_empty_object)
 
+    _declared_secret_values: list[str] = PrivateAttr(default_factory=list)
+
+    @model_validator(mode="after")
+    def _normalize_hash_env_keys(self) -> McpStdioServer:
+        self.env, self._declared_secret_values = _strip_hash_keys(self.env, where=f"mcp server '{self.name}' env")
+        return self
+
 
 class McpRemoteServer(BaseModel):
     """An HTTP or SSE MCP server. Secrets live in ``headers`` (Bearer token)."""
@@ -141,6 +174,15 @@ class McpRemoteServer(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict)
 
     _coerce_headers = field_validator("headers", mode="before")(_coerce_empty_object)
+
+    _declared_secret_values: list[str] = PrivateAttr(default_factory=list)
+
+    @model_validator(mode="after")
+    def _normalize_hash_header_keys(self) -> McpRemoteServer:
+        self.headers, self._declared_secret_values = _strip_hash_keys(
+            self.headers, where=f"mcp server '{self.name}' headers"
+        )
+        return self
 
 
 # Discriminated union on ``type`` so a config entry is parsed into the right shape.
@@ -257,6 +299,33 @@ class Configuration(BaseModel):
             raise UserException(f"Configuration validation error: {', '.join(error_messages)}") from e
 
     _coerce_settings_json = field_validator("settings_json", mode="before")(_coerce_empty_object)
+
+    _settings_secret_values: list[str] = PrivateAttr(default_factory=list)
+
+    @model_validator(mode="after")
+    def _normalize_settings_env_hash_keys(self) -> Configuration:
+        """Strip the ``#`` encryption marker from ``settings_json.env`` key names.
+
+        Only the object form is processed; the raw-string escape hatch stays
+        verbatim (documented limitation — ``#`` keys need the object form).
+        """
+        sj = self.settings_json
+        if isinstance(sj, dict) and isinstance(sj.get("env"), dict):
+            sj["env"], self._settings_secret_values = _strip_hash_keys(sj["env"], where="settings_json env")
+        return self
+
+    @property
+    def declared_secret_values(self) -> list[str]:
+        """Values the user marked secret via a ``#`` key (settings env, MCP env/headers).
+
+        Used by the component to scrub captured output — only values explicitly
+        declared secret are scrubbed, so an innocuous ``"1"`` in a plain env var
+        never mangles the transcript.
+        """
+        values = list(self._settings_secret_values)
+        for server in self.mcp_servers:
+            values.extend(server._declared_secret_values)
+        return values
 
     @model_validator(mode="before")
     @classmethod

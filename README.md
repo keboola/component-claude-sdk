@@ -104,7 +104,12 @@ parameter → `ClaudeAgentOptions` mapping is in the design spec
   repo(s) the agent needs, with just the permissions required; a broad token lets
   the agent see and act on everything your account can.
 - Per-MCP-server secrets — put a `#`-prefixed key in a stdio server's `env` or an
-  HTTP/SSE server's `headers` (e.g. `{"Authorization": "Bearer …"}`).
+  HTTP/SSE server's `headers` (e.g. `{"#Authorization": "Bearer …"}`). The `#`
+  marks the value for encrypted storage only; the component strips it at runtime,
+  so the subprocess/server sees the clean name (`Authorization`). The same works
+  for agent env vars via `settings_json` — `{"env": {"#WEBHOOK_URL": "https://…"}}`
+  gives the agent `$WEBHOOK_URL` (object form only, not the raw-string form).
+  Defining both `#KEY` and `KEY` in one map is a config error.
 
 **Model & budget**
 
