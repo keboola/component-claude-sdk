@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Security
+
+- Bumped transitive dependencies past open Dependabot advisories: `mcp`
+  1.27.2 → 1.29.0 (WebSocket Host/Origin validation, high), `vcrpy`
+  8.1.1 → 8.3.0 (unsafe YAML deserialization of cassettes, high),
+  `pydantic-settings` 2.14.1 → 2.14.2 (symlink traversal outside
+  `secrets_dir`, medium).
+
 ### Fixed
 
 - **`#`-prefixed keys in env/header maps now reach the agent under their clean
