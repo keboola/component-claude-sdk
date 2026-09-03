@@ -186,18 +186,19 @@ def _read_ptrace_scope() -> int | None:
 
 
 def _assert_ptrace_protected() -> None:
-    """Fail closed unless same-UID PTRACE_ATTACH is restricted (HIGH-2).
+    """FALLBACK gate: fail closed unless the host restricts same-UID PTRACE_ATTACH.
 
-    Called at the start of the agent run, before any secret is used to do
-    privileged I/O. If ptrace_scope is 0 the Advocate's in-memory secrets are
-    readable by the same-UID agent, so the broker offers no protection — refuse
-    to run (overridable only via the documented dev/test env var).
+    Reached only when ``_set_process_undumpable`` could not establish the
+    protection directly (see ``_assert_advocate_memory_protected``). At that
+    point the Advocate's in-memory secrets are readable by the same-UID agent
+    unless the host's Yama ptrace_scope is >= 1, so refuse to run when it is 0
+    (overridable only via the documented dev/test env var).
     """
     scope = _read_ptrace_scope()
     if scope is None:
         log.warning(
-            "ptrace_scope unreadable at %s — cannot verify same-UID memory protection "
-            "(expected on non-Linux/dev; the production runtime enforces ptrace_scope=1).",
+            "ptrace_scope unreadable at %s and this process is dumpable — same-UID memory "
+            "protection CANNOT be verified (expected on non-Linux/dev).",
             _PTRACE_SCOPE_PATH,
         )
         return
