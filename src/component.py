@@ -13,8 +13,9 @@ Boot sequence (Broker V0, spec §6):
     keboola base class captures it at construction, then PURGED from os.environ
     before the agent spawns (the SDK transport merges os.environ into the agent's
     env, so a lingering KBC_TOKEN would otherwise leak directly — HIGH-1).
-1.  Assert ptrace_scope >= 1 — all in-memory secret protection rests on it; fail
-    closed otherwise (HIGH-2).
+1.  Protect Advocate memory — mark the process non-dumpable (PR_SET_DUMPABLE=0) so
+    a same-UID PTRACE_ATTACH is refused on any host; fall back to the host
+    ptrace_scope sysctl and fail closed only if neither holds (HIGH-2).
 2.  Read config.json → Configuration.
 3.  Scrub /data/config.json in place — agent cannot read decrypted secrets.
 4.  Derive + sign the Intent Contract (Phase 0).
@@ -91,11 +92,35 @@ _SCRUB_DONE_ENV = "_ADVOCATE_ENV_SCRUB_DONE"
 # We always use fd 3 (first non-standard fd above stderr=2).
 _KBC_TOKEN_PIPE_FD = 3
 
-# ptrace_scope gate (HIGH-2). All in-memory secret protection in the Advocate
-# rests on the kernel restricting same-UID PTRACE_ATTACH (Yama ptrace_scope >= 1).
-# With ptrace_scope=0 the agent can attach to the Advocate and read every secret,
-# so the broker provides no protection — we fail closed.
+# Advocate memory protection (HIGH-2).
+#
+# All in-memory secret protection in the Advocate rests on the kernel refusing a
+# same-UID PTRACE_ATTACH from the agent. There are two independent ways to get
+# that guarantee, and we now ESTABLISH the first instead of assuming the second:
+#
+#   1. PRIMARY — the Advocate marks ITSELF non-dumpable (prctl PR_SET_DUMPABLE=0).
+#      __ptrace_may_access() then demands CAP_SYS_PTRACE in the target's user
+#      namespace. The runtime gives the container cap_eff=0 (spec §12.6), so the
+#      agent has no such capability and PTRACE_ATTACH returns EPERM. As a bonus
+#      the /proc/<advocate>/ tree becomes root-owned, so /proc/<advocate>/mem AND
+#      /proc/<advocate>/environ also stop being readable by the same-UID agent.
+#      This holds on every host, because we set it ourselves.
+#
+#   2. FALLBACK — the Yama LSM sysctl kernel.yama.ptrace_scope >= 1.
+#      This is a HOST-WIDE, NON-NAMESPACED sysctl. A container cannot set it and
+#      inherits whatever the node OS image ships. Spec §12.6 recorded
+#      "ptrace_scope = 1 (confirmed)" from probe jobs on ONE stack, and the code
+#      turned that single observation into a platform-wide guarantee. It is not
+#      one: on at least one production backend the same image digest reads
+#      ptrace_scope=0, and the component refused to boot on every run there.
+#      Yama is therefore only the fallback for kernels where prctl is unavailable.
+#
+# We fail closed only when NEITHER mechanism can be established.
 _PTRACE_SCOPE_PATH = "/proc/sys/kernel/yama/ptrace_scope"
+
+# prctl(2) options — see <linux/prctl.h>.
+_PR_GET_DUMPABLE = 3
+_PR_SET_DUMPABLE = 4
 # Dev/test escape hatch (NEVER set on the real runtime): proceed despite
 # ptrace_scope=0. Used by the test suite (see tests/conftest.py) where no real
 # same-UID agent attaches to a live Advocate.
@@ -109,6 +134,38 @@ _AGENT_ENV_BLANKS = ("KBC_TOKEN", "KBC_URL", "GITHUB_TOKEN", "GH_TOKEN")
 
 
 log = logging.getLogger(__name__)
+
+
+def _set_process_undumpable() -> bool:
+    """Mark this process non-dumpable so no same-UID process can read its memory.
+
+    Returns ``True`` only when the flag was set AND read back as 0 — we verify
+    rather than trust the return code, so a prctl that is silently ignored can
+    never be mistaken for protection. Returns ``False`` where prctl is not
+    available (macOS/Windows dev) or where the kernel did not apply the flag.
+
+    Call this AFTER the env-scrub re-exec: execve() resets the dumpable flag to
+    1, so a value set before the re-exec would be lost.
+
+    Side effects, all verified benign for this component: core dumps of the
+    Advocate are disabled (desirable — a core dump holds every decrypted secret),
+    and /proc/self/environ becomes unreadable even to the Advocate itself.
+    ``os.environ``, subprocess spawn, loopback sockets and file I/O are
+    unaffected. The flag is NOT inherited across the agent's execve, so the
+    agent subprocess itself stays dumpable and its behaviour does not change.
+    """
+    import ctypes
+
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        if libc.prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+            log.warning("prctl(PR_SET_DUMPABLE, 0) failed: %s", os.strerror(ctypes.get_errno()))
+            return False
+        return libc.prctl(_PR_GET_DUMPABLE, 0, 0, 0, 0) == 0
+    # fmt: skip — see _read_ptrace_scope for why this multi-except is pinned.
+    except (OSError, AttributeError, ValueError) as exc:  # fmt: skip
+        log.warning("Cannot mark the Advocate non-dumpable on this platform: %s", exc)
+        return False
 
 
 def _read_ptrace_scope() -> int | None:
@@ -129,18 +186,19 @@ def _read_ptrace_scope() -> int | None:
 
 
 def _assert_ptrace_protected() -> None:
-    """Fail closed unless same-UID PTRACE_ATTACH is restricted (HIGH-2).
+    """FALLBACK gate: fail closed unless the host restricts same-UID PTRACE_ATTACH.
 
-    Called at the start of the agent run, before any secret is used to do
-    privileged I/O. If ptrace_scope is 0 the Advocate's in-memory secrets are
-    readable by the same-UID agent, so the broker offers no protection — refuse
-    to run (overridable only via the documented dev/test env var).
+    Reached only when ``_set_process_undumpable`` could not establish the
+    protection directly (see ``_assert_advocate_memory_protected``). At that
+    point the Advocate's in-memory secrets are readable by the same-UID agent
+    unless the host's Yama ptrace_scope is >= 1, so refuse to run when it is 0
+    (overridable only via the documented dev/test env var).
     """
     scope = _read_ptrace_scope()
     if scope is None:
         log.warning(
-            "ptrace_scope unreadable at %s — cannot verify same-UID memory protection "
-            "(expected on non-Linux/dev; the production runtime enforces ptrace_scope=1).",
+            "ptrace_scope unreadable at %s and this process is dumpable — same-UID memory "
+            "protection CANNOT be verified (expected on non-Linux/dev).",
             _PTRACE_SCOPE_PATH,
         )
         return
@@ -155,11 +213,35 @@ def _assert_ptrace_protected() -> None:
         )
         return
     raise UserException(
-        "ptrace_scope=0: a same-UID process can PTRACE_ATTACH the Advocate and read every "
-        "decrypted secret, so the broker provides no protection. Refusing to run. The Keboola "
-        f"runtime sets ptrace_scope=1; if this fired on the platform, escalate. (Dev/test only: "
-        f"set {_PTRACE_OVERRIDE_ENV}=1 to override.)"
+        "ptrace_scope=0 and this process could not be made non-dumpable: a same-UID process "
+        "can PTRACE_ATTACH the Advocate and read every decrypted secret, so the broker "
+        "provides no protection. Refusing to run. (Dev/test only: set "
+        f"{_PTRACE_OVERRIDE_ENV}=1 to override.)"
     )
+
+
+def _assert_advocate_memory_protected() -> None:
+    """Establish — or, failing that, verify — protection of the Advocate's memory.
+
+    Preferred path: make this process non-dumpable, which denies same-UID
+    PTRACE_ATTACH and same-UID reads of /proc/<advocate>/{mem,environ} on any
+    host, whatever kernel.yama.ptrace_scope happens to be. Only when that cannot
+    be done do we fall back to requiring ptrace_scope >= 1, and fail closed if
+    that is not there either.
+    """
+    if _set_process_undumpable():
+        log.info(
+            "Advocate marked non-dumpable (PR_SET_DUMPABLE=0) — same-UID PTRACE_ATTACH and "
+            "/proc/<advocate>/{mem,environ} are denied without CAP_SYS_PTRACE. Host "
+            "kernel.yama.ptrace_scope=%s (informational only; no longer required).",
+            _read_ptrace_scope(),
+        )
+        return
+    log.warning(
+        "Could not mark the Advocate non-dumpable — falling back to the host "
+        "kernel.yama.ptrace_scope check for same-UID memory protection."
+    )
+    _assert_ptrace_protected()
 
 
 def _scrub_config_json_impl(kbc_datadir: str) -> None:
@@ -335,8 +417,9 @@ class Component(ComponentBase):
         """Orchestrate the Broker V0 boot sequence, task loop, and output promotion.
 
         Boot sequence (spec §6):
-        1.  Assert ptrace_scope >= 1 — fail closed if the runtime cannot protect
-            the Advocate's in-memory secrets from a same-UID PTRACE_ATTACH (HIGH-2).
+        1.  Protect Advocate memory — mark this process non-dumpable so a same-UID
+            PTRACE_ATTACH is refused; fall back to the host ptrace_scope check and
+            fail closed only if neither can be established (HIGH-2).
         2.  Read config.json → Configuration (secrets loaded into memory).
         3.  Scrub /data/config.json in place — same-uid agent cannot read secrets.
         4.  (Env-scrub handled at process entry — see module-level boot code.)
@@ -351,9 +434,9 @@ class Component(ComponentBase):
         run inside a ``try`` whose ``finally`` always flushes the transcript
         before any exception propagates (output-state durability guarantee).
         """
-        # Step 1: Fail closed unless the kernel protects Advocate memory (before
-        # any secret is decrypted into memory below).
-        _assert_ptrace_protected()
+        # Step 1: Protect the Advocate's memory from the same-UID agent before
+        # any secret is decrypted into memory below. Fail closed if we cannot.
+        _assert_advocate_memory_protected()
 
         # Step 2: Parse config (reads decrypted secrets into memory).
         config = Configuration(**self.configuration.parameters)

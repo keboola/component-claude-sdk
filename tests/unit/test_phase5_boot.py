@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 
 import pytest
@@ -23,6 +24,7 @@ from component import (
     _PTRACE_OVERRIDE_ENV,
     _SCRUB_DONE_ENV,
     Component,
+    _assert_advocate_memory_protected,
     _assert_ptrace_protected,
     _perform_env_scrub,
     _scrub_config_json_impl,
@@ -484,6 +486,113 @@ class TestPtraceScopeGate:
         monkeypatch.setattr("component._read_ptrace_scope", lambda: 0)
         monkeypatch.setenv(_PTRACE_OVERRIDE_ENV, "1")
         _assert_ptrace_protected()  # override → must not raise
+
+
+# ---------------------------------------------------------------------------
+# 5c. Advocate memory protection (HIGH-2) — established by us, not assumed
+# ---------------------------------------------------------------------------
+
+# Proves the primary mechanism end to end in a real process pair: a same-UID
+# tracer with no CAP_SYS_PTRACE can attach to a dumpable target and read its
+# /proc/<pid>/environ, and CANNOT once the target sets PR_SET_DUMPABLE=0.
+# This is the property the Advocate relies on, and it must hold with the host's
+# kernel.yama.ptrace_scope at ANY value (some production backends ship 0).
+_PTRACE_PROOF = r"""
+import ctypes, os, signal, sys, time
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+PTRACE_ATTACH, PTRACE_DETACH = 16, 17
+
+def probe(dumpable):
+    pid = os.fork()
+    if pid == 0:
+        if dumpable == 0:
+            libc.prctl(4, 0, 0, 0, 0)
+        time.sleep(20)
+        os._exit(0)
+    time.sleep(0.5)
+    try:
+        with open("/proc/%d/environ" % pid, "rb") as fh:
+            fh.read(1)
+        environ_readable = True
+    except OSError:
+        environ_readable = False
+    attached = libc.ptrace(PTRACE_ATTACH, pid, None, None) == 0
+    if attached:
+        os.waitpid(pid, 0)
+        libc.ptrace(PTRACE_DETACH, pid, None, None)
+    os.kill(pid, signal.SIGKILL)
+    os.waitpid(pid, 0)
+    return attached, environ_readable
+
+print("dumpable:%s,%s" % probe(1))
+print("undumpable:%s,%s" % probe(0))
+"""
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="prctl/ptrace semantics are Linux-only")
+class TestAdvocateMemoryProtection:
+    """PR_SET_DUMPABLE=0 must give the memory protection, on any host."""
+
+    def test_undumpable_flag_is_set_and_verified(self):
+        """``_set_process_undumpable`` returns True and the flag really reads back 0.
+
+        Run in a subprocess: making the pytest process itself non-dumpable would
+        leak into every later test in the session.
+        """
+        script = (
+            "import sys; sys.path.insert(0, 'src'); import ctypes; from component import _set_process_undumpable; "
+            "ok = _set_process_undumpable(); "
+            "print(ok, ctypes.CDLL('libc.so.6').prctl(3, 0, 0, 0, 0))"
+        )
+        result = subprocess.run(  # noqa: S603
+            [sys.executable, "-c", script], capture_output=True, text=True, timeout=60
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "True 0", result.stdout
+
+    def test_same_uid_ptrace_and_environ_denied_when_undumpable(self):
+        """The regression test for CFTL-802.
+
+        Without the flag a same-UID peer can attach and read the environ; with it
+        both are denied — and neither outcome depends on kernel.yama.ptrace_scope.
+        """
+        result = subprocess.run(  # noqa: S603
+            [sys.executable, "-c", _PTRACE_PROOF], capture_output=True, text=True, timeout=120
+        )
+        assert result.returncode == 0, result.stderr
+        lines = dict(line.split(":", 1) for line in result.stdout.strip().splitlines())
+        assert lines["undumpable"] == "False,False", f"non-dumpable target was still reachable: {result.stdout}"
+        # Sanity check that the probe can detect an unprotected target at all.
+        # Skipped rather than failed when the runner's host already sets
+        # ptrace_scope>=1, which blocks the attach for its own reasons.
+        if lines["dumpable"] == "False,True":
+            pytest.skip("host ptrace_scope>=1 already blocks the attach; negative half not observable")
+        assert lines["dumpable"] == "True,True", result.stdout
+
+
+class TestAdvocateMemoryGate:
+    """The boot gate prefers the flag, falls back to Yama, fails closed only if both fail."""
+
+    def test_undumpable_passes_even_with_scope_zero(self, monkeypatch):
+        """The CFTL-802 case: ptrace_scope=0 must no longer block the boot."""
+        monkeypatch.setattr("component._set_process_undumpable", lambda: True)
+        monkeypatch.setattr("component._read_ptrace_scope", lambda: 0)
+        monkeypatch.delenv(_PTRACE_OVERRIDE_ENV, raising=False)
+        _assert_advocate_memory_protected()  # must not raise
+
+    def test_falls_back_to_yama_when_flag_unavailable(self, monkeypatch):
+        monkeypatch.setattr("component._set_process_undumpable", lambda: False)
+        monkeypatch.setattr("component._read_ptrace_scope", lambda: 1)
+        _assert_advocate_memory_protected()  # must not raise
+
+    def test_fails_closed_when_neither_mechanism_holds(self, monkeypatch):
+        from keboola.component.exceptions import UserException
+
+        monkeypatch.setattr("component._set_process_undumpable", lambda: False)
+        monkeypatch.setattr("component._read_ptrace_scope", lambda: 0)
+        monkeypatch.delenv(_PTRACE_OVERRIDE_ENV, raising=False)
+        with pytest.raises(UserException, match="ptrace_scope=0"):
+            _assert_advocate_memory_protected()
 
 
 # ---------------------------------------------------------------------------

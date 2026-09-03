@@ -1,5 +1,25 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **Advocate memory protection no longer depends on the host `ptrace_scope`.**
+  The boot gate asserted the host-wide, non-namespaced sysctl
+  `kernel.yama.ptrace_scope >= 1`, which a container can neither set nor rely on —
+  it is whatever the node's OS image ships. On backends where it reads `0` the
+  component failed closed on every run, before doing any work.
+
+  The Advocate now **establishes** the property itself with
+  `prctl(PR_SET_DUMPABLE, 0)`: a same-UID `PTRACE_ATTACH` needs `CAP_SYS_PTRACE`
+  against a non-dumpable target, and the runtime grants the container no
+  capabilities, so the attach is refused on any host. `/proc/<advocate>/mem` and
+  `/proc/<advocate>/environ` become unreadable to the agent for the same reason.
+  The `ptrace_scope` check is kept as a fallback for platforms without `prctl`,
+  the env-scrub re-exec is kept as defence in depth, and the boot still fails
+  closed when neither mechanism can be established. No configuration, schema,
+  output-table or manifest change. See spec §12.7.
+
 ## [Unreleased] — feat/advocate-broker
 
 ### Added
