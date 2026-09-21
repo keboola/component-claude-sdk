@@ -735,7 +735,7 @@ Raw probe output:
 | CAP_SYS_ADMIN / CAP_NET_ADMIN | **Absent** (cap_eff=0) | `unshare(CLONE_NEWNET)` fails; `iptables` unavailable |
 | `unshare(CLONE_NEWNET)` | **EPERM** | No network namespace; no per-UID egress |
 | seccomp AF_INET deny on agent | **NOT USABLE** — the bundled `claude` CLI uses loopback TCP for `ANTHROPIC_BASE_URL`; blocking AF_INET kills model calls | Cannot use seccomp net-kill as designed; transport pivots to loopback TCP |
-| `ptrace_scope` | **= 1** (confirmed) — same-uid descendant CANNOT `PTRACE_ATTACH` or read `/proc/<parent>/mem` (EPERM verified) | Memory isolation holds without UID boundary; this is V0's memory protection |
+| `ptrace_scope` | **= 1** on the probed stack — same-uid descendant CANNOT `PTRACE_ATTACH` or read `/proc/<parent>/mem` (EPERM verified). **SUPERSEDED — see §12.7** | Memory isolation holds without UID boundary; this was V0's memory protection |
 | `/proc/<parent>/environ` | **Readable** by same-uid agent (not Yama-gated) | KBC_TOKEN in Advocate exec-time env is exposed → env-scrub required |
 | Keboola component-custom-python Dockerfile | Contains comment: "Keboola running containers with -u 1000:1000" | Confirms euid=1000 is a platform-wide policy, not a transient config |
 
@@ -753,6 +753,39 @@ Raw probe output:
 5. The loopback TCP transport is confirmed for Anthropic (ANTHROPIC_BASE_URL); MCP (MCP_PROXY_URL)
    and GitHub (shim or HTTPS_PROXY) are the mechanism, but end-to-end wiring must be validated in
    Phase 5.
+
+---
+
+### 12.7 Amendment (2026-09-03) — `ptrace_scope` is NOT a platform guarantee
+
+> Trigger: the component failed to boot on **every** run on one stack, with
+> `ptrace_scope=0`, on the same image digest that boots on the stack probed in §12.6.
+
+`kernel.yama.ptrace_scope` is a **host-wide, non-namespaced** sysctl. A container
+cannot set it and cannot be granted it; it inherits whatever the node's OS image
+ships. The §12.6 row above generalised a single-stack probe into a platform-wide
+guarantee, and `src/component.py` then hard-gated the boot on it (and the error
+text told the reader "The Keboola runtime sets ptrace_scope=1"). Neither is true:
+different clouds and node images ship different Yama defaults, and the
+`application`-type backend on at least one production stack reads `0`.
+
+**Correction to the V0 design:** the Advocate does not assert a host setting — it
+**establishes the property itself** with `prctl(PR_SET_DUMPABLE, 0)`:
+
+- `__ptrace_may_access()` requires `CAP_SYS_PTRACE` in the target's user namespace
+  once the target is non-dumpable. §12.6 already recorded `cap_eff=0` for the
+  runtime, so the agent can never satisfy that — `PTRACE_ATTACH` returns `EPERM`.
+- The `/proc/<advocate>/` tree becomes root-owned, so `/proc/<advocate>/mem` **and**
+  `/proc/<advocate>/environ` also stop being readable by the same-UID agent. This
+  additionally covers the "`/proc/<parent>/environ` readable" row in §12.6 — the
+  env-scrub re-exec is kept as defence in depth, not replaced.
+- It needs no capability, no host cooperation, and no cross-team dependency, so it
+  is stack-independent by construction.
+
+Yama is retained as a **fallback** for platforms where `prctl` is unavailable, and
+the boot still fails closed when neither mechanism can be established. Verified
+with a real process pair at `uid=1000, cap_eff=0` (the runtime's profile) and kept
+honest by `TestAdvocateMemoryProtection` in `tests/unit/test_phase5_boot.py`.
 
 ---
 
