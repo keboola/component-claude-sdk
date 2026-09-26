@@ -135,6 +135,17 @@ def _branch_allowed(branch: str, allowed_patterns: list[str]) -> bool:
     return any(fnmatch.fnmatch(branch, pat) for pat in allowed_patterns)
 
 
+def _repo_allowed(repo: str, allowed_patterns: list[str]) -> bool:
+    """Return True if ``repo`` matches at least one glob pattern in ``allowed_patterns``.
+
+    Mirrors :func:`_branch_allowed`. A literal pattern like ``"org/repo"`` (no
+    wildcard characters) matches only itself via ``fnmatch`` — it does NOT
+    prefix-match ``"org/repo-evil"``. A pattern like ``"org/*"`` matches any
+    repo under that org. An empty pattern list denies every repo (fail-closed).
+    """
+    return any(fnmatch.fnmatch(repo, pat) for pat in allowed_patterns)
+
+
 # ---------------------------------------------------------------------------
 # Public gate
 # ---------------------------------------------------------------------------
@@ -212,9 +223,12 @@ def check_action(
             failed_check="destination",
         )
 
-    # 3. Scope check (only when the contract has a non-empty repos list)
+    # 3. Scope check (only when the contract has a non-empty repos list). Uses
+    # fnmatch so an "org/*" pattern authorizes any repo under that org, while a
+    # literal "org/repo" pattern (no wildcard characters) only matches itself —
+    # fnmatch treats a pattern with no special characters as an exact match.
     if scope_repo is not None and allowed_repos:
-        if scope_repo not in allowed_repos:
+        if not _repo_allowed(scope_repo, allowed_repos):
             log.warning(
                 "gate: scope denied — repo=%r not in contract scope",
                 scope_repo,

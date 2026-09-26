@@ -11,8 +11,10 @@ from __future__ import annotations
 import logging
 
 from keboola.component.exceptions import UserException
-from keboola.component.sync_actions import ValidationResult
+from keboola.component.sync_actions import SelectElement, ValidationResult
 from keboola.http_client import HttpClient
+
+from advocate.brokers.github_broker import GITHUB_API_BASE
 
 ANTHROPIC_API_URL = "https://api.anthropic.com"
 ANTHROPIC_VERSION = "2023-06-01"
@@ -20,6 +22,8 @@ ANTHROPIC_VERSION = "2023-06-01"
 TEST_MODEL = "claude-haiku-4-5"
 # Bound the connection test so a hung endpoint fails fast rather than blocking the UI.
 REQUEST_TIMEOUT_S = 15
+# GitHub REST pagination — 100 is the API's max per_page.
+GITHUB_REPOS_PAGE_SIZE = 100
 
 
 def check_anthropic_connection(anthropic_key: str, http_client: HttpClient | None = None) -> ValidationResult:
@@ -59,3 +63,50 @@ def check_anthropic_connection(anthropic_key: str, http_client: HttpClient | Non
         f"Anthropic connection test failed with HTTP {response.status_code}. "
         "Check the #anthropic_key and that the Anthropic API is reachable from this project."
     )
+
+
+def list_github_repos(github_token: str, http_client: HttpClient | None = None) -> list[SelectElement]:
+    """Paginate GET /user/repos with the configured token; returns every repo, no cap.
+
+    Populates the "Repositories" multi-select in the config UI. Never returns an
+    "org/*" wildcard entry — that pattern is always typed manually, since a repo
+    listing has no natural way to represent "the whole org".
+    """
+    if not github_token:
+        raise UserException("No #github_token provided; cannot load repositories.")
+
+    client = http_client or HttpClient(GITHUB_API_BASE)  # imported from advocate.brokers.github_broker
+    headers = {
+        "Authorization": f"Bearer {github_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    repos: list[SelectElement] = []
+    page = 1
+    try:
+        while True:
+            response = client.get_raw(
+                "/user/repos",
+                headers=headers,
+                params={"per_page": GITHUB_REPOS_PAGE_SIZE, "page": page},
+                timeout=REQUEST_TIMEOUT_S,
+            )
+            if response.status_code in (401, 403):
+                raise UserException("GitHub rejected the token (authentication failed). Check #github_token.")
+            if response.status_code != 200:
+                raise UserException(f"Could not list GitHub repositories (HTTP {response.status_code}).")
+            batch = response.json()
+            if not batch:
+                break
+            repos.extend(SelectElement(value=r["full_name"], label=r["full_name"]) for r in batch)
+            if len(batch) < GITHUB_REPOS_PAGE_SIZE:
+                break
+            page += 1
+    except UserException:
+        raise
+    except Exception as exc:
+        raise UserException(f"Could not reach the GitHub API: {exc}") from exc
+
+    logging.info("Loaded %d GitHub repositories for the repository picker.", len(repos))
+    return repos

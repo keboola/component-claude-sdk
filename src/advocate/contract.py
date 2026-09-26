@@ -23,14 +23,18 @@ Shape (spec §7.1)::
     }
 
 Repo scope — ``operates_on`` (spec §10):
-    ``Configuration`` exposes ``operates_on: "org/repo"`` and rejects
-    ``github_enabled`` without it (UserException at parse time).  ``derive_contract``
-    grants GitHub capabilities ONLY when ``operates_on`` is present and scopes the
-    destination to ``api.github.com/repos/<operates_on>``; without it ALL GitHub
-    capabilities are withheld (fail-closed).  The repo is never inferred from the
-    task prompt (untrusted once Phase 2 begins).  The gate additionally enforces
-    ``scope.repos`` and ``scope.writable_branches`` on GitHub writes (see
-    ``gate.py``).
+    ``Configuration`` exposes ``operates_on: list[str]`` (one or more ``"org/repo"``
+    entries, or ``"org/*"`` for an entire org) and rejects ``github_enabled``
+    without a non-empty list (UserException at parse time).  ``derive_contract``
+    grants GitHub capabilities ONLY when ``operates_on`` is non-empty and scopes
+    the destinations to ``api.github.com/repos/<entry>`` per entry — an
+    ``"org/*"`` entry scopes to ``api.github.com/repos/<org>`` (the broker's
+    existing child-path matching then covers any repo under that org, no broker
+    change needed); without any entries ALL GitHub capabilities are withheld
+    (fail-closed).  The repo is never inferred from the task prompt (untrusted
+    once Phase 2 begins).  The gate additionally enforces ``scope.repos`` (via
+    glob matching, so ``org/*`` patterns work) and ``scope.writable_branches`` on
+    GitHub writes (see ``gate.py``).
 """
 
 from __future__ import annotations
@@ -106,22 +110,32 @@ _IRREVERSIBLE_GATE = ["gh.merge", "deploy", "delete"]
 # ---------------------------------------------------------------------------
 
 
+def operates_on_to_repo_path(entry: str) -> str:
+    """Translate one operates_on entry to its GitHub REST path segment.
+
+    A concrete "org/repo" entry maps to itself. An "org/*" wildcard entry maps
+    to the org-only segment "org" — the broker's existing child-path matching
+    (github_broker._path_allowed) already scopes any "/repos/org/<anything>"
+    under that prefix, so no further narrowing is needed here.
+    """
+    return entry[:-2] if entry.endswith("/*") else entry
+
+
 def derive_contract(
     cfg: _ConfigProto,
     *,
-    operates_on: str | None = None,
+    operates_on: list[str] | None = None,
 ) -> dict:
     """Build a frozen Intent Contract from trusted config inputs.
 
     Args:
         cfg: The validated ``Configuration`` for this invocation.  No untrusted
             data must have been processed before this is called (spec §6 step 3).
-        operates_on: Optional ``org/repo`` string identifying the repository this
-            agent operates on.  When not present (current POC default), the repo
-            scope is empty — capability checking still applies but the destination
-            allowlist cannot be narrowed to a specific repo path.  Phase 5 should
-            wire this from a future ``cfg.operates_on`` field; do NOT infer it from
-            the task prompt (that is untrusted once we start Phase 2).
+        operates_on: One or more ``org/repo`` entries, or ``org/*`` for an entire
+            org, identifying what this agent operates on.  When empty or absent,
+            the repo scope is empty — capability checking still applies but no
+            GitHub destination is ever granted (fail-closed).  Never infer this
+            from the task prompt (that is untrusted once we start Phase 2).
 
     Returns:
         A plain dict representing the contract.  Sign it with :func:`sign_contract`
@@ -143,11 +157,17 @@ def derive_contract(
     # (UserException), so in production this branch is belt-and-suspenders.
     if cfg.github_enabled and operates_on:
         capabilities.extend([CAP_GH_READ, CAP_GH_WRITE_BRANCH, CAP_GH_OPEN_PR, CAP_GH_COMMENT])
-        destinations.append(f"{GITHUB_API_HOST}/repos/{operates_on}")
+        for entry in operates_on:
+            # "org/*" scopes to the org only — the broker's existing child-path
+            # matching (github_broker._path_allowed) already covers every repo
+            # under that org without needing the literal "/*" suffix, and its
+            # segment-boundary check already prevents "org-evil" from matching.
+            org_scoped = operates_on_to_repo_path(entry)
+            destinations.append(f"{GITHUB_API_HOST}/repos/{org_scoped}")
     elif cfg.github_enabled and not operates_on:
         log.warning(
-            "derive_contract: github_enabled but no operates_on repo — withholding ALL "
-            "GitHub capabilities (fail-closed). Set operates_on='org/repo' to grant scoped access."
+            "derive_contract: github_enabled but no operates_on repos — withholding ALL "
+            "GitHub capabilities (fail-closed). Set operates_on to grant scoped access."
         )
 
     # MCP capabilities — one "mcp.<name>" per declared server
@@ -161,8 +181,10 @@ def derive_contract(
         if isinstance(server, McpRemoteServer):
             destinations.append(server.url)
 
-    # Repo scope
-    repos: list[str] = [operates_on] if operates_on else []
+    # Repo scope — raw patterns (including any "org/*" wildcards); gate.py does
+    # glob matching against these, so the literal pattern (not the destination
+    # path) is what's stored here.
+    repos: list[str] = list(operates_on) if operates_on else []
 
     # Writable-branch scope (HIGH-3): enforced by the gate on ref-targeting
     # writes.  Defaults to ``agent/*`` (the agent may push only to its own
