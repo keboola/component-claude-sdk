@@ -46,7 +46,7 @@ def test_config_prompt_mode_writes_transcript_tables(datadir, monkeypatch):
     assert runs[0]["task_id"] == "config-task"
     assert runs[0]["success"] == "true"
     # 'pinned' resolves to the actual baked package version recorded for traceability
-    assert runs[0]["sdk_version_resolved"] == "0.2.101"
+    assert runs[0]["sdk_version_resolved"] == "0.2.165"
     assert runs[0]["model"] == "claude-opus-4-8"
 
     sessions = datadir.read_csv("claude_sessions.csv")

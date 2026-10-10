@@ -1,6 +1,6 @@
 """Optional runtime overlay of the claude-agent-sdk (spec §2.10).
 
-The image bakes ``claude-agent-sdk==0.2.101`` (with its bundled CLI). To move to
+The image bakes ``claude-agent-sdk==0.2.165`` (with its bundled CLI). To move to
 a newer SDK/CLI without an image rebuild, ``ensure()`` can pip-install a
 requested version into a writable ``/tmp`` overlay and put it first on
 ``sys.path`` so it shadows the baked package — **before** any module imports the

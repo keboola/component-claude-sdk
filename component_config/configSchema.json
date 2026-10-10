@@ -653,7 +653,7 @@
             "inputAttributes": {
               "placeholder": "pinned"
             },
-            "tooltip": "Leave as 'pinned' unless you need a newer SDK without rebuilding the image. 'pinned' = the baked 0.2.101, deterministic and offline-safe. A concrete version (e.g. 0.2.105) or 'latest' pip-installs into /tmp at job start and needs outbound HTTPS; 'latest' is non-reproducible. The resolved version is recorded in claude_runs. The bundled CLI moves with the package, so there is no SDK/CLI skew."
+            "tooltip": "Leave as 'pinned' unless you need a newer SDK without rebuilding the image. 'pinned' = the baked 0.2.165, deterministic and offline-safe. A concrete version (e.g. 0.2.105) or 'latest' pip-installs into /tmp at job start and needs outbound HTTPS; 'latest' is non-reproducible. The resolved version is recorded in claude_runs. The bundled CLI moves with the package, so there is no SDK/CLI skew."
           },
           "propertyOrder": 5
         },
@@ -670,7 +670,7 @@
               "Fail — raise an error, no silent downgrade (recommended)",
               "Fallback to pinned — log a warning and use the baked version"
             ],
-            "tooltip": "Only relevant when SDK Version is not 'pinned'. 'Fail' surfaces the install error so you know your requested version did not load. 'Fallback to pinned' keeps the job running on the baked 0.2.101 with a warning."
+            "tooltip": "Only relevant when SDK Version is not 'pinned'. 'Fail' surfaces the install error so you know your requested version did not load. 'Fallback to pinned' keeps the job running on the baked 0.2.165 with a warning."
           },
           "default": "fail",
           "propertyOrder": 6
