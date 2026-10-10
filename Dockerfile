@@ -30,6 +30,7 @@ COPY scripts/ scripts/
 FROM base AS test
 RUN uv sync --all-groups --frozen
 COPY tests/ tests/
+COPY component_config/ component_config/
 RUN uv run ruff check src/ tests/
 CMD ["uv", "run", "pytest", "tests/", "-v"]
 

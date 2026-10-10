@@ -14,7 +14,7 @@
       "#anthropic_key": "..."
     },
     "model_budget": {
-      "model": "claude-haiku-4-5",
+      "model": "claude-haiku-5-5",
       "max_turns": 10,
       "max_budget_usd": 2.0
     },

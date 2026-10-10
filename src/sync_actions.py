@@ -17,6 +17,9 @@ from keboola.http_client import HttpClient
 ANTHROPIC_API_URL = "https://api.anthropic.com"
 ANTHROPIC_VERSION = "2023-06-01"
 # Cheapest model for the validation ping; 1 token keeps cost negligible.
+# Deliberately still Haiku 4.5: the ping only proves the key works, the recorded
+# VCR cassettes (tests/functional/*/cassettes) are bound to this request body, and
+# Haiku 5.5 thinks by default, so a 1-token cap is not a meaningful request there.
 TEST_MODEL = "claude-haiku-4-5"
 # Bound the connection test so a hung endpoint fails fast rather than blocking the UI.
 REQUEST_TIMEOUT_S = 15
