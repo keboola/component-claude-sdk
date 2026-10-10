@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Claude Haiku 5.5 is selectable** (`claude-haiku-5-5`) as Model and Fallback
+  Model, listed as the fastest / cheapest option. Haiku 4.5 stays selectable, so
+  existing configurations are unchanged. The bundled Claude Code CLI (2.1.177)
+  sends Haiku 5.5 requests with adaptive thinking and `effort` (default `high`,
+  or the configured Effort). It sends no `budget_tokens` and no `temperature`,
+  which Haiku 5.5 rejects. The sample config now uses Haiku 5.5. The
+  `testConnection` ping stays on Haiku 4.5 (key check only, VCR-recorded).
+
 ### Fixed
 
 - **Advocate memory protection no longer depends on the host `ptrace_scope`.**

@@ -349,3 +349,32 @@ def test_system_prompt_lifts_from_either_section():
         advanced={"system_prompt": "role-legacy"},
     )
     assert old_placement.system_prompt == "role-legacy"
+
+
+def test_haiku_5_5_selectable_as_model_and_fallback():
+    cfg = Configuration(**_base(model="claude-haiku-5-5", fallback_model="claude-haiku-4-5"))
+    assert cfg.model == Model.haiku_5_5
+    assert cfg.fallback_model == Model.haiku_4_5
+
+
+def test_schema_model_enum_matches_model_enum():
+    """The UI picker and the parser must offer the same ids, Haiku 5.5 included."""
+    import json
+    from pathlib import Path
+
+    schema = json.loads((Path(__file__).resolve().parents[2] / "component_config" / "configSchema.json").read_text())
+
+    def enums(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in ("model", "fallback_model") and isinstance(value, dict) and "enum" in value:
+                    yield value["enum"]
+                yield from enums(value)
+        elif isinstance(node, list):
+            for value in node:
+                yield from enums(value)
+
+    found = list(enums(schema))
+    assert found, "no model enums found in configSchema.json"
+    for enum in found:
+        assert set(enum) == {m.value for m in Model}
