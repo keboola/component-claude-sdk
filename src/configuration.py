@@ -84,6 +84,10 @@ class Model(StrEnum):
     opus_4_8_versioned = "claude-opus-4-8-20250514"
     sonnet_4_6 = "claude-sonnet-4-6"
     sonnet_4_6_versioned = "claude-sonnet-4-6-20251101"
+    # Fixed id, no dated variant. Thinking is adaptive-only and sampling params are
+    # rejected; the bundled Claude Code CLI already sends adaptive thinking + effort
+    # for it (no budget_tokens, no temperature).
+    haiku_5_5 = "claude-haiku-5-5"
     haiku_4_5 = "claude-haiku-4-5"
     haiku_4_5_versioned = "claude-haiku-4-5-20251001"
 
