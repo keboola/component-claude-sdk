@@ -27,7 +27,8 @@
   It rebuilt every upstream request with only the key, version and content type,
   so request fields the CLI enables via beta flags were rejected with HTTP 400.
   With the 0.2.165 CLI that broke every Haiku 5.5 run (per-turn `output_config`).
-  Only well-formed flag names are forwarded.
+  Only an explicit allowlist of the flags the bundled CLI sends is forwarded, so a
+  beta that makes Anthropic call out on the agent's behalf cannot bypass egress control.
 
 - **Advocate memory protection no longer depends on the host `ptrace_scope`.**
   The boot gate asserted the host-wide, non-namespaced sysctl

@@ -508,8 +508,8 @@ def test_sse_upstream_url_is_hardcoded() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_sse_forwards_well_formed_anthropic_beta_flags_only() -> None:
-    """The CLI's beta flags reach the upstream; malformed entries are dropped."""
+def test_sse_forwards_allowlisted_anthropic_beta_flags_only() -> None:
+    """The CLI's beta flags reach the upstream; unlisted flags (egress-capable betas included) are dropped."""
     _SseUpstreamHandler.last_beta_header = None
 
     server = _make_server()
@@ -529,7 +529,7 @@ def test_sse_forwards_well_formed_anthropic_beta_flags_only() -> None:
                         json=payload,
                         headers={
                             "content-type": "application/json",
-                            "anthropic-beta": "effort-2025-11-24, per-turn-control-2026-07-01,Bad Flag,x;y",
+                            "anthropic-beta": "effort-2025-11-24, per-turn-control-2026-07-01,mcp-client-2025-11-20,Bad Flag,x;y",
                         },
                     ) as resp:
                         assert resp.status_code == 200

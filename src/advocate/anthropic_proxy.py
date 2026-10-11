@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import re
 from collections.abc import Iterator
 
 import httpx
@@ -21,9 +20,24 @@ UPSTREAM_URL = "https://api.anthropic.com"  # HARD-CODED — never taken from ag
 # Messages API rejects with 400 "Extra inputs are not permitted".
 _STRIP_FIELDS: frozenset[str] = frozenset({"action_id", "context_management"})
 
-# One Anthropic beta flag name, e.g. ``effort-2025-11-24``. Anything else in the
-# CLI's ``anthropic-beta`` header is dropped rather than forwarded.
-_BETA_FLAG = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+# Beta flags the bundled Claude Code CLI sends (2.1.294, captured per model).
+# Forwarded only from this allowlist: a beta can unlock server-side features that
+# make Anthropic call out on the agent's behalf (e.g. the MCP connector), which
+# would bypass the egress contract. A flag a future CLI adds fails closed (HTTP
+# 400) until it is reviewed and listed here.
+_ALLOWED_BETA_FLAGS: frozenset[str] = frozenset(
+    {
+        "claude-code-20250219",
+        "context-management-2025-06-27",
+        "effort-2025-11-24",
+        "interleaved-thinking-2025-05-14",
+        "mid-conversation-system-2026-04-07",
+        "mid-conversation-tool-changes-2026-07-01",
+        "per-turn-control-2026-07-01",
+        "prompt-caching-scope-2026-01-05",
+        "thinking-token-count-2026-05-13",
+    }
+)
 
 # Timeout for non-streaming calls.
 _UPSTREAM_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0)
@@ -34,14 +48,14 @@ _UPSTREAM_STREAM_TIMEOUT = httpx.Timeout(connect=5.0, read=120.0, write=10.0, po
 
 
 def sanitize_anthropic_beta(raw: str | None) -> str:
-    """Keep only well-formed beta flag names from the CLI's ``anthropic-beta`` header.
+    """Keep only allowlisted flags from the CLI's ``anthropic-beta`` header.
 
     The Claude Code CLI opts into request features (adaptive effort, per-turn
     ``output_config``, mid-conversation system messages, ...) via this header; the
     upstream rejects those request fields with 400 when the header is missing.
     """
     flags = (flag.strip() for flag in (raw or "").split(","))
-    return ",".join(flag for flag in flags if _BETA_FLAG.match(flag))
+    return ",".join(flag for flag in flags if flag in _ALLOWED_BETA_FLAGS)
 
 
 def _upstream_headers(anthropic_key: str, anthropic_beta: str, *, stream: bool) -> dict[str, str]:
