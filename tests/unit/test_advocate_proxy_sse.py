@@ -79,6 +79,7 @@ class _SseUpstreamHandler(BaseHTTPRequestHandler):
     # track the Authorization / x-api-key header received for security assertions
     last_auth_header: str | None = None
     last_api_key_header: str | None = None
+    last_beta_header: str | None = None
     # optional: slow emit to verify incremental delivery
     chunk_delay: float = 0.0
 
@@ -89,6 +90,7 @@ class _SseUpstreamHandler(BaseHTTPRequestHandler):
         # capture incoming headers for security assertions
         _SseUpstreamHandler.last_auth_header = self.headers.get("Authorization")
         _SseUpstreamHandler.last_api_key_header = self.headers.get("x-api-key")
+        _SseUpstreamHandler.last_beta_header = self.headers.get("anthropic-beta")
 
         body_len = int(self.headers.get("Content-Length", "0"))
         self.rfile.read(body_len)
@@ -497,5 +499,64 @@ def test_sse_upstream_url_is_hardcoded() -> None:
                     headers={"content-type": "application/json"},
                 ) as resp:
                     resp.read()
+    finally:
+        server.stop()
+
+
+# ---------------------------------------------------------------------------
+# anthropic-beta forwarding: Haiku 5.5 request fields need the CLI's beta flags
+# ---------------------------------------------------------------------------
+
+
+def test_sse_forwards_well_formed_anthropic_beta_flags_only() -> None:
+    """The CLI's beta flags reach the upstream; malformed entries are dropped."""
+    _SseUpstreamHandler.last_beta_header = None
+
+    server = _make_server()
+    try:
+        with _fake_upstream() as upstream_url:
+            with patch("advocate.anthropic_proxy.UPSTREAM_URL", upstream_url):
+                payload = {
+                    "model": "claude-haiku-5-5",
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "stream": True,
+                }
+                with _tcp_client(server.port) as client:
+                    with client.stream(
+                        "POST",
+                        "/v1/messages?beta=true",
+                        json=payload,
+                        headers={
+                            "content-type": "application/json",
+                            "anthropic-beta": "effort-2025-11-24, per-turn-control-2026-07-01,Bad Flag,x;y",
+                        },
+                    ) as resp:
+                        assert resp.status_code == 200
+                        resp.read()
+
+        assert _SseUpstreamHandler.last_beta_header == "effort-2025-11-24,per-turn-control-2026-07-01"
+    finally:
+        server.stop()
+
+
+def test_sse_sends_no_beta_header_when_agent_sends_none() -> None:
+    _SseUpstreamHandler.last_beta_header = "stale"
+
+    server = _make_server()
+    try:
+        with _fake_upstream() as upstream_url:
+            with patch("advocate.anthropic_proxy.UPSTREAM_URL", upstream_url):
+                payload = {
+                    "model": "claude-haiku-4-5",
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "stream": True,
+                }
+                with _tcp_client(server.port) as client:
+                    with client.stream("POST", "/v1/messages", json=payload) as resp:
+                        resp.read()
+
+        assert _SseUpstreamHandler.last_beta_header is None
     finally:
         server.stop()

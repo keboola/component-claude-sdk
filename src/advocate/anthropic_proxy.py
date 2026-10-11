@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from collections.abc import Iterator
 
 import httpx
@@ -20,6 +21,10 @@ UPSTREAM_URL = "https://api.anthropic.com"  # HARD-CODED — never taken from ag
 # Messages API rejects with 400 "Extra inputs are not permitted".
 _STRIP_FIELDS: frozenset[str] = frozenset({"action_id", "context_management"})
 
+# One Anthropic beta flag name, e.g. ``effort-2025-11-24``. Anything else in the
+# CLI's ``anthropic-beta`` header is dropped rather than forwarded.
+_BETA_FLAG = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+
 # Timeout for non-streaming calls.
 _UPSTREAM_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0)
 
@@ -28,7 +33,31 @@ _UPSTREAM_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0)
 _UPSTREAM_STREAM_TIMEOUT = httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=5.0)
 
 
-def _server_idem_key(payload: dict, query_string: str) -> str:
+def sanitize_anthropic_beta(raw: str | None) -> str:
+    """Keep only well-formed beta flag names from the CLI's ``anthropic-beta`` header.
+
+    The Claude Code CLI opts into request features (adaptive effort, per-turn
+    ``output_config``, mid-conversation system messages, ...) via this header; the
+    upstream rejects those request fields with 400 when the header is missing.
+    """
+    flags = (flag.strip() for flag in (raw or "").split(","))
+    return ",".join(flag for flag in flags if _BETA_FLAG.match(flag))
+
+
+def _upstream_headers(anthropic_key: str, anthropic_beta: str, *, stream: bool) -> dict[str, str]:
+    headers = {
+        "x-api-key": anthropic_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    if stream:
+        headers["accept"] = "text/event-stream"
+    if anthropic_beta:
+        headers["anthropic-beta"] = anthropic_beta
+    return headers
+
+
+def _server_idem_key(payload: dict, query_string: str, anthropic_beta: str = "") -> str:
     """Derive a content-addressed idempotency key from the forwarded request.
 
     Keyed on the request content the broker actually sends upstream (with
@@ -39,11 +68,13 @@ def _server_idem_key(payload: dict, query_string: str) -> str:
     actual content rather than from an agent-controlled token.
     """
     body = {k: v for k, v in payload.items() if k not in _STRIP_FIELDS}
-    canonical = json.dumps([body, query_string], sort_keys=True, separators=(",", ":"), default=str)
+    canonical = json.dumps([body, query_string, anthropic_beta], sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def handle_request(payload: dict, anthropic_key: str, *, query_string: str = "") -> tuple[int, dict]:
+def handle_request(
+    payload: dict, anthropic_key: str, *, query_string: str = "", anthropic_beta: str = ""
+) -> tuple[int, dict]:
     """Forward a validated non-streaming payload to Anthropic, injecting the API key.
 
     Idempotency: keyed on a server-derived hash of the forwarded request content
@@ -63,13 +94,13 @@ def handle_request(payload: dict, anthropic_key: str, *, query_string: str = "")
     Returns:
         ``(status_code, response_body_dict)`` tuple.
     """
-    idem_key = _server_idem_key(payload, query_string)
+    idem_key = _server_idem_key(payload, query_string, anthropic_beta)
     cached = _idem_get("anthropic", idem_key)
     if cached is not None:
         return cached
 
     try:
-        result = _call_upstream(payload, anthropic_key, query_string=query_string)
+        result = _call_upstream(payload, anthropic_key, query_string=query_string, anthropic_beta=anthropic_beta)
     except Exception:  # noqa: BLE001
         log.warning("_call_upstream raised (anthropic structured path)", exc_info=True)
         return 502, {"error": "upstream request failed"}
@@ -80,7 +111,9 @@ def handle_request(payload: dict, anthropic_key: str, *, query_string: str = "")
     return result
 
 
-def handle_request_passthrough(payload: dict, anthropic_key: str, *, query_string: str = "") -> tuple[int, dict]:
+def handle_request_passthrough(
+    payload: dict, anthropic_key: str, *, query_string: str = "", anthropic_beta: str = ""
+) -> tuple[int, dict]:
     """Forward a raw (no ``action_id``) Anthropic API payload to the upstream.
 
     Used for the transparent-proxy path where the Claude Code CLI sends
@@ -104,13 +137,15 @@ def handle_request_passthrough(payload: dict, anthropic_key: str, *, query_strin
         ``(status_code, response_body_dict)`` tuple.
     """
     try:
-        return _call_upstream(payload, anthropic_key, query_string=query_string)
+        return _call_upstream(payload, anthropic_key, query_string=query_string, anthropic_beta=anthropic_beta)
     except Exception:  # noqa: BLE001
         log.warning("_call_upstream raised in passthrough mode", exc_info=True)
         return 502, {"error": "upstream request failed"}
 
 
-def _call_upstream(payload: dict, anthropic_key: str, *, query_string: str = "") -> tuple[int, dict]:
+def _call_upstream(
+    payload: dict, anthropic_key: str, *, query_string: str = "", anthropic_beta: str = ""
+) -> tuple[int, dict]:
     """Make the actual HTTP call to Anthropic (non-streaming).
 
     The upstream URL is the module-level constant ``UPSTREAM_URL`` — it is
@@ -130,11 +165,7 @@ def _call_upstream(payload: dict, anthropic_key: str, *, query_string: str = "")
     Returns:
         ``(status_code, response_body_dict)`` tuple.
     """
-    headers = {
-        "x-api-key": anthropic_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
+    headers = _upstream_headers(anthropic_key, anthropic_beta, stream=False)
     # Strip broker-internal and CLI-internal fields before forwarding; set
     # stream=false so upstream always receives a clear non-streaming signal.
     body = {k: v for k, v in payload.items() if k not in _STRIP_FIELDS}
@@ -172,7 +203,9 @@ def _call_upstream(payload: dict, anthropic_key: str, *, query_string: str = "")
         return 502, {"error": "upstream request failed"}
 
 
-def _stream_upstream(payload: dict, anthropic_key: str, *, query_string: str = "") -> Iterator[bytes]:
+def _stream_upstream(
+    payload: dict, anthropic_key: str, *, query_string: str = "", anthropic_beta: str = ""
+) -> Iterator[bytes]:
     """Yield raw SSE byte chunks from the Anthropic upstream.
 
     The upstream URL is the module-level constant ``UPSTREAM_URL`` — NEVER
@@ -194,12 +227,7 @@ def _stream_upstream(payload: dict, anthropic_key: str, *, query_string: str = "
     Yields:
         Raw SSE bytes as received from the upstream, chunk by chunk.
     """
-    headers = {
-        "x-api-key": anthropic_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-        "accept": "text/event-stream",
-    }
+    headers = _upstream_headers(anthropic_key, anthropic_beta, stream=True)
     body = {k: v for k, v in payload.items() if k not in _STRIP_FIELDS}
 
     # Append the original query string (e.g. ?beta=true) if present.
