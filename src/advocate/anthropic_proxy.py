@@ -71,6 +71,20 @@ def _upstream_headers(anthropic_key: str, anthropic_beta: str, *, stream: bool) 
     return headers
 
 
+def _log_upstream_error(resp: httpx.Response) -> None:
+    """Log the upstream error type and message; Anthropic error bodies carry no credentials."""
+    try:
+        error = resp.json().get("error", {})
+    except ValueError:
+        error = {}
+    log.warning(
+        "upstream error: status=%d type=%s message=%s",
+        resp.status_code,
+        error.get("type", "?"),
+        str(error.get("message", ""))[:500],
+    )
+
+
 def _server_idem_key(payload: dict, query_string: str, anthropic_beta: str = "") -> str:
     """Derive a content-addressed idempotency key from the forwarded request.
 
@@ -204,9 +218,9 @@ def _call_upstream(
             body.get("model", "?"),
         )
         if resp.status_code >= 400:
-            # Log only the status at WARNING; the raw upstream body is an
-            # unbounded content sink, so keep it at DEBUG.
-            log.warning("upstream error status=%d", resp.status_code)
+            # The error type and a capped message at WARNING; the raw upstream
+            # body is an unbounded content sink, so keep it at DEBUG.
+            _log_upstream_error(resp)
             log.debug("upstream error body: %s", resp.text[:500])
         return resp.status_code, resp.json()
     except httpx.HTTPError as exc:
@@ -257,5 +271,8 @@ def _stream_upstream(
             json=body,
             timeout=_UPSTREAM_STREAM_TIMEOUT,
         ) as resp:
+            if resp.is_error:
+                resp.read()
+                _log_upstream_error(resp)
             resp.raise_for_status()
             yield from resp.iter_bytes()

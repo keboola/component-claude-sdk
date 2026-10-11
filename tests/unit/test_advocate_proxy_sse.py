@@ -9,6 +9,7 @@ All tests use a dummy anthropic_key — the real key never appears in fixtures.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections.abc import Iterator
@@ -17,6 +18,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import patch
 
 import httpx
+import pytest
 
 from advocate import idempotency
 from advocate.server import AdvocateServer
@@ -560,3 +562,36 @@ def test_sse_sends_no_beta_header_when_agent_sends_none() -> None:
         assert _SseUpstreamHandler.last_beta_header is None
     finally:
         server.stop()
+
+
+class _ErrorUpstreamHandler(BaseHTTPRequestHandler):
+    def log_message(self, format: str, *args: object) -> None:  # noqa: ANN002  # type: ignore[override]
+        pass
+
+    def do_POST(self) -> None:  # noqa: N802
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        body = b'{"type":"error","error":{"type":"invalid_request_error","message":"messages.1.output_config: Extra inputs are not permitted"}}'
+        self.send_response(400)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def test_sse_setup_error_logs_upstream_error_message(caplog: pytest.LogCaptureFixture) -> None:
+    """A 4xx before the first byte logs the upstream error type and message, not just the status."""
+    httpd = HTTPServer(("127.0.0.1", 0), _ErrorUpstreamHandler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    server = _make_server()
+    try:
+        with patch("advocate.anthropic_proxy.UPSTREAM_URL", f"http://127.0.0.1:{httpd.server_address[1]}"):
+            payload = {"model": "claude-haiku-5-5", "max_tokens": 10, "messages": [], "stream": True}
+            with caplog.at_level(logging.WARNING), _tcp_client(server.port) as client:
+                resp = client.post("/v1/messages", json=payload)
+
+        assert resp.status_code == 502
+        assert "invalid_request_error" in caplog.text
+        assert "messages.1.output_config: Extra inputs are not permitted" in caplog.text
+    finally:
+        server.stop()
+        httpd.shutdown()
