@@ -20,21 +20,24 @@ UPSTREAM_URL = "https://api.anthropic.com"  # HARD-CODED — never taken from ag
 # Messages API rejects with 400 "Extra inputs are not permitted".
 _STRIP_FIELDS: frozenset[str] = frozenset({"action_id", "context_management"})
 
-# Beta flags the bundled Claude Code CLI sends (2.1.294, captured per model).
+# Beta flags the bundled Claude Code CLI sends (2.1.294, captured per model via the SDK).
 # Forwarded only from this allowlist: a beta can unlock server-side features that
 # make Anthropic call out on the agent's behalf (e.g. the MCP connector), which
 # would bypass the egress contract. A flag a future CLI adds fails closed (HTTP
 # 400) until it is reviewed and listed here.
 _ALLOWED_BETA_FLAGS: frozenset[str] = frozenset(
     {
+        "advisor-tool-2026-03-01",
         "claude-code-20250219",
         "context-management-2025-06-27",
         "effort-2025-11-24",
+        "inline-tools-2026-09-15",
         "interleaved-thinking-2025-05-14",
         "mid-conversation-system-2026-04-07",
         "mid-conversation-tool-changes-2026-07-01",
         "per-turn-control-2026-07-01",
         "prompt-caching-scope-2026-01-05",
+        "thinking-display-updates-2026-08-18",
         "thinking-token-count-2026-05-13",
     }
 )
