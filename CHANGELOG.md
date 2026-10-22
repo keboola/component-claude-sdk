@@ -2,7 +2,33 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Claude Haiku 5.5 is selectable** (`claude-haiku-5-5`) as Model and Fallback
+  Model, listed as the fastest / cheapest option. Haiku 4.5 stays selectable, so
+  existing configurations are unchanged. The bundled Claude Code CLI
+  sends Haiku 5.5 requests with adaptive thinking and `effort` (default `high`,
+  or the configured Effort). It sends no `budget_tokens` and no `temperature`,
+  which Haiku 5.5 rejects. The sample config now uses Haiku 5.5. The
+  `testConnection` ping stays on Haiku 4.5 (key check only, VCR-recorded).
+
+### Changed
+
+- **`claude-agent-sdk` 0.2.101 → 0.2.165** (bundled Claude Code CLI 2.1.177 →
+  2.1.294). The old CLI did not know `claude-haiku-5-5` and costed it at its
+  fallback $5/$25 per MTok — about 50× the real $0.10/$0.50 — so `max_budget_usd`
+  tripped about 50× early and the reported `total_cost_usd` was inflated by the
+  same factor. The new CLI prices Haiku 5.5 correctly, including the >100K-token
+  tier.
+
 ### Fixed
+
+- **The Anthropic credential proxy now forwards the CLI's `anthropic-beta` flags.**
+  It rebuilt every upstream request with only the key, version and content type,
+  so request fields the CLI enables via beta flags were rejected with HTTP 400.
+  With the 0.2.165 CLI that broke every Haiku 5.5 run (per-turn `output_config`).
+  Only an explicit allowlist of the flags the bundled CLI sends is forwarded, so a
+  beta that makes Anthropic call out on the agent's behalf cannot bypass egress control.
 
 - **Advocate memory protection no longer depends on the host `ptrace_scope`.**
   The boot gate asserted the host-wide, non-namespaced sysctl

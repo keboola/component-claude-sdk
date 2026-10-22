@@ -313,6 +313,7 @@ class _Handler(BaseHTTPRequestHandler):
         # features that rely on it (e.g. ?beta=true) continue to work.
         parsed = urllib.parse.urlparse(self.path)
         query_string = parsed.query  # e.g. "beta=true" or ""
+        anthropic_beta = anthropic_proxy.sanitize_anthropic_beta(self.headers.get("anthropic-beta"))
 
         if "action_id" in payload:
             # Structured-agent path: enforce strict validation + idempotency.
@@ -322,11 +323,13 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             assert validated is not None  # _validate returns (dict, None) or (None, str)
             if validated.get("stream"):
-                self._handle_anthropic_stream(validated, anthropic_proxy, query_string=query_string)
+                self._handle_anthropic_stream(
+                    validated, anthropic_proxy, query_string=query_string, anthropic_beta=anthropic_beta
+                )
             else:
                 try:
                     status, body = anthropic_proxy.handle_request(
-                        validated, self.server.anthropic_key, query_string=query_string
+                        validated, self.server.anthropic_key, query_string=query_string, anthropic_beta=anthropic_beta
                     )
                 except Exception:  # noqa: BLE001
                     log.exception("unexpected error in handle_request")
@@ -339,11 +342,13 @@ class _Handler(BaseHTTPRequestHandler):
             # idempotent from the user's perspective (same input → same cost).
             log.debug("broker: transparent-proxy request for model=%s", payload.get("model", "?"))
             if payload.get("stream"):
-                self._handle_anthropic_stream(payload, anthropic_proxy, query_string=query_string)
+                self._handle_anthropic_stream(
+                    payload, anthropic_proxy, query_string=query_string, anthropic_beta=anthropic_beta
+                )
             else:
                 try:
                     status, body = anthropic_proxy.handle_request_passthrough(
-                        payload, self.server.anthropic_key, query_string=query_string
+                        payload, self.server.anthropic_key, query_string=query_string, anthropic_beta=anthropic_beta
                     )
                 except Exception:  # noqa: BLE001
                     log.exception("unexpected error in handle_request_passthrough")
@@ -352,7 +357,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self._respond(status, body)
 
     def _handle_anthropic_stream(
-        self, validated: dict, anthropic_proxy: types.ModuleType, *, query_string: str = ""
+        self,
+        validated: dict,
+        anthropic_proxy: types.ModuleType,
+        *,
+        query_string: str = "",
+        anthropic_beta: str = "",
     ) -> None:
         """Stream an SSE response from the Anthropic upstream back to the TCP client.
 
@@ -384,7 +394,7 @@ class _Handler(BaseHTTPRequestHandler):
         # error event" (which would imply the request had succeeded).
         try:
             chunk_iter = anthropic_proxy._stream_upstream(
-                validated, self.server.anthropic_key, query_string=query_string
+                validated, self.server.anthropic_key, query_string=query_string, anthropic_beta=anthropic_beta
             )
             first_chunk = next(chunk_iter, None)
         except Exception:  # noqa: BLE001
